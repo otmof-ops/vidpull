@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from rich.text import Text
-from textual import on, work
+from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -20,7 +20,7 @@ from textual.message import Message
 from textual.widgets import DataTable, Footer, Header, Input, Static
 
 from vidpull import CREDIT, REPO_URL, __version__
-from vidpull.clipboard import ClipboardWatcher, available_reader, extract_url, read_clipboard
+from vidpull.clipboard import ClipboardWatcher, available_reader, read_clipboard
 from vidpull.config import Config
 from vidpull.engine import Engine, ProbeError, YtDlpEngine
 from vidpull.formats import build_menu, human_size, preset_selection
@@ -33,12 +33,14 @@ from vidpull.procs import redact_url, which
 from vidpull.store import Store
 from vidpull.tui.screens.confirm import ConfirmScreen, TextScreen
 from vidpull.tui.screens.logview import LogScreen
-from vidpull.tui.screens.picker import FormatPicker
+from vidpull.tui.screens.picker import FormatPicker, Pick
 from vidpull.tui.screens.settings import SettingsScreen
 from vidpull.tui.screens.uninstall import UninstallScreen
 from vidpull.tui.screens.update import UpdateScreen
+from vidpull.tui.widgets import UrlInput
 from vidpull.uninstall import UninstallPlan
 from vidpull.update import UpdatePipeline
+from vidpull.urls import extract_urls
 
 log = logging.getLogger(__name__)
 
@@ -54,9 +56,9 @@ STATUS_STYLE = {
 }
 
 HELP = """\
-a      focus the URL box (Enter probes the URL and opens the format picker)
-esc    leave the URL box
-v      paste the clipboard into the URL box
+a      focus the link box (Enter probes the link and opens the format picker)
+esc    leave the link box
+paste  anywhere: Ctrl+Shift+V, right click, or Ctrl+V / v; several links at once are fine
 p      pick a format for a pending job (clipboard watcher)
 c      cancel the selected download          r  retry a failed or cancelled job
 d      delete the selected job (asks; can also delete its files)
@@ -66,6 +68,7 @@ u      update vidpull / yt-dlp               x  uninstall
 l      this session's log                    q  quit (running downloads resume next time)
 
 Picker: enter selects · a shows every format · p queues the whole playlist (presets)
+        ctrl+a uses your choice for every remaining pasted link
 
 vidpull is BSD 3-Clause licensed · by Jay · https://github.com/otmof-ops/vidpull
 """
@@ -104,6 +107,7 @@ class VidpullApp(App[PostExit | None]):
         Binding("a", "focus_url", "Add URL"),
         Binding("escape", "focus_table", "Table", show=False),
         Binding("v", "paste", "Paste", show=False),
+        Binding("ctrl+v", "paste", "Paste", show=False),
         Binding("p", "pick", "Pick format"),
         Binding("c", "cancel", "Cancel"),
         Binding("r", "retry", "Retry"),
@@ -149,9 +153,10 @@ class VidpullApp(App[PostExit | None]):
         self._notify_tool = which("notify-send")
         self._seen_status: dict[int, JobStatus] = {}
         self._url_queue: list[str] = [u.strip() for u in (initial_urls or []) if u.strip()]
+        self._batch_selection: Selection | None = None
         self._table: DataTable | None = None
         self._status: Static | None = None
-        self._url_box: Input | None = None
+        self._url_box: UrlInput | None = None
 
     @property
     def table(self) -> DataTable:
@@ -159,7 +164,7 @@ class VidpullApp(App[PostExit | None]):
         return self._table
 
     @property
-    def url_box(self) -> Input:
+    def url_box(self) -> UrlInput:
         assert self._url_box is not None
         return self._url_box
 
@@ -174,7 +179,11 @@ class VidpullApp(App[PostExit | None]):
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="main"):
-            yield Input(placeholder="Paste a URL and press Enter", id="url")
+            yield UrlInput(
+                placeholder="Paste one or more links (Ctrl+Shift+V or right click), "
+                "or type one and press Enter",
+                id="url",
+            )
             yield DataTable(id="jobs", cursor_type="row", zebra_stripes=True)
             yield Static("", id="status")
         yield Footer()
@@ -183,7 +192,7 @@ class VidpullApp(App[PostExit | None]):
         self.sub_title = f"v{__version__} · {REPO_URL.removeprefix('https://')}"
         self._table = self.query_one("#jobs", DataTable)
         self._status = self.query_one("#status", Static)
-        self._url_box = self.query_one("#url", Input)
+        self._url_box = self.query_one("#url", UrlInput)
         table = self._table
         keys = table.add_columns(*COLUMNS)
         self._columns = dict(zip(COLUMNS, keys, strict=True))
@@ -267,7 +276,9 @@ class VidpullApp(App[PostExit | None]):
             log.exception("update check failed")
 
     @work(thread=True, group="probe")
-    def probe(self, url: str, job_id: int | None = None, playlist: bool = False) -> None:
+    def probe(
+        self, url: str, job_id: int | None = None, playlist: bool = False, batch: bool = False
+    ) -> None:
         try:
             info = self.engine.probe(url, playlist=playlist)
         except ProbeError as exc:
@@ -283,11 +294,14 @@ class VidpullApp(App[PostExit | None]):
             )
             self.call_from_thread(self._probe_next)
             return
-        self.call_from_thread(self._offer, url, info, job_id)
+        self.call_from_thread(self._offer, url, info, job_id, batch)
 
     def _probe_next(self) -> None:
-        """Probe the next URL handed over on the command line, one picker at a time."""
-        if not self._url_queue or self._modal_open():
+        """Probe the next queued link: one picker at a time, or no picker in batch mode."""
+        if not self._url_queue:
+            self._batch_selection = None
+            return
+        if self._modal_open():
             return
         url = self._url_queue.pop(0)
         if not url.lower().startswith(("http://", "https://")):
@@ -295,22 +309,66 @@ class VidpullApp(App[PostExit | None]):
             self._probe_next()
             return
         self.notify(f"probing {_short(redact_url(url), 60)}", timeout=3)
-        self.probe(url)
+        self.probe(url, batch=self._batch_selection is not None)
 
     # ------------------------------------------------------------- flows
     @on(Input.Submitted, "#url")
     def _url_submitted(self, event: Input.Submitted) -> None:
-        url = event.value.strip()
-        if not url:
+        text = event.value.strip()
+        if not text:
             return
-        if not url.lower().startswith(("http://", "https://")):
-            self.notify("Enter an http(s) URL", severity="warning")
+        if not self.accept_pasted_text(text):
+            self.notify("Enter a link such as https://… or youtu.be/…", severity="warning")
             return
         self.url_box.value = ""
-        self.notify(f"probing {_short(redact_url(url), 60)}", timeout=3)
-        self.probe(url)
 
-    def _offer(self, url: str, info: MediaInfo, job_id: int | None) -> None:
+    # ---------------------------------------------------------- pasting
+    def accept_pasted_text(self, text: str | None) -> int:
+        """Queue every link found in ``text``; returns how many. Works from any screen."""
+        urls = extract_urls(text)
+        if not urls:
+            return 0
+        self._url_queue.extend(urls)
+        if len(urls) == 1:
+            self.notify("link added", timeout=3)
+        else:
+            self.notify(
+                f"{len(urls)} links added; pick a format for each, "
+                "or ctrl+a in the picker to use one choice for all",
+                timeout=6,
+            )
+        self._probe_next()
+        return len(urls)
+
+    def on_paste(self, event: events.Paste) -> None:
+        """A paste that landed outside the link box (the table, or a modal)."""
+        if self.accept_pasted_text(event.text):
+            event.stop()
+            return
+        if self.screen.focused is self._url_box:
+            return  # the box already inserted the text itself
+        if not self._modal_open() and event.text.strip():
+            self.url_box.value = event.text.strip().splitlines()[0]
+            self.url_box.focus()
+            event.stop()
+
+    def paste_from_clipboard(self) -> None:
+        """v / Ctrl+V from anywhere: the system clipboard, every link in it."""
+        text = self._clipboard_reader()
+        if self.accept_pasted_text(text):
+            return
+        if text and text.strip() and not self._modal_open():
+            self.url_box.value = text.strip().splitlines()[0]
+            self.url_box.focus()
+            return
+        self.notify("the clipboard holds no link", severity="warning")
+
+    def _offer(self, url: str, info: MediaInfo, job_id: int | None, batch: bool = False) -> None:
+        if batch and self._batch_selection is not None:
+            chosen = Selection(**{**self._batch_selection.__dict__, "playlist": info.is_playlist})
+            self._queue(url, info, chosen, job_id)
+            self._probe_next()
+            return
         menu = build_menu(info, self.config)
         if self.config.auto_pick:
             selection = preset_selection(
@@ -320,12 +378,22 @@ class VidpullApp(App[PostExit | None]):
             self._probe_next()
             return
 
-        def picked(selection: Selection | None) -> None:
-            if selection is not None:
-                self._queue(url, info, selection, job_id)
+        def picked(result: Pick | None) -> None:
+            if result is not None:
+                self._queue(url, info, result.selection, job_id)
+                if result.for_rest is not None and self._url_queue:
+                    self._batch_selection = result.for_rest
+                    self.notify(
+                        f"using '{result.for_rest.label}' for the remaining "
+                        f"{len(self._url_queue)} link(s)",
+                        timeout=5,
+                    )
             self._probe_next()
 
-        self.push_screen(FormatPicker(info, menu, self.config), callback=picked)
+        self.push_screen(
+            FormatPicker(info, menu, self.config, remaining=len(self._url_queue)),
+            callback=picked,
+        )
 
     def _queue(self, url: str, info: MediaInfo, selection: Selection, job_id: int | None) -> None:
         if job_id is not None:
@@ -348,12 +416,7 @@ class VidpullApp(App[PostExit | None]):
         self.table.focus()
 
     def action_paste(self) -> None:
-        url = extract_url(self._clipboard_reader())
-        if not url:
-            self.notify("the clipboard holds no URL", severity="warning")
-            return
-        self.url_box.value = url
-        self.url_box.focus()
+        self.paste_from_clipboard()
 
     def action_pick(self) -> None:
         job = self._selected_job()

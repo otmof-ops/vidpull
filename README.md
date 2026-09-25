@@ -33,10 +33,13 @@ the built-in updater.
 ## Use it
 
 ```sh
-vidpull                                   # open it, paste a link, press Enter
+vidpull                                   # open it and paste a link (or several)
 vidpull https://youtu.be/aqz-KE-bpKQ      # or hand it the link on the way in
 ```
 
+Paste however your terminal pastes (Ctrl+Shift+V, right click, middle click; Ctrl+V works
+too), with the link box focused or not. Several links at once are fine: you get a picker
+for each in turn, or press Ctrl+A in the first one to use that choice for all of them.
 The picker opens with what the site actually has:
 
 | Tab | What you can pick |
@@ -53,7 +56,7 @@ open the folder.
 
 | Key | Does |
 | --- | --- |
-| `a` / `v` | add a link / paste one from the clipboard |
+| `a` / `v` | focus the link box / paste from the clipboard (any terminal paste works too) |
 | `c` / `r` / `d` | cancel, retry, delete the selected download (delete can take the files with it) |
 | `o` | open the download folder |
 | `u` / `x` | update vidpull, or remove it |

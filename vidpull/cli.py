@@ -34,6 +34,7 @@ from vidpull.procs import redact_url
 from vidpull.semver import Version
 from vidpull.store import Store
 from vidpull.update import NotInstalledError, UpdateError, UpdatePipeline, finalize_install
+from vidpull.urls import looks_like_url, normalize_url
 from vidpull.versioning import git_describe, source_checkout
 
 log = logging.getLogger(__name__)
@@ -57,16 +58,13 @@ COMMANDS = frozenset(
         "_finalize-install",
     }
 )
-URL_LIKE = re.compile(
-    r"^(?:https?://|www\.)|^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?:/|$)"
-)
 
 
 def normalize_argv(argv: list[str]) -> list[str]:
     """``vidpull URL [URL...]`` means ``vidpull tui URL [URL...]``; a bare host gets ``https://``."""
-    if not argv or argv[0].startswith("-") or argv[0] in COMMANDS or not URL_LIKE.match(argv[0]):
+    if not argv or argv[0].startswith("-") or argv[0] in COMMANDS or not looks_like_url(argv[0]):
         return list(argv)
-    return ["tui", *[u if "://" in u else f"https://{u}" for u in argv]]
+    return ["tui", *[normalize_url(u) for u in argv]]
 
 
 @dataclass
