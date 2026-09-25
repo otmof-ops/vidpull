@@ -1,0 +1,52 @@
+{
+ "_type": "playlist",
+ "id": "blender open movie",
+ "title": "blender open movie",
+ "extractor": "youtube:search",
+ "extractor_key": "YoutubeSearch",
+ "webpage_url": "ytsearch3:blender open movie",
+ "playlist_count": 4,
+ "_fixture": {
+  "captured_with": "yt-dlp 2026.08.19",
+  "captured_on": "2026-09-26",
+  "source": "ytsearch3:blender open movie (flat)"
+ },
+ "entries": [
+  {
+   "_type": "url",
+   "ie_key": "Youtube",
+   "id": "WhWc3b3KhnY",
+   "url": "https://www.youtube.com/watch?v=WhWc3b3KhnY",
+   "title": "Spring - Blender Open Movie",
+   "duration": 465,
+   "uploader": "Blender Studio"
+  },
+  {
+   "_type": "url",
+   "ie_key": "Youtube",
+   "id": "UXqq0ZvbOnk",
+   "url": "https://www.youtube.com/watch?v=UXqq0ZvbOnk",
+   "title": "CHARGE - Blender Open Movie",
+   "duration": 263,
+   "uploader": "Blender Studio"
+  },
+  {
+   "_type": "url",
+   "ie_key": "Youtube",
+   "id": "_cMxraX_5RE",
+   "url": "https://www.youtube.com/watch?v=_cMxraX_5RE",
+   "title": "Sprite Fright - Blender Open Movie",
+   "duration": 630,
+   "uploader": "Blender Studio"
+  },
+  {
+   "_type": "url",
+   "ie_key": "Youtube",
+   "id": "missing0000",
+   "url": "https://www.youtube.com/watch?v=missing0000",
+   "title": null,
+   "duration": null,
+   "uploader": null
+  }
+ ]
+}
