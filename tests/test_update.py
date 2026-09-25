@@ -198,3 +198,17 @@ def test_finalize_install_registers_generation(paths, repo):
         repo_url=repo,
     )
     assert manifest.current == "0002-v0.1.0+abc123" and manifest.previous == "0001-v0.1.0"
+
+
+def test_finalize_install_prunes_to_two_generations(paths, repo):
+    layout = Layout(paths)
+    for n, tag in ((1, "v0.1.0"), (2, "v0.2.0"), (3, "v0.3.0")):
+        gen_dir = layout.gen_dir(f"{n:04d}-{tag}")
+        fake_generation(gen_dir / "venv", tag[1:])
+        finalize_install(
+            paths, gen_dir=gen_dir, tag=tag, commit="d" * 40, python=sys.executable, repo_url=repo
+        )
+    manifest = Manifest.load(paths.manifest_file)
+    assert manifest.current == "0003-v0.3.0" and manifest.previous == "0002-v0.2.0"
+    assert sorted(p.name for p in layout.gen_root.iterdir()) == ["0002-v0.2.0", "0003-v0.3.0"]
+    assert [g.id for g in manifest.generations] == ["0002-v0.2.0", "0003-v0.3.0"]

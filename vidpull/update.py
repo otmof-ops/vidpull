@@ -501,6 +501,8 @@ def finalize_install(
         manifest.created_download_dir = created_download_dir
     layout.point_current(gen_id)
     manifest.save(paths.manifest_file)
+    pipeline.manifest = manifest
+    pipeline._prune()  # noqa: SLF001 - keep current + previous, exactly like an update
     return manifest
 
 
