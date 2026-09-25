@@ -248,3 +248,108 @@ def test_initial_urls_open_pickers_in_turn(config, paths, store, video_info):
 
     run(flow())
     app.manager.stop()
+
+
+def _paste(app, text):
+    """Simulate a terminal paste the way the driver delivers it: to the app, which forwards it."""
+    from textual import events
+
+    app.post_message(events.Paste(text))
+
+
+def test_paste_many_links_into_box_opens_pickers_in_turn(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    app = make_app(config, paths, store, engine)
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            _paste(app, f"{URL}\n{URL}?x=2\n\nnot a link\n")
+            assert await until(pilot, lambda: isinstance(app.screen, FormatPicker))
+            assert app.screen.remaining == 1
+            await pilot.press("enter")
+            assert await until(pilot, lambda: len(store.list()) == 1)
+            assert await until(pilot, lambda: isinstance(app.screen, FormatPicker))
+            await pilot.press("escape")
+            assert await until(pilot, lambda: not isinstance(app.screen, FormatPicker))
+            assert len(store.list()) == 1 and app.url_box.value == ""
+
+    run(flow())
+    app.manager.stop()
+
+
+def test_paste_lands_anywhere_including_open_picker(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    app = make_app(config, paths, store, engine)
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("escape")  # table focused
+            _paste(app, f"see {URL} today")
+            assert await until(pilot, lambda: isinstance(app.screen, FormatPicker))
+            _paste(app, "youtu.be/abc123")  # pasted while the picker is open: queued for after
+            await pilot.pause(0.05)
+            assert app._url_queue == ["https://youtu.be/abc123"]
+            await pilot.press("enter")
+            assert await until(pilot, lambda: len(store.list()) == 1)
+            assert await until(pilot, lambda: isinstance(app.screen, FormatPicker))
+            await pilot.press("escape")
+            await pilot.pause(0.05)
+            await pilot.press("escape")
+            _paste(app, "plain words only")  # no link: goes into the box for editing
+            assert await until(pilot, lambda: app.url_box.value == "plain words only")
+
+    run(flow())
+    app.manager.stop()
+
+
+def test_ctrl_v_reads_system_clipboard_and_submit_accepts_bare_hosts(
+    config, paths, store, video_info
+):
+    engine = FakeEngine(info=video_info)
+    app = make_app(config, paths, store, engine)
+    app._clipboard_reader = lambda: f"{URL}\n{URL}?b=2"
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press(
+                "ctrl+v"
+            )  # link box focused: our override, not Textual's internal clipboard
+            assert await until(pilot, lambda: isinstance(app.screen, FormatPicker))
+            assert app.screen.remaining == 1
+            await pilot.press("escape")
+            await pilot.pause(0.05)
+            assert await until(pilot, lambda: isinstance(app.screen, FormatPicker))
+            await pilot.press("escape")
+            assert await until(pilot, lambda: not isinstance(app.screen, FormatPicker))
+            app.url_box.value = "www.youtube.com/watch?v=x   youtu.be/y"
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, FormatPicker))
+            assert app.screen.remaining == 1 and app.url_box.value == ""
+            await pilot.press("escape")
+            await pilot.pause(0.05)
+            await pilot.press("escape")
+
+    run(flow())
+    app.manager.stop()
+
+
+def test_use_choice_for_all_links(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    app = make_app(config, paths, store, engine, initial_urls=[URL, f"{URL}?n=2", f"{URL}?n=3"])
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            assert await until(pilot, lambda: isinstance(app.screen, FormatPicker))
+            assert app.screen.remaining == 2
+            await pilot.press("ctrl+a")  # top video row: 2160p60 -> "up to 2160p" for the rest
+            assert await until(pilot, lambda: len(store.list()) == 3)
+            jobs = store.list()
+            assert jobs[0].selection.kind == SelectionKind.VIDEO
+            assert all(
+                j.selection.kind == SelectionKind.PRESET and j.selection.label == "Up to 2160p (4K)"
+                for j in jobs[1:]
+            )
+            assert not isinstance(app.screen, FormatPicker) and app._batch_selection is None
+
+    run(flow())
+    app.manager.stop()

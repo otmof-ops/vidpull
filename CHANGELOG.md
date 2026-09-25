@@ -6,6 +6,21 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-09-26
+
+### Fixed
+
+- Pasting links into the app now works from anywhere and with any method: a terminal
+  paste (Ctrl+Shift+V, right click, middle click) or Ctrl+V / `v`, with the link box
+  focused or not, even while a picker is open. Textual's own link box kept only the
+  first pasted line and its Ctrl+V read an internal clipboard that was always empty.
+
+### Added
+
+- Paste or type several links at once: each gets its own picker in turn, or press
+  Ctrl+A in the first picker to use that choice for all the remaining links.
+- Links without a scheme (`youtu.be/…`, `www.…`) are accepted everywhere.
+
 ## [1.0.0] - 2026-09-26
 
 ### Added

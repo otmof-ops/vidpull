@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
@@ -25,6 +27,23 @@ from vidpull.formats import (
 )
 from vidpull.models import MediaInfo, Selection
 
+PRESET_HEIGHTS = (
+    (360, "360p"),
+    (480, "480p"),
+    (720, "720p"),
+    (1080, "1080p"),
+    (1440, "1440p"),
+    (2160, "2160p"),
+)
+
+
+@dataclass(frozen=True)
+class Pick:
+    """The picker's answer: the choice for this link and, optionally, one for the links after it."""
+
+    selection: Selection
+    for_rest: Selection | None = None
+
 
 def _duration(seconds: float | None) -> str:
     if not seconds:
@@ -35,18 +54,20 @@ def _duration(seconds: float | None) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
 
 
-class FormatPicker(ModalScreen[Selection | None]):
+class FormatPicker(ModalScreen[Pick | None]):
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("a", "toggle_all", "All formats"),
         Binding("p", "toggle_playlist", "Whole playlist"),
+        Binding("ctrl+a", "use_for_all", "Use for all links"),
     ]
 
-    def __init__(self, info: MediaInfo, menu: FormatMenu, config: Config):
+    def __init__(self, info: MediaInfo, menu: FormatMenu, config: Config, *, remaining: int = 0):
         super().__init__()
         self.info = info
         self.menu = menu
         self.config = config
+        self.remaining = remaining
         self.show_all = False
         self.playlist = info.is_playlist
         self._audio_rows = [r for r in info.formats if r.has_audio and not r.has_video]
@@ -91,6 +112,8 @@ class FormatPicker(ModalScreen[Selection | None]):
 
     def _hint(self) -> str:
         parts = ["enter selects", "esc cancels"]
+        if self.remaining:
+            parts.append(f"ctrl+a uses your choice for all {self.remaining} remaining link(s)")
         if not self.info.is_playlist:
             parts.append(
                 "a toggles all formats" if not self.show_all else "a shows best per quality"
@@ -175,7 +198,7 @@ class FormatPicker(ModalScreen[Selection | None]):
             return
         selection = self._selection_for(str(key))
         if selection is not None:
-            self.dismiss(selection)
+            self.dismiss(Pick(selection))
 
     def _selection_for(self, key: str) -> Selection | None:
         kind, _, rest = key.partition(":")
@@ -198,7 +221,37 @@ class FormatPicker(ModalScreen[Selection | None]):
             return conversion_selection(self.menu.conversions[int(rest)])
         return None
 
+    def _current_key(self) -> str | None:
+        table = self.focused
+        if not isinstance(table, DataTable) or table.row_count == 0:
+            return None
+        try:
+            row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+        except Exception:
+            return None
+        return None if row_key is None or row_key.value is None else str(row_key.value)
+
+    def _generalized(self, key: str, selection: Selection) -> Selection:
+        """The same choice expressed so it applies to other videos, whose format ids differ."""
+        kind, _, rest = key.partition(":")
+        if kind in {"v", "va"}:
+            row = self.menu.video[int(rest)].row if kind == "v" else self.menu.video_all[int(rest)]
+            name = next((n for h, n in PRESET_HEIGHTS if (row.height or 0) <= h), "best")
+            return preset_selection(name, self.config)
+        if kind == "a":
+            return preset_selection("audio-best", self.config)
+        return selection
+
     # ------------------------------------------------------------ actions
+    def action_use_for_all(self) -> None:
+        key = self._current_key()
+        if key is None:
+            return
+        selection = self._selection_for(key)
+        if selection is None:
+            return
+        self.dismiss(Pick(selection, for_rest=self._generalized(key, selection)))
+
     def action_cancel(self) -> None:
         self.dismiss(None)
 
