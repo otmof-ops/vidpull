@@ -1,0 +1,99 @@
+Screen {
+    layout: vertical;
+}
+
+#main {
+    height: 1fr;
+}
+
+#url {
+    margin: 0 1;
+}
+
+#jobs {
+    height: 1fr;
+    margin: 0 1;
+}
+
+#status {
+    height: 1;
+    padding: 0 1;
+    background: $panel;
+    color: $text-muted;
+}
+
+ModalScreen {
+    align: center middle;
+}
+
+#dialog {
+    width: 92%;
+    height: auto;
+    max-height: 92%;
+    border: thick $accent;
+    background: $surface;
+    padding: 1 2;
+}
+
+FormatPicker #dialog,
+SettingsScreen #dialog,
+LogScreen #dialog {
+    height: 92%;
+}
+
+UpdateScreen #dialog,
+UninstallScreen #dialog {
+    height: 85%;
+}
+
+.title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.hint {
+    color: $text-muted;
+    margin-top: 1;
+}
+
+.buttons {
+    height: auto;
+    align: center middle;
+    margin-top: 1;
+}
+
+.buttons Button {
+    margin: 0 1;
+}
+
+.field {
+    height: auto;
+    margin-bottom: 1;
+}
+
+.field Label {
+    width: 26;
+    padding-top: 1;
+}
+
+.field Input {
+    width: 1fr;
+}
+
+RichLog {
+    height: 1fr;
+    border: solid $primary-darken-2;
+    margin-top: 1;
+}
+
+TabbedContent {
+    height: 1fr;
+}
+
+TabPane DataTable {
+    height: 1fr;
+}
+
+VerticalScroll {
+    height: 1fr;
+}

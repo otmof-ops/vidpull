@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vidpull"
+version = "0.1.0"
+description = "Automated URL video downloader with a Textual TUI, tagged releases, and integrated update and uninstall pipelines"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Jay" }]
+keywords = ["yt-dlp", "tui", "downloader", "textual"]
+classifiers = [
+  "Environment :: Console",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3.12",
+  "Private :: Do Not Upload",
+]
+dependencies = [
+  "yt-dlp[default]>=2026.8.19",
+  "textual>=8,<9",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.6",
+  "build>=1.2",
+]
+
+[project.scripts]
+vidpull = "vidpull.cli:main"
+
+[project.urls]
+Repository = "https://github.com/otmof-ops/vidpull"
+Changelog = "https://github.com/otmof-ops/vidpull/blob/main/CHANGELOG.md"
+
+[tool.setuptools.packages.find]
+include = ["vidpull*"]
+
+[tool.setuptools.package-data]
+vidpull = ["py.typed", "tui/*.tcss"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "PL"]
+ignore = [
+  "PLR0913",  # many arguments: dataclass-style constructors
+  "PLR2004",  # magic values in comparisons
+  "PLR0912",  # too many branches: format-menu logic is branchy by nature
+  "PLR0915",  # too many statements
+  "PLR0911",  # too many return statements
+  "RUF012",   # mutable class attributes on Textual widgets (BINDINGS/CSS)
+  "SIM108",   # ternaries are not always clearer
+  "PLC0415",  # local imports keep optional heavy modules (rich, yt-dlp) off the startup path
+  "PLR0917",  # positional arguments: engine/manager signatures are positional by design
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["PLR", "B011", "RUF", "E501", "E741"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -ra"
+filterwarnings = ["error::DeprecationWarning:vidpull.*"]

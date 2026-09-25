@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""A stand-in for ``python -m yt_dlp`` that speaks the vidpull wire protocol.
+
+Invoked by tests through YtDlpEngine(python=<this file>). The first two argv
+entries are ``-m yt_dlp`` and are ignored. Behaviour comes from a ``mode`` file
+next to this script: ``ok`` (default), ``error``, ``hang`` or ``partial``.
+"""
+
+from __future__ import annotations
+
+import json
+import signal
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).parent
+SEP = "\t"
+
+
+def mode() -> str:
+    try:
+        return (HERE / "mode").read_text().strip() or "ok"
+    except OSError:
+        return "ok"
+
+
+def opt(args: list[str], name: str) -> str | None:
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
+def main(argv: list[str]) -> int:
+    args = [a for a in argv[1:] if a not in ("-m", "yt_dlp")]
+    (HERE / "last-args.json").write_text(json.dumps(args))
+    if "--version" in args:
+        print("2026.08.19")
+        return 0
+    url = args[-1]
+    if "-J" in args:
+        if mode() == "error":
+            print("ERROR: [fake] Unsupported URL: " + url, file=sys.stderr)
+            return 1
+        fixture = (
+            HERE
+            / "fixtures"
+            / ("youtube_playlist_flat.json" if "playlist" in url else "youtube_video.json")
+        )
+        sys.stdout.write(fixture.read_text())
+        return 0
+    if mode() == "hang":
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        print(
+            SEP.join(
+                [
+                    "VP",
+                    '"downloading"',
+                    "10",
+                    "100",
+                    "NA",
+                    "NA",
+                    "NA",
+                    "NA",
+                    "NA",
+                    "NA",
+                    '"avc1"',
+                    '"/tmp/x.part"',
+                ]
+            ),
+            flush=True,
+        )
+        time.sleep(60)
+        return 0
+    if mode() == "error":
+        print("ERROR: [fake] boom", file=sys.stderr, flush=True)
+        return 1
+    home = opt(args, "-P")
+    home_dir = Path(home.removeprefix("home:")) if home else Path.cwd()
+    for step in (25, 50, 100):
+        print(
+            SEP.join(
+                [
+                    "VP",
+                    '"downloading"',
+                    str(step),
+                    "100",
+                    "NA",
+                    "1000.5",
+                    "2",
+                    "NA",
+                    "NA",
+                    "NA",
+                    '"avc1"',
+                    '"/tmp/x.part"',
+                ]
+            ),
+            flush=True,
+        )
+    print(
+        SEP.join(
+            [
+                "VP",
+                '"finished"',
+                "100",
+                "100",
+                "NA",
+                "NA",
+                "NA",
+                "NA",
+                "NA",
+                "NA",
+                '"avc1"',
+                '"/tmp/x.part"',
+            ]
+        ),
+        flush=True,
+    )
+    print(SEP.join(["VPP", '"started"', '"Merger"', "NA", "NA"]), file=sys.stderr, flush=True)
+    print("WARNING: [fake] something minor", file=sys.stderr, flush=True)
+    home_dir.mkdir(parents=True, exist_ok=True)
+    out = home_dir / "clip.mp4"
+    out.write_bytes(b"fake")
+    print(SEP.join(["VF", json.dumps(str(out))]), flush=True)
+    if mode() == "partial":
+        print("ERROR: [fake] entry 2 failed", file=sys.stderr, flush=True)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
