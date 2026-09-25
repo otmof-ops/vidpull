@@ -47,6 +47,10 @@ Contributions are accepted under the project license, BSD 3-Clause (`LICENSE`). 
 copyright line, which carries the author's name and the repository link, in every copy, and
 keep the credit in `vidpull version` and the help screen intact in forks and derived works.
 
+When a dependency is added, removed or changes its licence, refresh `THIRD-PARTY-NOTICES.md`
+with `scripts/third-party-inventory.py` (run under the live generation's interpreter) and check
+the compatibility summary still holds.
+
 ## Style
 
 Python 3.12, ruff (`make lint` / `make format`), 100-column lines, no shell=True anywhere,

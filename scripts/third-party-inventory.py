@@ -68,7 +68,7 @@ def direct_names() -> set[str]:
     for req in md.requires("vidpull") or []:
         if "extra ==" in req:
             continue
-        names.add(re.split(r"[\[\s<>=!;]", req, 1)[0].lower())
+        names.add(re.split(r"[\[\s<>=!;]", req, maxsplit=1)[0].lower())
     return names
 
 
@@ -99,7 +99,8 @@ def render(rows) -> str:
         "",
         f"Generated from `{sys.prefix}` with Python {sys.version.split()[0]}.",
         "",
-        "| Package | Version | Licence (as declared by the package) | Role | How vidpull uses it | Source |",
+        "| Package | Version | Licence (as declared by the package) | Role "
+        "| How vidpull uses it | Source |",
         "| --- | --- | --- | --- | --- | --- |",
     ]
     for name, ver, lic, kind, linkage, src in rows:
