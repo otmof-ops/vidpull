@@ -502,7 +502,7 @@ def finalize_install(
     layout.point_current(gen_id)
     manifest.save(paths.manifest_file)
     pipeline.manifest = manifest
-    pipeline._prune()  # noqa: SLF001 - keep current + previous, exactly like an update
+    pipeline._prune()
     return manifest
 
 
