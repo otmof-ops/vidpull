@@ -6,6 +6,8 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-27
+
 ### Added
 
 - Spotify links. A track, album or playlist link (or `spotify:` URI) becomes one audio job per
