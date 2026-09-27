@@ -6,6 +6,12 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `THIRD-PARTY-NOTICES.md`: what runs alongside vidpull and under whose terms, with the
+  generated inventory (`scripts/third-party-inventory.py`) and the bundling caveat for
+  mutagen (GPL) and certifi (MPL). Shipped in the wheel next to LICENSE.
+
 ## [1.0.1] - 2026-09-26
 
 ### Fixed

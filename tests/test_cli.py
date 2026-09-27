@@ -1,4 +1,6 @@
 import json
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -131,3 +133,23 @@ def test_normalize_argv_url_first():
     assert cli.normalize_argv(["doctor"]) == ["doctor"]
     ns = cli.build_parser().parse_args(cli.normalize_argv(["https://a/b", "https://c"]))
     assert ns.command == "tui" and ns.urls == ["https://a/b", "https://c"]
+
+
+def test_third_party_inventory_script_runs(tmp_path, monkeypatch):
+    import runpy
+    import shutil
+
+    script = Path(__file__).parent.parent / "scripts" / "third-party-inventory.py"
+    notices = Path(__file__).parent.parent / "THIRD-PARTY-NOTICES.md"
+    work = tmp_path / "repo"
+    (work / "scripts").mkdir(parents=True)
+    shutil.copy(script, work / "scripts" / "third-party-inventory.py")
+    shutil.copy(notices, work / "THIRD-PARTY-NOTICES.md")
+    monkeypatch.setattr(sys, "argv", [str(work / "scripts" / "third-party-inventory.py")])
+    try:
+        runpy.run_path(str(work / "scripts" / "third-party-inventory.py"), run_name="__main__")
+    except SystemExit as exc:
+        assert exc.code == 0
+    text = (work / "THIRD-PARTY-NOTICES.md").read_text()
+    assert "| yt-dlp |" in text and "| textual |" in text and "direct" in text
+    assert "vidpull" not in text.split("<!-- INVENTORY:START -->")[1].split("|")[1:2]
