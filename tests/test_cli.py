@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import FakeEngine
+from tests.helpers import FakeEngine, FakeSongEngine
 from vidpull import __version__, cli
 from vidpull.models import Job, Selection, SelectionKind
 from vidpull.store import Store
@@ -153,3 +153,37 @@ def test_third_party_inventory_script_runs(tmp_path, monkeypatch):
     text = (work / "THIRD-PARTY-NOTICES.md").read_text()
     assert "| yt-dlp |" in text and "| textual |" in text and "direct" in text
     assert "vidpull" not in text.split("<!-- INVENTORY:START -->")[1].split("|")[1:2]
+
+
+SPOTIFY_TRACK = "https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl"
+
+
+def test_get_spotify_link_resolves_matches_and_downloads(monkeypatch, capsys, paths, video_info):
+    engine = FakeEngine(info=video_info)
+    song_engine = FakeSongEngine()
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: engine)
+    monkeypatch.setattr(cli, "SpotdlEngine", lambda *a, **k: song_engine)
+    code = cli.main(["get", SPOTIFY_TRACK, "-a", "mp3"])
+    out = capsys.readouterr().out
+    assert code == 0 and "saved" in out
+    assert song_engine.resolved == [SPOTIFY_TRACK] and song_engine.matched
+    assert engine.infos[-1]["track"] == "Cut To The Feeling"
+    job = Store(paths.db_file).list()[0]
+    assert job.song is not None and job.selection.audio_only and job.status == "done"
+
+    assert cli.main(["get", SPOTIFY_TRACK, "-q", "720p"]) == 2  # songs are audio-only
+    assert "audio-only" in capsys.readouterr().err
+
+    assert cli.main(["get", SPOTIFY_TRACK, "--list"]) == 0
+    listed = capsys.readouterr().out
+    assert "Cut To The Feeling" in listed and "Carly Rae Jepsen" in listed and "3:27" in listed
+
+
+def test_get_spotify_link_without_spotdl_explains(monkeypatch, capsys, paths, video_info):
+    engine = FakeEngine(info=video_info)
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: engine)
+    monkeypatch.setattr(cli, "SpotdlEngine", lambda *a, **k: FakeSongEngine(available=False))
+    assert cli.main(["get", SPOTIFY_TRACK]) == 1  # not a terminal: disclosed, nothing installed
+    out = capsys.readouterr().out
+    assert "spotDL" in out and str(paths.spotdl_venv) in out and "--yes" in out
+    assert engine.downloads == []

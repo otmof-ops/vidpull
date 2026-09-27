@@ -8,6 +8,14 @@ All notable changes to vidpull are recorded here. The format follows
 
 ### Added
 
+- Spotify links. A track, album or playlist link (or `spotify:` URI) becomes one audio job per
+  song: spotDL, run as a second engine in its own environment under the data dir, resolves the
+  songs and matches each on YouTube Music; vidpull's yt-dlp engine downloads the match with the
+  song's own title, artists, album, numbers, date and cover written through `--load-info-json`.
+  The first Spotify link offers the install (about 200 MB, nothing without a yes); `vidpull
+  update` refreshes it, `vidpull doctor` reports it, `vidpull uninstall` removes it. New settings
+  `song_format` and `song_template`; songs with no confident match wait as pending and `p` or
+  `r` looks again. The job database gains its first migration (schema 2: `song`, `matched_url`).
 - `THIRD-PARTY-NOTICES.md`: what runs alongside vidpull and under whose terms, with the
   generated inventory (`scripts/third-party-inventory.py`) and the bundling caveat for
   mutagen (GPL) and certifi (MPL). Shipped in the wheel next to LICENSE.

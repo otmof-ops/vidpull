@@ -73,6 +73,26 @@ vidpull get URL --list          # every format with its id, then: vidpull get UR
 vidpull get URL --playlist      # the whole playlist the link belongs to
 ```
 
+### Spotify links
+
+Paste a Spotify track, album or playlist link (or a `spotify:` URI) and vidpull queues one job per
+song. The audio does not come from Spotify: [spotDL](https://github.com/spotDL/spotify-downloader)
+reads the track list and finds each song on YouTube Music, and vidpull downloads that upload with
+its own engine and tags the file with the song's title, artists, album, track number, date and
+cover. Songs are audio-only, MP3 320 kbps unless `song_format` or `-a` says otherwise:
+
+```sh
+vidpull get https://open.spotify.com/album/6dVIqQ8qmQ5GBnJ9shOYGE -a opus
+vidpull get https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl --list   # the songs, no download
+```
+
+The first Spotify link offers to install spotDL into its own environment under
+`~/.local/share/vidpull/spotdl-venv` (about 200 MB, no sudo); nothing is installed without your
+yes, `vidpull update` keeps it current and `vidpull uninstall` removes it with everything else.
+spotDL keeps its own settings in `~/.config/spotdl`. A song with no confident match on YouTube
+Music waits as pending; `p` or `r` looks again. The quality ceiling is YouTube's stream, so a
+320 kbps MP3 is still made from that source.
+
 ## Keeping it current
 
 ```sh

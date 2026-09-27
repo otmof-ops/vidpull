@@ -6,6 +6,7 @@ import contextlib
 import logging
 import os
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -27,9 +28,18 @@ from vidpull.formats import build_menu, human_size, preset_selection
 from vidpull.log import RingBufferHandler, setup_logging
 from vidpull.manager import DownloadManager
 from vidpull.manifest import Manifest
-from vidpull.models import Job, JobEvent, JobStatus, MediaInfo, Selection
+from vidpull.models import Job, JobEvent, JobStatus, MediaInfo, Selection, Song
 from vidpull.paths import Paths
 from vidpull.procs import redact_url, which
+from vidpull.spotdl import (
+    InstallError,
+    ResolveError,
+    SongEngine,
+    SpotdlEngine,
+    is_spotify_link,
+)
+from vidpull.spotdl import disclosure as spotdl_disclosure
+from vidpull.spotdl import install as spotdl_install
 from vidpull.store import Store
 from vidpull.tui.screens.confirm import ConfirmScreen, TextScreen
 from vidpull.tui.screens.logview import LogScreen
@@ -48,6 +58,7 @@ COLUMNS = ("#", "Title", "Format", "Status", "Progress", "Speed", "ETA", "Size")
 STATUS_STYLE = {
     JobStatus.PENDING: "yellow",
     JobStatus.QUEUED: "dim",
+    JobStatus.MATCHING: "cyan",
     JobStatus.DOWNLOADING: "cyan",
     JobStatus.PROCESSING: "magenta",
     JobStatus.DONE: "green",
@@ -135,6 +146,7 @@ class VidpullApp(App[PostExit | None]):
         ring: RingBufferHandler | None = None,
         clipboard_reader: Callable[[], str | None] | None = None,
         initial_urls: list[str] | None = None,
+        song_engine: SongEngine | None = None,
     ):
         super().__init__()
         self.config = config
@@ -144,6 +156,11 @@ class VidpullApp(App[PostExit | None]):
         self.ring = ring
         self.manager = manager or DownloadManager(store, engine, config, paths)
         self.manager.on_event = self._on_manager_event
+        self.song_engine: SongEngine = song_engine or SpotdlEngine(
+            config, paths, engine_python=getattr(engine, "python", None)
+        )
+        if self.manager.song_engine is None:
+            self.manager.song_engine = self.song_engine
         self.pipeline = pipeline or UpdatePipeline(paths, config)
         self._clipboard_reader = clipboard_reader or read_clipboard
         self._columns: dict[str, object] = {}
@@ -240,6 +257,10 @@ class VidpullApp(App[PostExit | None]):
         url = message.url
         if any(j.url == url and not j.is_terminal for j in self.store.list()):
             return
+        if is_spotify_link(url):  # songs skip the picker: resolve and queue them as audio
+            self._url_queue.append(url)
+            self._probe_next()
+            return
         placeholder = preset_selection(self.config.default_preset, self.config)
         job = self.manager.enqueue(url, placeholder, status=JobStatus.PENDING)
         self.notify(f"copied URL queued as job {job.id}; press p to pick a format", timeout=6)
@@ -304,12 +325,81 @@ class VidpullApp(App[PostExit | None]):
         if self._modal_open():
             return
         url = self._url_queue.pop(0)
+        if is_spotify_link(url):
+            self.notify(f"resolving {_short(url, 60)} through spotDL", timeout=3)
+            self.resolve_spotify(url)
+            return
         if not url.lower().startswith(("http://", "https://")):
             self.notify(f"not a URL: {_short(url, 60)}", severity="warning")
             self._probe_next()
             return
         self.notify(f"probing {_short(redact_url(url), 60)}", timeout=3)
         self.probe(url, batch=self._batch_selection is not None)
+
+    # ------------------------------------------------------ spotify links
+    @work(thread=True, group="probe")
+    def resolve_spotify(self, url: str) -> None:
+        """Turn a Spotify link into song jobs; offers to install spotDL when it is missing."""
+        if not self.song_engine.available():
+            self.call_from_thread(self._offer_spotdl, url)
+            return
+        try:
+            songs = self.song_engine.resolve(url)
+        except ResolveError as exc:
+            self.call_from_thread(
+                self.notify, str(exc), title="Spotify link failed", severity="error", timeout=8
+            )
+            self.call_from_thread(self._probe_next)
+            return
+        self.call_from_thread(self._queue_songs, songs)
+
+    def _queue_songs(self, songs: list[Song]) -> None:
+        selection = preset_selection(self.config.song_format, self.config)
+        for song in songs:
+            self.manager.enqueue_song(song, selection)
+        if len(songs) == 1:
+            what = songs[0].display_title
+        elif songs and songs[0].list_name:
+            what = f"{len(songs)} songs from {songs[0].list_name}"
+        else:
+            what = f"{len(songs)} songs"
+        self.notify(
+            f"queued {_short(what, 50)} · {selection.label} · audio from YouTube Music", timeout=6
+        )
+        if not self._modal_open():
+            self.table.focus()
+        self._probe_next()
+
+    def _offer_spotdl(self, url: str) -> None:
+        def decided(result: tuple[bool, bool] | None) -> None:
+            if result is not None and result[0]:
+                self.install_spotdl(url)
+                return
+            self.notify("skipped; paste the link again any time to install spotDL", timeout=6)
+            self._probe_next()
+
+        self.push_screen(
+            ConfirmScreen(spotdl_disclosure(self.paths), yes_label="Install"), callback=decided
+        )
+
+    @work(thread=True, group="probe")
+    def install_spotdl(self, url: str) -> None:
+        self.call_from_thread(
+            self.notify, "installing spotDL; this takes a few minutes", timeout=10
+        )
+        python = getattr(self.engine, "python", None) or sys.executable
+        try:
+            spotdl_install(
+                self.paths, python, report=lambda line: log.info("spotdl install: %s", line)
+            )
+        except InstallError as exc:
+            self.call_from_thread(
+                self.notify, str(exc), title="spotDL install failed", severity="error", timeout=10
+            )
+            self.call_from_thread(self._probe_next)
+            return
+        self.call_from_thread(self.notify, "spotDL installed", timeout=5)
+        self.call_from_thread(self.resolve_spotify, url)
 
     # ------------------------------------------------------------- flows
     @on(Input.Submitted, "#url")
@@ -424,6 +514,10 @@ class VidpullApp(App[PostExit | None]):
             return
         if job.status != JobStatus.PENDING:
             self.notify("p picks a format for a pending job; add URLs with a", severity="warning")
+            return
+        if job.song is not None:  # an unmatched song: look again rather than open a picker
+            self.manager.retry(job.id)
+            self.notify(f"looking again for {_short(job.display_title, 50)}", timeout=4)
             return
         self.probe(job.url, job.id)
 

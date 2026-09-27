@@ -70,6 +70,11 @@ class Paths:
         return self.data_dir / "venv"
 
     @property
+    def spotdl_venv(self) -> Path:
+        """The second engine's virtualenv (see ``vidpull.spotdl``); shared by all generations."""
+        return self.data_dir / "spotdl-venv"
+
+    @property
     def launcher(self) -> Path:
         return self.bin_dir / APP_NAME
 

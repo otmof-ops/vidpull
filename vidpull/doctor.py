@@ -19,6 +19,7 @@ from vidpull.manifest import Manifest
 from vidpull.paths import Paths
 from vidpull.preflight import JS_RUNTIME_MINIMUM, tool_version
 from vidpull.procs import run, which
+from vidpull.spotdl import SpotdlEngine
 from vidpull.versioning import git_describe, source_checkout
 
 DOCTOR_PROBE_URL = "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
@@ -41,6 +42,7 @@ def run_checks(
     checks.extend(_engine_checks(engine))
     checks.append(_js_runtime_check(engine))
     checks.append(_ffmpeg_check(engine))
+    checks.append(_spotdl_check(config, paths, engine))
     checks.extend(_dir_checks(config, paths))
     checks.append(_db_check(paths))
     checks.append(_clipboard_check())
@@ -137,6 +139,20 @@ def _ffmpeg_check(engine: YtDlpEngine) -> Check:
     except (OSError, subprocess.SubprocessError, IndexError):
         first = ffmpeg
     return Check("ffmpeg", "ok", first[:80])
+
+
+def _spotdl_check(config: Config, paths: Paths, engine: YtDlpEngine) -> Check:
+    song_engine = SpotdlEngine(config, paths, engine_python=engine.python)
+    if not song_engine.available():
+        return Check("spotdl", "ok", "not installed; offered the first time you use a Spotify link")
+    version = song_engine.version()
+    if version == "unavailable":
+        return Check(
+            "spotdl",
+            "fail",
+            f"{paths.spotdl_venv} does not run; delete it and use a Spotify link again",
+        )
+    return Check("spotdl", "ok", f"{version} in {paths.spotdl_venv} (Spotify links)")
 
 
 def _dir_checks(config: Config, paths: Paths) -> list[Check]:

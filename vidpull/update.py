@@ -26,6 +26,8 @@ from vidpull.manifest import Generation, Manifest
 from vidpull.paths import Paths
 from vidpull.procs import clean_env, run, which
 from vidpull.semver import Version
+from vidpull.spotdl import SpotdlError
+from vidpull.spotdl import install as spotdl_install
 from vidpull.versioning import (
     GitError,
     changelog_section,
@@ -278,6 +280,7 @@ class UpdatePipeline:
             finally:
                 shutil.rmtree(build_dir, ignore_errors=True)
             self._prune()
+            self._refresh_spotdl()
         self.report(f"switched current to {gen_id}; restart vidpull to run it")
         return UpdateResult(
             ok=True,
@@ -317,6 +320,16 @@ class UpdatePipeline:
         return [str(self.layout.current_link / "bin" / "vidpull")]
 
     # -------------------------------------------------------------- steps
+    def _refresh_spotdl(self) -> None:
+        """Bring the optional spotDL environment along; a failure there never fails the update."""
+        if not (self.paths.spotdl_venv / "bin" / "python").exists():
+            return
+        self.report("refreshing spotDL")
+        try:
+            spotdl_install(self.paths, self.python, report=self.report, upgrade=True)
+        except SpotdlError as exc:
+            self.report(f"spotDL refresh failed ({exc}); Spotify links keep the installed copy")
+
     def _preflight(self) -> None:
         if which("git") is None:
             raise UpdateError("git is required to fetch releases")

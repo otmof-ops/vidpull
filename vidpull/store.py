@@ -2,7 +2,8 @@
 
 One connection shared across threads behind a re-entrant lock; WAL mode so the
 TUI can read while a worker writes. The schema is created on open and versioned
-through the ``meta`` table.
+through the ``meta`` table; an older database is migrated in place, one version
+at a time, inside a transaction.
 """
 
 from __future__ import annotations
@@ -14,9 +15,9 @@ import threading
 from collections.abc import Iterable
 from pathlib import Path
 
-from vidpull.models import Job, JobStatus, Selection, utcnow
+from vidpull.models import Job, JobStatus, Selection, Song, utcnow
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -42,7 +43,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     started_at TEXT,
-    finished_at TEXT
+    finished_at TEXT,
+    song TEXT NOT NULL DEFAULT '',
+    matched_url TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE TABLE IF NOT EXISTS meta (
@@ -50,6 +53,15 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 """
+
+# Statements that take a database from version N-1 to N. ``ALTER TABLE ... ADD COLUMN`` is
+# skipped when the column already exists, so a run interrupted half-way can be repeated.
+_MIGRATIONS: dict[int, tuple[str, ...]] = {
+    2: (
+        "ALTER TABLE jobs ADD COLUMN song TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE jobs ADD COLUMN matched_url TEXT NOT NULL DEFAULT ''",
+    ),
+}
 
 _COLUMNS = (
     "url",
@@ -74,6 +86,8 @@ _COLUMNS = (
     "updated_at",
     "started_at",
     "finished_at",
+    "song",
+    "matched_url",
 )
 
 
@@ -91,8 +105,11 @@ class Store:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
-            if self.get_meta("schema_version") is None:
+            recorded = self.get_meta("schema_version")
+            if recorded is None:
                 self.set_meta("schema_version", str(SCHEMA_VERSION))
+            else:
+                self._migrate(int(recorded))
         if str(path) != ":memory:":
             with contextlib.suppress(OSError):
                 self.path.chmod(0o600)
@@ -100,6 +117,28 @@ class Store:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def _migrate(self, recorded: int) -> None:
+        for version in range(recorded + 1, SCHEMA_VERSION + 1):
+            columns = {
+                str(row["name"]) for row in self._conn.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                for statement in _MIGRATIONS.get(version, ()):
+                    added = _added_column(statement)
+                    if added is not None and added in columns:
+                        continue
+                    self._conn.execute(statement)
+                self._conn.execute(
+                    "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (str(version),),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     # ------------------------------------------------------------- meta
     def get_meta(self, key: str) -> str | None:
@@ -211,10 +250,11 @@ class Store:
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE jobs SET status = ?, worker = '', speed = NULL, eta = NULL, "
-                "updated_at = ? WHERE status IN (?, ?)",
+                "updated_at = ? WHERE status IN (?, ?, ?)",
                 (
                     str(JobStatus.QUEUED),
                     utcnow(),
+                    str(JobStatus.MATCHING),
                     str(JobStatus.DOWNLOADING),
                     str(JobStatus.PROCESSING),
                 ),
@@ -236,9 +276,24 @@ class Store:
         return {str(r["status"]): int(r["n"]) for r in rows}
 
 
+def _added_column(statement: str) -> str | None:
+    words = statement.split()
+    if len(words) >= 6 and [w.upper() for w in words[:5]] == [
+        "ALTER",
+        "TABLE",
+        "JOBS",
+        "ADD",
+        "COLUMN",
+    ]:
+        return words[5]
+    return None
+
+
 def _encode(column: str, value: object) -> object:
     if column == "selection" and isinstance(value, Selection):
         return value.to_json()
+    if column == "song":
+        return value.to_json() if isinstance(value, Song) else (value or "")
     if column == "files" and isinstance(value, list):
         return json.dumps(value)
     if column == "status" and isinstance(value, JobStatus):
@@ -272,10 +327,13 @@ def _to_row(job: Job) -> dict[str, object]:
         "updated_at": job.updated_at,
         "started_at": job.started_at,
         "finished_at": job.finished_at,
+        "song": job.song.to_json() if job.song is not None else "",
+        "matched_url": job.matched_url,
     }
 
 
 def _from_row(row: sqlite3.Row) -> Job:
+    song_text = row["song"]
     return Job(
         id=int(row["id"]),
         url=row["url"],
@@ -300,4 +358,6 @@ def _from_row(row: sqlite3.Row) -> Job:
         updated_at=row["updated_at"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
+        song=Song.from_json(song_text) if song_text else None,
+        matched_url=row["matched_url"] or "",
     )

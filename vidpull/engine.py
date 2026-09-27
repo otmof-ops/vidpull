@@ -10,6 +10,10 @@ Wire protocol (one record per line, tab separated, JSON-encoded fields, ``NA`` f
 absent values): ``VP`` download progress and ``VF`` final file paths arrive on
 stdout; ``VPP`` postprocessor progress arrives on stderr along with yt-dlp's own
 warnings and errors.
+
+A song job (a track resolved from a Spotify link, see ``vidpull.spotdl``) is
+downloaded from a probe of its matched upload fed back through
+``--load-info-json``, with the song's own tags and cover written into that JSON.
 """
 
 from __future__ import annotations
@@ -47,6 +51,7 @@ MARKS = {MARK_PROGRESS, MARK_POSTPROCESS, MARK_FILE, MARK_INFO}
 PROBE_TIMEOUT = 180.0
 VERSION_TIMEOUT = 30.0
 KILL_GRACE_SECONDS = 8.0
+INFO_JSON_NAME = "info.json"
 
 PP_LABELS: dict[str, str] = {
     "ExtractAudio": "extracting audio",
@@ -107,6 +112,8 @@ class DownloadResult:
 class Engine(Protocol):
     def probe(self, url: str, *, playlist: bool = False) -> MediaInfo: ...
 
+    def probe_json(self, url: str, *, playlist: bool = False) -> dict[str, Any]: ...
+
     def download(
         self,
         job: Job,
@@ -115,6 +122,8 @@ class Engine(Protocol):
         on_progress: Callable[[Progress], None],
         cancel: threading.Event,
         on_log: Callable[[str, str], None],
+        *,
+        info: dict[str, Any] | None = None,
     ) -> DownloadResult: ...
 
     def version(self) -> str: ...
@@ -213,11 +222,24 @@ def media_info_from_dict(url: str, data: dict[str, Any]) -> MediaInfo:
 
 
 def download_args(
-    job: Job, config: Config, download_dir: Path, temp_dir: Path, *, playlist: bool
+    job: Job,
+    config: Config,
+    download_dir: Path,
+    temp_dir: Path,
+    *,
+    playlist: bool,
+    info_path: Path | None = None,
 ) -> list[str]:
-    """Everything after ``python -m yt_dlp`` and the common flags, in yt-dlp CLI form."""
+    """Everything after ``python -m yt_dlp`` and the common flags, in yt-dlp CLI form.
+
+    With ``info_path`` the download reads that info JSON instead of extracting
+    ``job.url`` (a song job downloads its matched upload this way, tags included).
+    """
     selection = job.selection
-    template = config.playlist_template if playlist else config.output_template
+    if job.song is not None:
+        template = config.song_template
+    else:
+        template = config.playlist_template if playlist else config.output_template
     args = [
         "--newline",
         "--progress",
@@ -285,14 +307,17 @@ def download_args(
             args += ["--extract-audio", "--audio-format", str(pp.get("preferredcodec", "best"))]
             if pp.get("preferredquality") is not None:
                 args += ["--audio-quality", str(pp["preferredquality"])]
-    if config.embed_metadata:
+    if config.embed_metadata or job.song is not None:
         args.append("--embed-metadata")
-    if config.embed_thumbnail:
-        args.append("--embed-thumbnail")
+    if config.embed_thumbnail or job.song is not None:
+        args.append("--embed-thumbnail")  # a song carries its own cover in the info JSON
     if config.subtitles and not selection.audio_only:
         langs = ",".join(config.subtitle_langs) or "en"
         args += ["--write-subs", "--sub-langs", langs, "--embed-subs"]
-    args += ["--", job.url]
+    if info_path is not None:
+        args += ["--load-info-json", str(info_path)]
+    else:
+        args += ["--", job.url]
     return args
 
 
@@ -345,6 +370,10 @@ class YtDlpEngine:
         return text
 
     def probe(self, url: str, *, playlist: bool = False) -> MediaInfo:
+        return media_info_from_dict(url, self.probe_json(url, playlist=playlist))
+
+    def probe_json(self, url: str, *, playlist: bool = False) -> dict[str, Any]:
+        """yt-dlp's ``-J`` document for ``url``: what ``--load-info-json`` reads back."""
         args = [
             *self.prefix(),
             *self.common_args(),
@@ -371,7 +400,7 @@ class YtDlpEngine:
             raise ProbeError("yt-dlp returned unreadable JSON") from exc
         if not isinstance(data, dict):
             raise ProbeError("yt-dlp returned an unexpected document")
-        return media_info_from_dict(url, data)
+        return data
 
     def download(
         self,
@@ -381,17 +410,28 @@ class YtDlpEngine:
         on_progress: Callable[[Progress], None],
         cancel: threading.Event,
         on_log: Callable[[str, str], None],
+        *,
+        info: dict[str, Any] | None = None,
     ) -> DownloadResult:
         if cancel.is_set():
             return DownloadResult(ok=False, cancelled=True)
         playlist = job.selection.playlist
+        download_dir.mkdir(parents=True, exist_ok=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        info_path: Path | None = None
+        if info is not None:
+            info_path = temp_dir / INFO_JSON_NAME
+            try:
+                info_path.write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
+            except OSError as exc:
+                return DownloadResult(ok=False, error=f"cannot write the info JSON: {exc}")
         argv = [
             *self.prefix(),
             *self.common_args(),
-            *download_args(job, self.config, download_dir, temp_dir, playlist=playlist),
+            *download_args(
+                job, self.config, download_dir, temp_dir, playlist=playlist, info_path=info_path
+            ),
         ]
-        download_dir.mkdir(parents=True, exist_ok=True)
-        temp_dir.mkdir(parents=True, exist_ok=True)
         try:
             proc = subprocess.Popen(
                 argv,

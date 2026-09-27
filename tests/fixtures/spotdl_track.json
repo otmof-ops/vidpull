@@ -1,0 +1,39 @@
+[
+  {
+    "name": "Cut To The Feeling",
+    "artists": [
+      "Carly Rae Jepsen"
+    ],
+    "artist": "Carly Rae Jepsen",
+    "genres": [
+      "",
+      ""
+    ],
+    "disc_number": 1,
+    "disc_count": 1,
+    "album_name": "Cut To The Feeling",
+    "album_artist": "Carly Rae Jepsen",
+    "duration": 207,
+    "year": 2017,
+    "date": "2017-05-26",
+    "track_number": 1,
+    "tracks_count": 1,
+    "song_id": "11dFghVXANMlKmJXsNCbNl",
+    "explicit": false,
+    "publisher": "Universal Music Group",
+    "url": "https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl",
+    "isrc": "",
+    "cover_url": "https://i.scdn.co/image/ab67616d0000b2737359994525d219f64872d3b1",
+    "copyright_text": "",
+    "download_url": null,
+    "lyrics": null,
+    "popularity": 10,
+    "album_id": "0tGPJ0bkWOUmH7MEOR77qc",
+    "list_name": null,
+    "list_url": null,
+    "list_position": null,
+    "list_length": null,
+    "artist_id": "6sFIWsNpZYqfjUpaCgueju",
+    "album_type": "album"
+  }
+]

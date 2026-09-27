@@ -32,6 +32,22 @@ GPL-2.0-or-later obligations and certifi's MPL-2.0 file-level terms. Either sati
 whole artifact, or leave mutagen out (`yt-dlp` without the `default` extra, at the cost of embedded
 metadata and thumbnails).
 
+## The optional spotDL environment
+
+Spotify links are handled by [spotDL](https://github.com/spotDL/spotify-downloader) (MIT), which
+vidpull installs, only after the user says yes, into a **second virtual environment** under the
+data dir (`~/.local/share/vidpull/spotdl-venv`) and runs as a **separate process** (`spotdl save`,
+`spotdl url`) the way it runs yt-dlp. vidpull never imports it and never redistributes it.
+
+That environment is pip-installed from PyPI onto the user's machine and holds about 64 packages,
+each under its own licence. Besides MIT, BSD, Apache and PSF entries it contains **mutagen**
+(GPL-2.0-or-later), **pykakasi** (GPL-3.0-or-later), **Unidecode** and **text-unidecode**
+(GPL-2.0-or-later, the latter also Artistic) and **spotapi** (GPL-3.0). The position is the one
+described for mutagen above: use, not distribution, behind a process boundary. It does not change
+vidpull's licence. Anyone who bundles vidpull *together with that environment* into one artifact
+takes on those GPL obligations for the whole artifact; leave the spotDL environment out of any
+bundle, as this repository does.
+
 ## Inventory
 
 Regenerate with the interpreter whose packages you want listed, normally the live generation:

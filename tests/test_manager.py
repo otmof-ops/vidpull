@@ -1,7 +1,7 @@
 import threading
 
-from tests.helpers import FakeEngine, wait_until
-from vidpull.manager import DownloadManager
+from tests.helpers import MATCHED_URL, FakeEngine, FakeSongEngine, sample_song, wait_until
+from vidpull.manager import NO_MATCH_PHASE, DownloadManager
 from vidpull.models import JobStatus, Selection, SelectionKind
 
 
@@ -135,3 +135,57 @@ def test_stop_requeues_active_jobs_for_resume(store, config, paths):
         assert wait_until(lambda: store.get(job.id).status == JobStatus.DONE)
     finally:
         manager2.stop()
+
+
+def test_song_job_matches_then_downloads_with_tags(store, config, paths):
+    engine = FakeEngine()
+    song_engine = FakeSongEngine()
+    manager, events = make_manager(store, config, paths, engine)
+    manager.song_engine = song_engine
+    manager.start()
+    try:
+        job = manager.enqueue_song(sample_song(), selection())
+        assert job.song is not None and job.display_title == "Carly Rae Jepsen - Cut To The Feeling"
+        assert wait_until(lambda: store.get(job.id).status == JobStatus.DONE)
+        done = store.get(job.id)
+        assert done.matched_url == MATCHED_URL and done.song.title == "Cut To The Feeling"
+        assert song_engine.matched == ["Carly Rae Jepsen - Cut To The Feeling"]
+        assert engine.json_probes == [MATCHED_URL]
+        info = engine.infos[-1]
+        assert info["track"] == "Cut To The Feeling" and info["album"] == "Cut To The Feeling"
+        assert info["artists"] == ["Carly Rae Jepsen"] and "webpage_url" not in info
+        assert any(e.job.status == JobStatus.MATCHING for e in events)
+    finally:
+        manager.stop()
+
+
+def test_song_job_without_match_waits_as_pending_and_can_retry(store, config, paths):
+    engine = FakeEngine()
+    song_engine = FakeSongEngine(match_url=None)
+    manager, _ = make_manager(store, config, paths, engine)
+    manager.song_engine = song_engine
+    manager.start()
+    try:
+        job = manager.enqueue_song(sample_song(), selection())
+        assert wait_until(lambda: store.get(job.id).status == JobStatus.PENDING)
+        waiting = store.get(job.id)
+        assert waiting.phase == NO_MATCH_PHASE and waiting.matched_url == ""
+        assert engine.downloads == []
+        song_engine.match_url = MATCHED_URL
+        assert manager.retry(job.id) is not None  # an unmatched song can be retried
+        assert wait_until(lambda: store.get(job.id).status == JobStatus.DONE)
+        assert len(song_engine.matched) == 2
+    finally:
+        manager.stop()
+
+
+def test_song_job_without_song_engine_fails(store, config, paths):
+    engine = FakeEngine()
+    manager, _ = make_manager(store, config, paths, engine)
+    manager.start()
+    try:
+        job = manager.enqueue_song(sample_song(), selection())
+        assert wait_until(lambda: store.get(job.id).status == JobStatus.FAILED)
+        assert "spotDL" in store.get(job.id).error and engine.downloads == []
+    finally:
+        manager.stop()
