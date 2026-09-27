@@ -38,7 +38,11 @@ def main(argv: list[str]) -> int:
     if "--version" in args:
         print("2026.08.19")
         return 0
-    url = args[-1]
+    info_file = opt(args, "--load-info-json")
+    if info_file is not None:  # a song job: the URL comes from the info JSON, not argv
+        url = str(json.loads(Path(info_file).read_text()).get("original_url") or "info")
+    else:
+        url = args[-1]
     if "-J" in args:
         if mode() == "error":
             print("ERROR: [fake] Unsupported URL: " + url, file=sys.stderr)

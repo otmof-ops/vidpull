@@ -7,7 +7,7 @@ import threading
 
 from textual.widgets import DataTable, Input
 
-from tests.helpers import FakeEngine, wait_until
+from tests.helpers import FakeEngine, FakeSongEngine, wait_until
 from vidpull.models import JobStatus, Selection, SelectionKind
 from vidpull.tui.app import PostExit, VidpullApp
 from vidpull.tui.screens.confirm import ConfirmScreen
@@ -353,3 +353,49 @@ def test_use_choice_for_all_links(config, paths, store, video_info):
 
     run(flow())
     app.manager.stop()
+
+
+SPOTIFY_TRACK = "https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl"
+
+
+def test_spotify_link_queues_a_song_without_a_picker(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    song_engine = FakeSongEngine()
+    app = make_app(config, paths, store, engine, song_engine=song_engine)
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = SPOTIFY_TRACK
+            await pilot.press("enter")
+            assert await until(pilot, lambda: len(store.list()) == 1)
+            assert not isinstance(app.screen, FormatPicker)
+            job = store.list()[0]
+            assert job.song is not None and job.selection.audio_only
+            assert job.display_title == "Carly Rae Jepsen - Cut To The Feeling"
+            assert wait_until(lambda: store.get(job.id).status == JobStatus.DONE)
+            assert song_engine.resolved == [SPOTIFY_TRACK]
+            assert await until(
+                pilot,
+                lambda: "100%" in str(app.query_one("#jobs", DataTable).get_row(str(job.id))[4]),
+            )
+
+    run(flow())
+
+
+def test_spotify_link_without_spotdl_offers_install(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    app = make_app(config, paths, store, engine, song_engine=FakeSongEngine(available=False))
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = SPOTIFY_TRACK
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
+            assert "spotDL" in app.screen.question
+            await pilot.press("n")
+            assert await until(pilot, lambda: not isinstance(app.screen, ConfirmScreen))
+            assert store.list() == []
+
+    run(flow())

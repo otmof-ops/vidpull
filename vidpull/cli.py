@@ -32,6 +32,14 @@ from vidpull.models import Job, JobEvent, JobStatus, Selection
 from vidpull.paths import Paths
 from vidpull.procs import redact_url
 from vidpull.semver import Version
+from vidpull.spotdl import (
+    InstallError,
+    ResolveError,
+    SpotdlEngine,
+    is_spotify_link,
+)
+from vidpull.spotdl import disclosure as spotdl_disclosure
+from vidpull.spotdl import install as spotdl_install
 from vidpull.store import Store
 from vidpull.update import NotInstalledError, UpdateError, UpdatePipeline, finalize_install
 from vidpull.urls import looks_like_url, normalize_url
@@ -256,8 +264,31 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
     engine = YtDlpEngine(ctx.config, ctx.paths, extra_args=extra)
     download_dir = Path(args.output_dir).expanduser() if args.output_dir else None
 
+    song_engine: SpotdlEngine | None = None
+    if any(is_spotify_link(u) for u in args.urls):
+        if args.format_id or args.quality:
+            print(
+                "error: Spotify links are audio-only; choose -a mp3, m4a, opus, flac or wav",
+                file=sys.stderr,
+            )
+            return EXIT_USAGE
+        engine_python = getattr(engine, "python", None) or sys.executable
+        song_engine = SpotdlEngine(ctx.config, ctx.paths, engine_python=engine_python)
+        if not song_engine.available() and not _offer_spotdl(
+            ctx, engine_python, assume_yes=args.assume_yes
+        ):
+            return EXIT_FAILURE
+
     if args.list:
         for url in args.urls:
+            if song_engine is not None and is_spotify_link(url):
+                try:
+                    songs = song_engine.resolve(url)
+                except ResolveError as exc:
+                    console.print(f"[red]error:[/] {exc}")
+                    return EXIT_FAILURE
+                _print_songs(console, Table, url, songs)
+                continue
             try:
                 info = engine.probe(url)
             except ProbeError as exc:
@@ -268,6 +299,9 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
 
     try:
         selection = _selection_from_args(args, ctx.config)
+        song_selection = (
+            selection if args.audio else preset_selection(ctx.config.song_format, ctx.config)
+        )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
@@ -303,13 +337,30 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
 
     progress_lock = threading.Lock()
     manager = DownloadManager(
-        store, engine, ctx.config, ctx.paths, on_event, workers=args.jobs, download_dir=download_dir
+        store,
+        engine,
+        ctx.config,
+        ctx.paths,
+        on_event,
+        workers=args.jobs,
+        download_dir=download_dir,
+        song_engine=song_engine,
     )
     ids: list[int] = []
     with progress:
         manager.start(resume=False)
         try:
             for url in args.urls:
+                if song_engine is not None and is_spotify_link(url):
+                    try:
+                        songs = song_engine.resolve(url)
+                    except ResolveError as exc:
+                        console.print(f"[red]error:[/] {redact_url(url)}: {exc}")
+                        continue
+                    for song in songs:
+                        job = manager.enqueue_song(song, song_selection)
+                        ids.append(job.id or 0)
+                    continue
                 try:
                     info = engine.probe(url, playlist=args.playlist)
                 except ProbeError as exc:
@@ -350,6 +401,47 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
             console.print(f"[red]{job.status}[/] {redact_url(job.url)}: {job.error}")
     store.close()
     return EXIT_FAILURE if failures or not ids else EXIT_OK
+
+
+def _print_songs(console, table_cls, url, songs) -> None:
+    table = table_cls(title=_short(redact_url(url), 70))
+    table.add_column("#", justify="right")
+    table.add_column("Title")
+    table.add_column("Artists")
+    table.add_column("Album")
+    table.add_column("Length", justify="right")
+    for index, song in enumerate(songs, 1):
+        length = ""
+        if song.duration:
+            length = f"{int(song.duration // 60)}:{int(song.duration % 60):02d}"
+        table.add_row(str(song.track_number or index), song.title, song.artist, song.album, length)
+    console.print(table)
+    console.print(f"{len(songs)} song(s); the audio comes from YouTube Music when downloaded")
+
+
+def _offer_spotdl(ctx: Context, python: str, *, assume_yes: bool) -> bool:
+    """Disclose what installing spotDL does, ask, install. True when it is usable afterwards."""
+    print(spotdl_disclosure(ctx.paths))
+    if assume_yes:
+        agreed = True
+    elif not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("(not running in a terminal, so nothing was installed; rerun with --yes)")
+        return False
+    else:
+        try:
+            answer = input("Install it now? [Y/n] ").strip().lower()
+        except EOFError:
+            answer = "n"
+        agreed = answer in {"", "y", "yes"}
+    if not agreed:
+        print("Skipped. Spotify links need it; run this again any time.")
+        return False
+    try:
+        spotdl_install(ctx.paths, python)
+    except InstallError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return False
+    return True
 
 
 def _selection_from_args(args: argparse.Namespace, config: Config) -> Selection:

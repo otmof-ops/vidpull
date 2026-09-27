@@ -16,14 +16,16 @@ from collections.abc import Callable
 from pathlib import Path
 
 from vidpull.config import Config
-from vidpull.engine import Engine, Progress
-from vidpull.models import Job, JobEvent, JobStatus, MediaInfo, Selection, utcnow
+from vidpull.engine import DownloadResult, Engine, ProbeError, Progress
+from vidpull.models import Job, JobEvent, JobStatus, MediaInfo, Selection, Song, utcnow
 from vidpull.paths import Paths
+from vidpull.spotdl import SongEngine, tagged_info
 from vidpull.store import Store
 
 log = logging.getLogger(__name__)
 
 PROGRESS_THROTTLE_SECONDS = 0.2
+NO_MATCH_PHASE = "no confident match on YouTube Music"
 EventHandler = Callable[[JobEvent], None]
 
 
@@ -38,9 +40,11 @@ class DownloadManager:
         *,
         workers: int | None = None,
         download_dir: Path | None = None,
+        song_engine: SongEngine | None = None,
     ):
         self.store = store
         self.engine = engine
+        self.song_engine = song_engine
         self.config = config
         self.paths = paths
         self.on_event = on_event
@@ -127,6 +131,25 @@ class DownloadManager:
             self._queue.put(job.id)
         return job
 
+    def enqueue_song(
+        self, song: Song, selection: Selection, *, status: JobStatus = JobStatus.QUEUED
+    ) -> Job:
+        """Queue a song from a music link; a worker matches it on YouTube Music, then downloads."""
+        job = Job(
+            url=song.url,
+            selection=selection,
+            status=status,
+            title=song.display_title,
+            uploader=song.artist,
+            duration=song.duration,
+            song=song,
+        )
+        job = self.store.add(job)
+        self._emit(job)
+        if status == JobStatus.QUEUED and job.id is not None:
+            self._queue.put(job.id)
+        return job
+
     def promote(self, job_id: int, selection: Selection) -> Job | None:
         """Give a pending (clipboard) job its format choice and queue it."""
         job = self.store.get(job_id)
@@ -173,7 +196,10 @@ class DownloadManager:
 
     def retry(self, job_id: int) -> Job | None:
         job = self.store.get(job_id)
-        if job is None or job.status not in {JobStatus.FAILED, JobStatus.CANCELLED}:
+        if job is None:
+            return None
+        unmatched_song = job.song is not None and job.status == JobStatus.PENDING
+        if job.status not in {JobStatus.FAILED, JobStatus.CANCELLED} and not unmatched_song:
             return None
         job = self.store.update(
             job_id,
@@ -228,13 +254,14 @@ class DownloadManager:
             self._cancel[job_id] = cancel
         temp_dir = self.paths.temp_dir / str(job_id)
         temp_dir.mkdir(parents=True, exist_ok=True)
+        matching = job.song is not None and not job.matched_url
         current = self.store.update(
             job_id,
-            status=JobStatus.DOWNLOADING,
+            status=JobStatus.MATCHING if matching else JobStatus.DOWNLOADING,
             worker=worker_name,
             started_at=utcnow(),
             error="",
-            phase="starting",
+            phase="matching on YouTube Music" if matching else "starting",
             speed=None,
             eta=None,
         )
@@ -284,16 +311,33 @@ class DownloadManager:
             )
             self._emit(job, kind="log", message=f"{level}: {message}")
 
+        unmatched = False
         try:
-            result = self.engine.download(
-                job, self.download_dir, temp_dir, on_progress, cancel, on_log
-            )
+            info: dict[str, object] | None = None
+            result: DownloadResult | None = None
+            if job.song is not None:
+                job, info, result, unmatched = self._prepare_song(job, cancel, on_log)
+            if result is None:
+                result = self.engine.download(
+                    job, self.download_dir, temp_dir, on_progress, cancel, on_log, info=info
+                )
         finally:
             with self._lock:
                 self._cancel.pop(job_id, None)
                 delete_files = self._delete_after.pop(job_id, None)
 
-        if result.cancelled and self._stopping.is_set() and delete_files is None:
+        if unmatched:
+            # back to pending: the user can retry later or hand the job a YouTube link
+            fields = {
+                "status": JobStatus.PENDING,
+                "phase": NO_MATCH_PHASE,
+                "error": result.error,
+                "speed": None,
+                "eta": None,
+                "worker": "",
+            }
+            self._cleanup_temp(job_id)
+        elif result.cancelled and self._stopping.is_set() and delete_files is None:
             # shutting down, not a user cancel: leave it queued so the next run resumes it
             fields = {
                 "status": JobStatus.QUEUED,
@@ -337,6 +381,50 @@ class DownloadManager:
             return
         if updated is not None:
             self._emit(updated)
+
+    def _prepare_song(
+        self, job: Job, cancel: threading.Event, on_log: Callable[[str, str], None]
+    ) -> tuple[Job, dict[str, object] | None, DownloadResult | None, bool]:
+        """Match a song job and probe its upload.
+
+        Returns the (possibly refreshed) job, the info JSON to download from, a
+        result when the download must not run, and whether that result means
+        "no match" (the job then waits as pending rather than failing).
+        """
+        assert job.song is not None and job.id is not None
+        song = job.song
+        if self.song_engine is None or not self.song_engine.available():
+            return (
+                job,
+                None,
+                DownloadResult(
+                    ok=False,
+                    error="spotDL is not installed; paste a Spotify link in the app or run "
+                    "`vidpull get <link>` in a terminal to set it up",
+                ),
+                False,
+            )
+        matched = job.matched_url
+        if not matched:
+            on_log("info", f"looking for {song.display_title} on YouTube Music")
+            matched = self.song_engine.match(song, cancel) or ""
+            if cancel.is_set():
+                return job, None, DownloadResult(ok=False, cancelled=True), False
+            if not matched:
+                on_log("warning", NO_MATCH_PHASE)
+                return job, None, DownloadResult(ok=False, error=NO_MATCH_PHASE), True
+            on_log("info", f"matched {matched}")
+            updated = self.store.update(
+                job.id, matched_url=matched, status=JobStatus.DOWNLOADING, phase="starting"
+            )
+            if updated is not None:
+                job = updated
+                self._emit(job)
+        try:
+            raw = self.engine.probe_json(matched)
+        except ProbeError as exc:
+            return job, None, DownloadResult(ok=False, error=f"{matched}: {exc}"), False
+        return job, tagged_info(raw, song), None, False
 
     # -------------------------------------------------------------- helpers
     def _finish_delete(self, job: Job, delete_files: bool) -> None:

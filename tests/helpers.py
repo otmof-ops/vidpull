@@ -7,7 +7,63 @@ import time
 from pathlib import Path
 
 from vidpull.engine import DownloadResult, ProbeError, Progress
-from vidpull.models import Job, MediaInfo
+from vidpull.models import Job, MediaInfo, Song
+
+MATCHED_URL = "https://music.youtube.com/watch?v=Jg4bxoyywyA"
+
+
+def sample_song(**overrides) -> Song:
+    fields = {
+        "title": "Cut To The Feeling",
+        "artists": ["Carly Rae Jepsen"],
+        "album": "Cut To The Feeling",
+        "album_artist": "Carly Rae Jepsen",
+        "track_number": 1,
+        "disc_number": 1,
+        "date": "2017-05-26",
+        "duration": 207.0,
+        "cover_url": "https://i.scdn.co/image/ab67616d0000b2737359994525d219f64872d3b1",
+        "url": "https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl",
+    }
+    fields.update(overrides)
+    return Song(**fields)
+
+
+class FakeSongEngine:
+    """A scripted stand-in for SpotdlEngine: resolves to fixed songs, matches to one URL."""
+
+    def __init__(
+        self,
+        *,
+        songs: list[Song] | None = None,
+        match_url: str | None = MATCHED_URL,
+        available: bool = True,
+        resolve_error: str | None = None,
+    ):
+        self.songs = songs if songs is not None else [sample_song()]
+        self.match_url = match_url
+        self._available = available
+        self.resolve_error = resolve_error
+        self.resolved: list[str] = []
+        self.matched: list[str] = []
+
+    def available(self) -> bool:
+        return self._available
+
+    def version(self) -> str:
+        return "fake-4.5.2"
+
+    def resolve(self, url: str) -> list[Song]:
+        from vidpull.spotdl import ResolveError
+
+        self.resolved.append(url)
+        if self.resolve_error:
+            raise ResolveError(self.resolve_error)
+        return [Song.from_json(s.to_json()) for s in self.songs]
+
+    def match(self, song: Song, cancel: threading.Event | None = None) -> str | None:
+        self.matched.append(song.display_title)
+        return self.match_url
 
 
 class FakeEngine:
@@ -30,7 +86,9 @@ class FakeEngine:
         self.block = block
         self.files = files
         self.probes: list[tuple[str, bool]] = []
+        self.json_probes: list[str] = []
         self.downloads: list[int | None] = []
+        self.infos: list[dict | None] = []
         self.started = threading.Event()
 
     def version(self) -> str:
@@ -44,8 +102,34 @@ class FakeEngine:
             return self.info
         return MediaInfo(url=url, id="fake", title=f"Fake {url}", is_playlist=playlist)
 
-    def download(self, job: Job, download_dir: Path, temp_dir: Path, on_progress, cancel, on_log):
+    def probe_json(self, url: str, *, playlist: bool = False) -> dict:
+        self.json_probes.append(url)
+        if self.probe_error:
+            raise ProbeError(self.probe_error)
+        return {
+            "id": "fake",
+            "title": f"Fake {url}",
+            "webpage_url": url,
+            "original_url": url,
+            "uploader": "Fake Channel",
+            "categories": ["Music"],
+            "description": "a description",
+            "formats": [],
+        }
+
+    def download(
+        self,
+        job: Job,
+        download_dir: Path,
+        temp_dir: Path,
+        on_progress,
+        cancel,
+        on_log,
+        *,
+        info=None,
+    ):
         self.downloads.append(job.id)
+        self.infos.append(info)
         self.started.set()
         on_log("info", "fake engine starting")
         if self.block is not None:

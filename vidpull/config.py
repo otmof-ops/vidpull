@@ -41,6 +41,11 @@ FIELD_HELP: dict[str, str] = {
     "download_dir": "Where finished files land. Empty means ~/Videos/vidpull.",
     "output_template": "yt-dlp output template for single videos.",
     "playlist_template": "yt-dlp output template for playlist entries.",
+    "song_template": "yt-dlp output template for songs from Spotify links (artist, track, album, "
+    "track_number are the song's own).",
+    "song_format": "Audio preset for songs from Spotify links: "
+    + ", ".join(p for p in PRESETS if p.startswith("audio-"))
+    + ".",
     "default_preset": "Preset used when no format is picked. One of: " + ", ".join(PRESETS) + ".",
     "container": f"Merge container for video+audio downloads: {', '.join(CONTAINERS)}.",
     "codec_preference": "Video codec order when several codecs share a resolution and frame rate.",
@@ -74,6 +79,8 @@ class Config:
     playlist_template: str = (
         "%(playlist_title).100B/%(playlist_index)03d - %(title).200B [%(id)s].%(ext)s"
     )
+    song_template: str = "%(artist).100B - %(track).150B.%(ext)s"
+    song_format: str = "audio-mp3"
     default_preset: str = "best"
     container: str = "auto"
     codec_preference: list[str] = field(default_factory=lambda: ["avc1", "av01", "vp9"])
@@ -142,6 +149,11 @@ class Config:
         if self.default_preset not in PRESETS:
             log.warning("config: default_preset %r unknown; using 'best'", self.default_preset)
             self.default_preset = "best"
+        if self.song_format not in PRESETS or not self.song_format.startswith("audio-"):
+            log.warning(
+                "config: song_format %r is not an audio preset; using 'audio-mp3'", self.song_format
+            )
+            self.song_format = "audio-mp3"
         if self.container not in CONTAINERS:
             log.warning("config: container %r unknown; using 'auto'", self.container)
             self.container = "auto"

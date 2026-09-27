@@ -16,6 +16,7 @@ def utcnow() -> str:
 class JobStatus(StrEnum):
     PENDING = "pending"  # queued from the clipboard, waiting for a format choice
     QUEUED = "queued"
+    MATCHING = "matching"  # a song job looking for its upload on YouTube Music
     DOWNLOADING = "downloading"
     PROCESSING = "processing"
     DONE = "done"
@@ -24,7 +25,7 @@ class JobStatus(StrEnum):
 
     @property
     def is_active(self) -> bool:
-        return self in {JobStatus.DOWNLOADING, JobStatus.PROCESSING}
+        return self in {JobStatus.MATCHING, JobStatus.DOWNLOADING, JobStatus.PROCESSING}
 
     @property
     def is_terminal(self) -> bool:
@@ -65,6 +66,48 @@ class Selection:
 
 
 @dataclass
+class Song:
+    """A track named by a music service; the audio is found elsewhere and tagged with this."""
+
+    title: str
+    artists: list[str] = field(default_factory=list)
+    album: str = ""
+    album_artist: str = ""
+    track_number: int | None = None
+    disc_number: int | None = None
+    date: str = ""  # YYYY-MM-DD, YYYY-MM or YYYY, as the service gives it
+    duration: float | None = None  # seconds
+    isrc: str = ""
+    explicit: bool = False
+    cover_url: str = ""
+    url: str = ""  # the link this song was resolved from
+    list_name: str = ""
+    list_position: int | None = None
+    schema: int = 1
+
+    @property
+    def artist(self) -> str:
+        return ", ".join(a for a in self.artists if a)
+
+    @property
+    def display_title(self) -> str:
+        return f"{self.artist} - {self.title}" if self.artist else self.title
+
+    @property
+    def year(self) -> str:
+        return self.date[:4] if len(self.date) >= 4 and self.date[:4].isdigit() else ""
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), separators=(",", ":"), ensure_ascii=False)
+
+    @classmethod
+    def from_json(cls, text: str) -> Song:
+        data = json.loads(text)
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass
 class Job:
     url: str
     selection: Selection
@@ -89,9 +132,13 @@ class Job:
     updated_at: str = field(default_factory=utcnow)
     started_at: str | None = None
     finished_at: str | None = None
+    song: Song | None = None  # set when the job came from a music link, not a media URL
+    matched_url: str = ""  # the upload the song was matched to; empty until matched
 
     @property
     def display_title(self) -> str:
+        if self.song is not None:
+            return self.song.display_title
         return self.title or self.url
 
     @property
