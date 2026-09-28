@@ -2,9 +2,11 @@
 """A stand-in for ``python -m spotdl`` that speaks the two operations vidpull uses.
 
 Invoked by tests through SpotdlEngine(python=<this file>); the ``-m spotdl`` argv
-entries are ignored. A ``mode`` file next to this script selects the behaviour:
-``ok`` (default), ``nomatch`` (``url`` prints nothing and exits 0, as spotDL does),
-``error`` (``save`` fails) or ``hang``.
+entries are ignored, and so is the ``spotdl_tracklist.py`` path vidpull runs for a
+track list (recorded as ``script`` in last-args.json). A ``mode`` file next to this
+script selects the behaviour: ``ok`` (default), ``nomatch`` (``save --preload``
+prints a null entry and exits 0, as spotDL does), ``error`` (``save`` fails) or
+``hang``.
 """
 
 from __future__ import annotations
@@ -28,7 +30,11 @@ def mode() -> str:
 
 def main(argv: list[str]) -> int:
     args = [a for a in argv[1:] if a not in ("-m", "spotdl")]
+    script = ""
+    if args and args[0].endswith("spotdl_tracklist.py"):
+        script, args = Path(args[0]).name, args[1:]
     (HERE / "last-args.json").write_text(json.dumps(args))
+    (HERE / "last-script").write_text(script)
     if "--version" in args:
         print("4.5.2")
         return 0
@@ -46,14 +52,15 @@ def main(argv: list[str]) -> int:
             return 1
         name = "spotdl_album.json" if "/album/" in query else "spotdl_track.json"
         print(f"Processing query: {query}")  # spotDL prints this on stdout at INFO level
-        sys.stdout.write((HERE / "fixtures" / name).read_text())
-        return 0
-    if operation == "url":
+        if "--preload" not in args:
+            sys.stdout.write((HERE / "fixtures" / name).read_text())
+            return 0
         if mode() == "nomatch":
-            print("YouTube Music returned no usable results", file=sys.stderr)
-            return 0  # spotDL exits 0 here too (spotDL/spotify-downloader#2768)
-        print(f"Processing query: {query}")
-        print(MATCH)
+            print("ERROR: Could not find a match for the song", file=sys.stderr)
+            print(json.dumps([None]))  # spotDL exits 0 here too (spotDL/spotify-downloader#2768)
+            return 0
+        songs = json.loads((HERE / "fixtures" / name).read_text())
+        print(json.dumps([{**songs[0], "download_url": MATCH, "lyrics": None}], indent=4))
         return 0
     print(f"unknown operation {operation}", file=sys.stderr)
     return 2

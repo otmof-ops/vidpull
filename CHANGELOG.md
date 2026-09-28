@@ -6,6 +6,17 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Long Spotify playlists no longer fail with "spotDL did not answer within the resolve
+  timeout". The track list is now fetched on its own, in seconds (676 songs in under 10 s,
+  where `spotdl save` needed about 15 minutes for its three lookups per song), and each song's
+  album, date, cover and match come in one `spotdl save --preload` call when its batch is
+  reached. Downloads start within seconds of pasting the link.
+- A Spotify-made playlist (Daily Mix, Wrapped, Your Top Songs) now says why it cannot be read
+  and what to do instead, where it said only "spotDL exited with code 1".
+- `vidpull get -l` numbers a playlist's songs by their place in the playlist.
+
 ## [1.2.0] - 2026-09-28
 
 ### Added
