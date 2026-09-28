@@ -6,6 +6,8 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-28
+
 ### Fixed
 
 - A private or Spotify-made playlist is refused in well under a second with the way round it
