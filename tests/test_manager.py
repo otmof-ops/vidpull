@@ -159,6 +159,25 @@ def test_song_job_matches_then_downloads_with_tags(store, config, paths):
         manager.stop()
 
 
+def test_thin_playlist_song_takes_its_details_from_the_match(store, config, paths):
+    engine = FakeEngine()
+    thin = sample_song(album="", date="", cover_url="", list_name="Mix", list_position=7)
+    full = sample_song(list_name="", list_position=None)
+    song_engine = FakeSongEngine(match_song=full)
+    manager, _ = make_manager(store, config, paths, engine)
+    manager.song_engine = song_engine
+    manager.start()
+    try:
+        job = manager.enqueue_song(thin, selection())
+        assert wait_until(lambda: store.get(job.id).status == JobStatus.DONE)
+        done = store.get(job.id)
+        assert done.song.album == "Cut To The Feeling" and done.song.cover_url == full.cover_url
+        info = engine.infos[-1]
+        assert info["album"] == "Cut To The Feeling" and info["thumbnail"] == full.cover_url
+    finally:
+        manager.stop()
+
+
 def test_song_job_without_match_waits_as_pending_and_can_retry(store, config, paths):
     engine = FakeEngine()
     song_engine = FakeSongEngine(match_url=None)

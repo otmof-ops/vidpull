@@ -723,16 +723,29 @@ class DownloadManager:
         matched = job.matched_url
         if not matched:
             on_log("info", f"looking for {song.display_title} on YouTube Music")
-            matched = self.song_engine.match(song, cancel) or ""
+            found = self.song_engine.match(song, cancel)
             if cancel.is_set():
                 return job, None, DownloadResult(ok=False, cancelled=True), False
-            if not matched:
+            if found is None:
                 on_log("warning", NO_MATCH_PHASE)
                 return job, None, DownloadResult(ok=False, error=NO_MATCH_PHASE), True
+            matched = found.url
             on_log("info", f"matched {matched}")
-            updated = self.store.update(
-                job.id, matched_url=matched, status=JobStatus.DOWNLOADING, phase="starting"
-            )
+            fields: dict[str, object] = {
+                "matched_url": matched,
+                "status": JobStatus.DOWNLOADING,
+                "phase": "starting",
+            }
+            if found.song is not None:
+                # a playlist's track list is thin; the match brings the album, date and cover
+                song = found.song
+                fields.update(
+                    song=song,
+                    title=song.display_title,
+                    uploader=song.artist,
+                    duration=song.duration or job.duration,
+                )
+            updated = self.store.update(job.id, **fields)
             if updated is not None:
                 job = updated
                 self._emit(job)

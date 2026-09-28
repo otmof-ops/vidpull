@@ -8,6 +8,7 @@ from pathlib import Path
 
 from vidpull.engine import DownloadResult, ProbeError, Progress
 from vidpull.models import Job, MediaInfo, Song
+from vidpull.spotdl import Match
 
 MATCHED_URL = "https://music.youtube.com/watch?v=Jg4bxoyywyA"
 
@@ -37,12 +38,14 @@ class FakeSongEngine:
         *,
         songs: list[Song] | None = None,
         match_url: str | None = MATCHED_URL,
+        match_song: Song | None = None,
         available: bool = True,
         resolve_error: str | None = None,
         resolve_block: threading.Event | None = None,
     ):
         self.songs = songs if songs is not None else [sample_song()]
         self.match_url = match_url
+        self.match_song = match_song  # the full details a match brings back, if any
         self._available = available
         self.resolve_error = resolve_error
         self.resolve_block = resolve_block  # when set, resolve waits for it (or for cancel)
@@ -68,9 +71,11 @@ class FakeSongEngine:
             raise ResolveError(self.resolve_error)
         return [Song.from_json(s.to_json()) for s in self.songs]
 
-    def match(self, song: Song, cancel: threading.Event | None = None) -> str | None:
+    def match(self, song: Song, cancel: threading.Event | None = None) -> Match | None:
         self.matched.append(song.display_title)
-        return self.match_url
+        if self.match_url is None:
+            return None
+        return Match(self.match_url, self.match_song)
 
 
 class FakeEngine:

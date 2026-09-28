@@ -2,10 +2,12 @@
 
 spotDL (github.com/spotDL/spotify-downloader) turns a Spotify track, album or
 playlist link into song metadata and finds each song's upload on YouTube Music.
-vidpull uses exactly those two operations, ``spotdl save`` and ``spotdl url``,
-and downloads the matched upload with its own yt-dlp engine, so progress, cancel,
-resume and tagging work the same as for any other link. spotDL's own downloader
-and tag writer never run.
+vidpull uses exactly those two operations: the track list comes from
+``spotdl_tracklist.py`` (``spotdl save`` stopped before its per-song lookups), and
+each song's full details and match come from ``spotdl save <track> --preload`` when
+its batch is reached. vidpull downloads the matched upload with its own yt-dlp
+engine, so progress, cancel, resume and tagging work the same as for any other
+link. spotDL's own downloader and tag writer never run.
 
 It lives in its own virtualenv under the data dir because it pins ``rich<14``
 while Textual needs ``rich>=14``, and because its dependency tree carries GPL
@@ -25,6 +27,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -47,6 +50,9 @@ VENV_TIMEOUT = 120.0
 PIP_TIMEOUT = 1800.0
 KILL_GRACE_SECONDS = 5.0
 
+# run by spotDL's interpreter; lists a link's songs without spotDL's three lookups per song
+TRACKLIST_SCRIPT = Path(__file__).with_name("spotdl_tracklist.py")
+
 _SPOTIFY_URL = re.compile(
     r"^https?://open\.spotify\.com/(?:intl-[a-z]{2,3}(?:-[a-z]{2,4})?/)?"
     r"(?P<kind>track|album|playlist)/(?P<id>[A-Za-z0-9]{22})(?:[/?#].*)?$",
@@ -54,6 +60,13 @@ _SPOTIFY_URL = re.compile(
 )
 _SPOTIFY_URI = re.compile(
     r"^spotify:(?P<kind>track|album|playlist):(?P<id>[A-Za-z0-9]{22})$", re.IGNORECASE
+)
+# Spotify's own playlists (Daily Mix, Wrapped, Your Top Songs, editorial lists) carry this id
+# prefix and are not served to third-party apps
+_SPOTIFY_MADE = re.compile(r"/playlist/37i9dQZF1", re.IGNORECASE)
+SPOTIFY_MADE_HINT = (
+    "Spotify-made playlists are not open to other apps; "
+    "in Spotify, add its songs to a playlist of your own and paste that link"
 )
 _YOUTUBE_URL = re.compile(
     r"^https?://(?:(?:www|music|m)\.)?(?:youtube\.com/watch\?|youtu\.be/)\S+$", re.IGNORECASE
@@ -74,6 +87,14 @@ class ResolveCancelled(SpotdlError):
 
 class InstallError(SpotdlError):
     pass
+
+
+@dataclass
+class Match:
+    """A song's upload on YouTube (Music), with the song's full details when spotDL sent them."""
+
+    url: str
+    song: Song | None = None
 
 
 # ------------------------------------------------------------------ links
@@ -190,7 +211,7 @@ class SongEngine(Protocol):
 
     def resolve(self, url: str, cancel: threading.Event | None = None) -> list[Song]: ...
 
-    def match(self, song: Song, cancel: threading.Event | None = None) -> str | None: ...
+    def match(self, song: Song, cancel: threading.Event | None = None) -> Match | None: ...
 
 
 class SpotdlEngine:
@@ -250,12 +271,22 @@ class SpotdlEngine:
         return text
 
     def resolve(self, url: str, cancel: threading.Event | None = None) -> list[Song]:
-        """Every song behind a Spotify track, album or playlist link, via ``spotdl save``.
+        """Every song behind a Spotify track, album or playlist link.
 
-        Raises ``ResolveCancelled`` when ``cancel`` is set while spotDL is still working.
+        Seconds even for a long playlist: songs from a playlist can come back without
+        album, date or cover, which ``match`` fills in. Raises ``ResolveCancelled`` when
+        ``cancel`` is set while spotDL is still working.
         """
         link = normalize_spotify_link(url)
-        args = [*self.prefix(), "save", link, "--save-file", "-", *self.common_args()]
+        args = [
+            self._python,
+            str(TRACKLIST_SCRIPT),
+            "save",
+            link,
+            "--save-file",
+            "-",
+            *self.common_args(),
+        ]
         outcome = _run_cancellable(args, self.env(), cancel, RESOLVE_TIMEOUT)
         if outcome is None:
             raise ResolveCancelled("cancelled while fetching the track list")
@@ -271,6 +302,8 @@ class SpotdlEngine:
                     if returncode == 0
                     else f"spotDL exited with code {returncode}"
                 )
+            if _SPOTIFY_MADE.search(link):
+                detail = f"{detail} ({SPOTIFY_MADE_HINT})"
             raise ResolveError(detail)
         songs = [song_from_spotdl(d) for d in data if isinstance(d, dict) and d.get("name")]
         if not songs:
@@ -284,14 +317,25 @@ class SpotdlEngine:
             songs.sort(key=lambda s: (s.disc_number or 1, s.track_number or 0))
         return songs
 
-    def match(self, song: Song, cancel: threading.Event | None = None) -> str | None:
-        """The YouTube (Music) URL spotDL picks for ``song``, or None when it finds nothing.
+    def match(self, song: Song, cancel: threading.Event | None = None) -> Match | None:
+        """The upload spotDL picks for ``song`` and the song's full details, or None.
 
-        ``spotdl url`` exits 0 whether or not it found anything, so the answer is
-        read from stdout: the first line that is a YouTube URL.
+        ``spotdl save --preload`` fetches the track, artist and album the way a
+        plain ``spotdl save`` would, then searches YouTube Music; ``--lyrics`` with
+        no provider skips the lyrics search. It exits 0 whether or not it found a
+        match (the entry is then ``null``), so the answer is read from the JSON.
         """
         query = song.url or song.display_title
-        argv = [*self.prefix(), "url", query, *self.common_args()]
+        argv = [
+            *self.prefix(),
+            "save",
+            query,
+            "--save-file",
+            "-",
+            "--preload",
+            "--lyrics",
+            *self.common_args(),
+        ]
         try:
             outcome = _run_cancellable(argv, self.env(), cancel, MATCH_TIMEOUT)
         except SpotdlError as exc:
@@ -303,10 +347,19 @@ class SpotdlEngine:
         if returncode is None:
             log.warning("spotDL match timed out for %s", song.display_title)
             return None
-        for line in stdout.splitlines():
-            candidate = line.strip()
-            if is_youtube_url(candidate):
-                return candidate
+        for data in _json_array(stdout) or []:
+            if not isinstance(data, dict):
+                continue
+            candidate = str(data.get("download_url") or "").strip()
+            if not is_youtube_url(candidate):
+                continue
+            details = song_from_spotdl(data) if data.get("name") else None
+            if details is not None:
+                # the song's place in its album or playlist is only known from the list
+                details.url = details.url or song.url
+                details.list_name = song.list_name or details.list_name
+                details.list_position = song.list_position or details.list_position
+            return Match(candidate, details)
         error = last_error(stderr)
         if error:
             log.info("spotDL: %s", error)

@@ -427,7 +427,13 @@ def _print_songs(console, table_cls, url, songs) -> None:
         length = ""
         if song.duration:
             length = f"{int(song.duration // 60)}:{int(song.duration % 60):02d}"
-        table.add_row(str(song.track_number or index), song.title, song.artist, song.album, length)
+        table.add_row(
+            str(song.list_position or song.track_number or index),
+            song.title,
+            song.artist,
+            song.album,
+            length,
+        )
     console.print(table)
     console.print(f"{len(songs)} song(s); the audio comes from YouTube Music when downloaded")
 
