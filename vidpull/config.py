@@ -68,6 +68,8 @@ FIELD_HELP: dict[str, str] = {
     "update_check": "Check for a new vidpull release when the TUI starts.",
     "update_check_hours": "Minimum hours between automatic update checks.",
     "include_prereleases": "Offer pre-release tags (v1.2.0-rc1) in update checks.",
+    "auto_update": "Install a new vidpull release in the background when the app finds one at "
+    "startup, then ask before restarting into it.",
     "js_runtime": f"JavaScript runtime for yt-dlp (YouTube needs one): {', '.join(JS_RUNTIMES)}.",
     "desktop_notify": "Send a desktop notification when a download finishes.",
     "preflight": "At startup, check for ffmpeg and a JavaScript runtime and offer to install "
@@ -101,8 +103,9 @@ class Config:
     clipboard_watch: bool = False
     auto_pick: bool = False
     update_check: bool = True
-    update_check_hours: int = 24
+    update_check_hours: int = 1
     include_prereleases: bool = False
+    auto_update: bool = False
     js_runtime: str = "auto"
     desktop_notify: bool = True
     preflight: bool = True

@@ -463,3 +463,63 @@ def test_cancel_key_stops_a_run_while_it_fetches_the_list(config, paths, store, 
             assert store.list() == []
 
     run(flow())
+
+
+class FakePipeline:
+    """Stands in for UpdatePipeline: one candidate release, an update that succeeds or is busy."""
+
+    def __init__(self, candidate: str | None = "v9.9.9"):
+        self.candidate = candidate
+        self.runs = 0
+
+    def check(self, *, include_prerelease=None):
+        from types import SimpleNamespace
+
+        tag = SimpleNamespace(tag=self.candidate) if self.candidate else None
+        return SimpleNamespace(candidate=tag, error="", latest=None, current=None)
+
+    def run(self, *, target=None, engine_only=False, dry_run=False, busy=None):
+        from types import SimpleNamespace
+
+        from vidpull.update import BusyError
+
+        if busy is not None and busy():
+            raise BusyError("downloads are running")
+        self.runs += 1
+        return SimpleNamespace(
+            ok=True, message="installed", restart_required=True, generation=None, previous=None
+        )
+
+    def restart_argv(self):
+        return ["/bin/true"]
+
+
+def test_startup_check_offers_the_update_or_installs_it(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    pipeline = FakePipeline()
+    app = make_app(config, paths, store, engine, pipeline=pipeline)
+    app.config.update_check = True  # make_app turns it off; this test is about it
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            assert await until(pilot, lambda: app._update_tag == "v9.9.9")
+            await pilot.pause(0.2)
+            assert pipeline.runs == 0  # auto_update off: a note and the u key, nothing installed
+
+    run(flow())
+
+    store.set_meta("update_check_at", "0")  # forget the throttle for the second app
+    pipeline = FakePipeline()
+    app = make_app(config, paths, store, engine, pipeline=pipeline)
+    app.config.update_check = True
+    app.config.auto_update = True
+
+    async def flow_auto():
+        async with app.run_test(size=(120, 40)) as pilot:
+            assert await until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
+            assert "v9.9.9 is installed" in app.screen.question and pipeline.runs == 1
+            await pilot.press("n")
+            assert await until(pilot, lambda: not isinstance(app.screen, ConfirmScreen))
+            assert app._update_tag is None
+
+    run(flow_auto())
