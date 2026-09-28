@@ -14,6 +14,9 @@ All notable changes to vidpull are recorded here. The format follows
   spotDL is still fetching the list; `r` retries its failed songs; `d` deletes it; Enter or `p`
   opens the songs behind it with their own status, match, cancel and retry. `vidpull queue
   list` shows runs above their songs. Job database schema 3 (`groups`, `jobs.group_id`).
+- Runs go in batches: `stage_size` songs (10 by default) are released to the queue at a time,
+  the next batch when the current one is done, after `stage_pause` seconds when set; the row
+  shows `batch 3/68`. A song with no match no longer holds a run open; `r` re-stages it.
 
 ### Fixed
 

@@ -71,6 +71,7 @@ COLUMNS = ("#", "Title", "Format", "Status", "Progress", "Speed", "ETA", "Size")
 STATUS_STYLE = {
     JobStatus.PENDING: "yellow",
     JobStatus.QUEUED: "dim",
+    JobStatus.STAGED: "dim",
     JobStatus.MATCHING: "cyan",
     JobStatus.DOWNLOADING: "cyan",
     JobStatus.PROCESSING: "magenta",
@@ -846,8 +847,13 @@ class VidpullApp(App[PostExit | None]):
         else:
             title = f"{group.display_title} · {group.entry_count} songs"
             if group.status == GroupStatus.ACTIVE:
-                stage = progress.active.status.value if progress.active else "queued"
+                if progress.resting:
+                    stage = f"resting {self.config.stage_pause}s"
+                else:
+                    stage = progress.active.status.value if progress.active else "queued"
                 status = f"{stage} {progress.done}/{progress.total}"
+                if progress.stages > 1:
+                    status += f" · batch {progress.stage}/{progress.stages}"
             elif group.status == GroupStatus.DONE:
                 status = f"done {progress.done}/{progress.total}"
                 if progress.failed or progress.pending:
@@ -937,6 +943,8 @@ class VidpullApp(App[PostExit | None]):
             f"{self.manager.active_count} active",
             f"{counts.get('queued', 0)} queued",
         ]
+        if counts.get("staged"):
+            parts.append(f"{counts['staged']} staged")
         if counts.get("pending"):
             parts.append(f"{counts['pending']} pending (p)")
         parts.append(f"{counts.get('done', 0)} done")

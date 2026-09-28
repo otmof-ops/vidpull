@@ -90,7 +90,9 @@ An album or playlist is **one row** in the queue (`G1`, `G2`, …). It appears t
 the link, shows the track list being fetched, then counts its songs through (`downloading 4/12`).
 `c` on that row cancels the whole run at any stage, fetch included; `r` retries what failed;
 `d` deletes it, files optional; Enter or `p` shows the songs behind it, each with its own status
-and match. The songs download two at a time (`concurrency`), so a 12-track album takes a few
+and match. A run releases its songs to the queue **ten at a time** (`stage_size`); the next batch
+starts when the current one is done, after `stage_pause` seconds if you set one, so a long playlist
+never hammers the site. Downloads run two at a time (`concurrency`), so a 12-track album takes a few
 minutes and a 600-song playlist an evening.
 
 The first Spotify link offers to install spotDL into its own environment under

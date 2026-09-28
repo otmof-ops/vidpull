@@ -51,8 +51,25 @@ class GroupProgress:
     failed: int = 0
     cancelled: int = 0
     pending: int = 0
+    staged: int = 0
     active: Job | None = None
     bytes: int = 0
+    stage_size: int = 0
+    resting: bool = False  # between batches, waiting out stage_pause
+
+    @property
+    def stages(self) -> int:
+        if not self.stage_size or not self.total:
+            return 1
+        return -(-self.total // self.stage_size)
+
+    @property
+    def stage(self) -> int:
+        """The batch currently released, 1-based."""
+        if not self.stage_size or not self.total:
+            return 1
+        released = self.total - self.staged
+        return max(1, -(-released // self.stage_size))
 
     @property
     def percent(self) -> float:
@@ -91,6 +108,8 @@ class DownloadManager:
         self._cancel: dict[int, threading.Event] = {}
         self._delete_after: dict[int, bool] = {}
         self._resolving: dict[int, threading.Event] = {}
+        self._stage_timers: dict[int, threading.Timer] = {}
+        self._stage_lock = threading.RLock()
         self._stopping = threading.Event()
         self._started = False
 
@@ -106,6 +125,9 @@ class DownloadManager:
         for job in self.store.list([JobStatus.QUEUED]):
             if job.id is not None:
                 self._queue.put(job.id)
+        for group in self.store.list_groups():
+            if group.status == GroupStatus.ACTIVE and group.id is not None:
+                self._settle_group(group.id)  # releases the next batch after a restart
         for index in range(self._worker_count):
             thread = threading.Thread(
                 target=self._worker, name=f"vidpull-worker-{index + 1}", daemon=True
@@ -120,6 +142,9 @@ class DownloadManager:
                 event.set()
             for event in self._resolving.values():
                 event.set()
+            for timer in self._stage_timers.values():
+                timer.cancel()
+            self._stage_timers.clear()
         for _ in self._threads:
             self._queue.put(None)
         if wait:
@@ -232,8 +257,10 @@ class DownloadManager:
         )
         if updated is not None:
             self._emit_group(updated)
-        for song in songs:
-            self.enqueue_song(song, group.selection, group_id=group_id)
+        size = self.config.stage_size or len(songs)
+        for index, song in enumerate(songs):
+            status = JobStatus.QUEUED if index < size else JobStatus.STAGED
+            self.enqueue_song(song, group.selection, group_id=group_id, status=status)
         return self.store.get_group(group_id)
 
     def cancel_group(self, group_id: int) -> bool:
@@ -246,6 +273,10 @@ class DownloadManager:
         if resolving is not None:
             resolving.set()  # resolve_group records the cancelled state itself
             return True
+        with self._stage_lock:
+            timer = self._stage_timers.pop(group_id, None)
+        if timer is not None:
+            timer.cancel()
         for job in self.store.list(group_id=group_id):
             if job.id is None or job.is_terminal:
                 continue
@@ -268,12 +299,29 @@ class DownloadManager:
             return 0
         retried = 0
         for job in self.store.list(group_id=group_id):
-            if job.id is not None and self.retry(job.id) is not None:
-                retried += 1
+            unmatched = job.song is not None and job.status == JobStatus.PENDING
+            if job.id is None or (
+                job.status not in {JobStatus.FAILED, JobStatus.CANCELLED} and not unmatched
+            ):
+                continue
+            updated_job = self.store.update(
+                job.id,
+                status=JobStatus.STAGED,
+                error="",
+                phase="",
+                progress=0.0,
+                speed=None,
+                eta=None,
+                worker="",
+            )
+            if updated_job is not None:
+                self._emit(updated_job)
+            retried += 1
         if retried:
             updated = self.store.update_group(group_id, status=GroupStatus.ACTIVE, error="")
             if updated is not None:
                 self._emit_group(updated)
+            self._settle_group(group_id)  # nothing is live, so this releases the first batch
         return retried
 
     def delete_group(self, group_id: int, *, delete_files: bool = False) -> bool:
@@ -303,8 +351,13 @@ class DownloadManager:
                 progress.cancelled += 1
             elif job.status == JobStatus.PENDING:
                 progress.pending += 1
+            elif job.status == JobStatus.STAGED:
+                progress.staged += 1
             if job.status.is_active and progress.active is None:
                 progress.active = job
+        progress.stage_size = self.config.stage_size
+        with self._stage_lock:
+            progress.resting = group.id in self._stage_timers
         return progress
 
     def _finish_group(self, group_id: int, status: GroupStatus, error: str) -> Group | None:
@@ -314,19 +367,71 @@ class DownloadManager:
         return updated
 
     def _settle_group(self, group_id: int) -> None:
-        """Once every song of an active group is over, the group is over too."""
+        """When nothing in an active run is live: release its next batch, or finish it.
+
+        An unmatched song (pending) does not hold the run open; ``retry_group``
+        picks it up again.
+        """
+        with self._stage_lock:
+            group = self.store.get_group(group_id)
+            if group is None or group.status != GroupStatus.ACTIVE:
+                return
+            jobs = self.store.list(group_id=group_id)
+            if any(j.status == JobStatus.QUEUED or j.status.is_active for j in jobs):
+                return
+            if any(j.status == JobStatus.STAGED for j in jobs):
+                self._schedule_stage(group_id)
+                return
+            statuses = {j.status for j in jobs}
+            if statuses == {JobStatus.CANCELLED}:
+                self._finish_group(group_id, GroupStatus.CANCELLED, "")
+                return
+            failed = sum(1 for j in jobs if j.status == JobStatus.FAILED)
+            pending = sum(1 for j in jobs if j.status == JobStatus.PENDING)
+            notes = [
+                n
+                for n, count in ((f"{failed} failed", failed), (f"{pending} not found", pending))
+                if count
+            ]
+            self._finish_group(group_id, GroupStatus.DONE, ", ".join(notes))
+
+    def _schedule_stage(self, group_id: int) -> None:
+        """Release the next batch now, or after ``stage_pause`` seconds."""
+        pause = self.config.stage_pause
+        if pause <= 0 or self._stopping.is_set():
+            self._release_stage(group_id)
+            return
+        with self._stage_lock:
+            if group_id in self._stage_timers:
+                return
+            timer = threading.Timer(pause, self._release_stage, args=(group_id,))
+            timer.daemon = True
+            self._stage_timers[group_id] = timer
+            timer.start()
         group = self.store.get_group(group_id)
-        if group is None or group.status != GroupStatus.ACTIVE:
-            return
-        jobs = self.store.list(group_id=group_id)
-        if any(not j.is_terminal for j in jobs):
-            return
-        statuses = {j.status for j in jobs}
-        if statuses == {JobStatus.CANCELLED}:
-            self._finish_group(group_id, GroupStatus.CANCELLED, "")
-            return
-        failed = sum(1 for j in jobs if j.status == JobStatus.FAILED)
-        self._finish_group(group_id, GroupStatus.DONE, f"{failed} failed" if failed else "")
+        if group is not None:
+            self._emit_group(group)  # the row shows the rest
+
+    def _release_stage(self, group_id: int) -> None:
+        with self._stage_lock:
+            self._stage_timers.pop(group_id, None)
+            if self._stopping.is_set():
+                return
+            group = self.store.get_group(group_id)
+            if group is None or group.status != GroupStatus.ACTIVE:
+                return
+            size = self.config.stage_size or len(self.store.list(group_id=group_id))
+            released = 0
+            for job in self.store.list([JobStatus.STAGED], group_id=group_id):
+                if released >= size or job.id is None:
+                    break
+                updated = self.store.update(job.id, status=JobStatus.QUEUED)
+                if updated is not None:
+                    self._emit(updated)
+                    self._queue.put(job.id)
+                    released += 1
+            if released:
+                self._emit_group(group)
 
     def _emit_group(self, group: Group, kind: str = "update") -> None:
         if self.on_group_event is None:
@@ -359,7 +464,7 @@ class DownloadManager:
             event.set()
             return True
         job = self.store.get(job_id)
-        if job is None or job.status not in {JobStatus.QUEUED, JobStatus.PENDING}:
+        if job is None or job.status not in {JobStatus.QUEUED, JobStatus.PENDING, JobStatus.STAGED}:
             return False
         job = self.store.update(job_id, status=JobStatus.CANCELLED, phase="cancelled")
         if job is not None:

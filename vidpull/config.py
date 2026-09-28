@@ -43,6 +43,9 @@ FIELD_HELP: dict[str, str] = {
     "playlist_template": "yt-dlp output template for playlist entries.",
     "song_template": "yt-dlp output template for songs from Spotify links (artist, track, album, "
     "track_number are the song's own).",
+    "stage_size": "Songs of an album or playlist released to the queue at a time; the next batch "
+    "starts when this one is done. 0 releases them all at once.",
+    "stage_pause": "Seconds to wait between batches of a run.",
     "song_format": "Audio preset for songs from Spotify links: "
     + ", ".join(p for p in PRESETS if p.startswith("audio-"))
     + ".",
@@ -81,6 +84,8 @@ class Config:
     )
     song_template: str = "%(artist).100B - %(track).150B.%(ext)s"
     song_format: str = "audio-mp3"
+    stage_size: int = 10
+    stage_pause: int = 0
     default_preset: str = "best"
     container: str = "auto"
     codec_preference: list[str] = field(default_factory=lambda: ["avc1", "av01", "vp9"])
@@ -154,6 +159,8 @@ class Config:
                 "config: song_format %r is not an audio preset; using 'audio-mp3'", self.song_format
             )
             self.song_format = "audio-mp3"
+        self.stage_size = max(0, min(int(self.stage_size), 1000))
+        self.stage_pause = max(0, min(int(self.stage_pause), 3600))
         if self.container not in CONTAINERS:
             log.warning("config: container %r unknown; using 'auto'", self.container)
             self.container = "auto"

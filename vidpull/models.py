@@ -16,6 +16,7 @@ def utcnow() -> str:
 class JobStatus(StrEnum):
     PENDING = "pending"  # queued from the clipboard, waiting for a format choice
     QUEUED = "queued"
+    STAGED = "staged"  # a song of a run, held until its batch is released
     MATCHING = "matching"  # a song job looking for its upload on YouTube Music
     DOWNLOADING = "downloading"
     PROCESSING = "processing"

@@ -2,7 +2,7 @@ import threading
 
 from tests.helpers import MATCHED_URL, FakeEngine, FakeSongEngine, sample_song, wait_until
 from vidpull.manager import NO_MATCH_PHASE, DownloadManager
-from vidpull.models import GroupStatus, JobStatus, Selection, SelectionKind
+from vidpull.models import Group, GroupStatus, Job, JobStatus, Selection, SelectionKind
 
 
 def selection():
@@ -285,5 +285,106 @@ def test_group_resolve_error_and_delete(store, config, paths):
         manager.song_engine = None
         group = manager.start_group(ALBUM, "album", selection())
         assert manager.resolve_group(group.id).status == GroupStatus.FAILED
+    finally:
+        manager.stop()
+
+
+def test_run_releases_songs_in_batches(store, config, paths):
+    config.stage_size = 2
+    songs = [
+        sample_song(title=f"Song {n}", track_number=n) for n in range(1, 6)
+    ]  # 5 songs, 3 batches
+    block = threading.Event()
+    engine = FakeEngine(block=block)
+    manager, _ = make_manager(store, config, paths, engine, workers=2)
+    manager.song_engine = FakeSongEngine(songs=songs)
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        jobs = store.list(group_id=group.id)
+        assert [j.status for j in jobs[2:]] == [JobStatus.STAGED] * 3
+        assert all(j.status != JobStatus.STAGED for j in jobs[:2])
+        progress = manager.group_progress(store.get_group(group.id))
+        assert (progress.staged, progress.stage, progress.stages) == (3, 1, 3)
+        assert engine.started.wait(5)
+        assert len(engine.downloads) <= 2  # the held songs never reached a worker
+        block.set()
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert all(j.status == JobStatus.DONE for j in store.list(group_id=group.id))
+        assert len(engine.downloads) == 5
+    finally:
+        block.set()
+        manager.stop()
+
+
+def test_batch_pause_and_cancel_of_held_songs(store, config, paths):
+    config.stage_size = 1
+    config.stage_pause = 1
+    songs = [sample_song(title=f"Song {n}", track_number=n) for n in range(1, 4)]
+    manager, _ = make_manager(store, config, paths, FakeEngine(), workers=1)
+    manager.song_engine = FakeSongEngine(songs=songs)
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        first = store.list(group_id=group.id)[0]
+        assert wait_until(lambda: store.get(first.id).status == JobStatus.DONE)
+        assert wait_until(lambda: manager.group_progress(store.get_group(group.id)).resting)
+        second = store.list(group_id=group.id)[1]
+        assert store.get(second.id).status == JobStatus.STAGED  # still held during the pause
+        assert wait_until(lambda: store.get(second.id).status == JobStatus.DONE, timeout=6)
+        assert manager.cancel_group(group.id)  # the third is held or resting: cancelled outright
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.CANCELLED)
+        third = store.list(group_id=group.id)[2]
+        assert store.get(third.id).status == JobStatus.CANCELLED and not manager._stage_timers
+    finally:
+        manager.stop()
+
+
+def test_restart_releases_a_batch_and_unmatched_songs_do_not_hold_a_run(store, config, paths):
+    config.stage_size = 1
+    group = store.add_group(
+        Group(
+            url=ALBUM,
+            kind="album",
+            selection=selection(),
+            status=GroupStatus.ACTIVE,
+            name="X",
+            entry_count=2,
+        )
+    )
+    store.add(
+        Job(
+            url="u",
+            selection=selection(),
+            song=sample_song(title="A"),
+            group_id=group.id,
+            status=JobStatus.PENDING,
+            phase=NO_MATCH_PHASE,
+        )
+    )
+    store.add(
+        Job(
+            url="u",
+            selection=selection(),
+            song=sample_song(title="B"),
+            group_id=group.id,
+            status=JobStatus.STAGED,
+        )
+    )
+    manager, _ = make_manager(store, config, paths, FakeEngine())
+    manager.song_engine = FakeSongEngine()
+    manager.start()  # B is released and runs; A waits as pending but does not hold the run open
+    try:
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert "1 not found" in store.get_group(group.id).error
+        assert manager.retry_group(group.id) == 1  # the unmatched song is staged and released again
+        assert wait_until(
+            lambda: (
+                store.get_group(group.id).status == GroupStatus.DONE
+                and all(j.status == JobStatus.DONE for j in store.list(group_id=group.id))
+            )
+        )
     finally:
         manager.stop()

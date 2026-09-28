@@ -17,6 +17,7 @@ COLUMNS = ("#", "Song", "Status", "Progress", "Match")
 STATUS_STYLE = {
     JobStatus.PENDING: "yellow",
     JobStatus.QUEUED: "dim",
+    JobStatus.STAGED: "dim",
     JobStatus.MATCHING: "cyan",
     JobStatus.DOWNLOADING: "cyan",
     JobStatus.PROCESSING: "magenta",
