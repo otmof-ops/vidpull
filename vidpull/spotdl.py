@@ -68,6 +68,10 @@ class ResolveError(SpotdlError):
     pass
 
 
+class ResolveCancelled(SpotdlError):
+    """The caller cancelled while spotDL was still working."""
+
+
 class InstallError(SpotdlError):
     pass
 
@@ -184,7 +188,7 @@ class SongEngine(Protocol):
 
     def version(self) -> str: ...
 
-    def resolve(self, url: str) -> list[Song]: ...
+    def resolve(self, url: str, cancel: threading.Event | None = None) -> list[Song]: ...
 
     def match(self, song: Song, cancel: threading.Event | None = None) -> str | None: ...
 
@@ -245,21 +249,29 @@ class SpotdlEngine:
         self._version = (now, text)
         return text
 
-    def resolve(self, url: str) -> list[Song]:
-        """Every song behind a Spotify track, album or playlist link, via ``spotdl save``."""
+    def resolve(self, url: str, cancel: threading.Event | None = None) -> list[Song]:
+        """Every song behind a Spotify track, album or playlist link, via ``spotdl save``.
+
+        Raises ``ResolveCancelled`` when ``cancel`` is set while spotDL is still working.
+        """
         link = normalize_spotify_link(url)
         args = [*self.prefix(), "save", link, "--save-file", "-", *self.common_args()]
-        try:
-            proc = run(args, timeout=RESOLVE_TIMEOUT, env=self.env())
-        except subprocess.TimeoutExpired as exc:
-            raise ResolveError("spotDL did not answer within the resolve timeout") from exc
-        except OSError as exc:
-            raise ResolveError(f"cannot run spotDL: {exc}") from exc
-        data = _json_array(proc.stdout)
-        if proc.returncode != 0 or data is None:
-            raise ResolveError(
-                last_error(proc.stderr) or f"spotDL exited with code {proc.returncode}"
-            )
+        outcome = _run_cancellable(args, self.env(), cancel, RESOLVE_TIMEOUT)
+        if outcome is None:
+            raise ResolveCancelled("cancelled while fetching the track list")
+        returncode, stdout, stderr = outcome
+        if returncode is None:
+            raise ResolveError("spotDL did not answer within the resolve timeout")
+        data = _json_array(stdout)
+        if returncode != 0 or data is None:
+            detail = last_error(stderr)
+            if not detail:
+                detail = (
+                    "spotDL returned no track list (it exits 0 when interrupted)"
+                    if returncode == 0
+                    else f"spotDL exited with code {returncode}"
+                )
+            raise ResolveError(detail)
         songs = [song_from_spotdl(d) for d in data if isinstance(d, dict) and d.get("name")]
         if not songs:
             raise ResolveError("spotDL found no songs at that link")
@@ -281,31 +293,16 @@ class SpotdlEngine:
         query = song.url or song.display_title
         argv = [*self.prefix(), "url", query, *self.common_args()]
         try:
-            proc = subprocess.Popen(
-                argv,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=self.env(),
-                start_new_session=True,
-            )
-        except OSError as exc:
-            log.warning("cannot run spotDL: %s", exc)
+            outcome = _run_cancellable(argv, self.env(), cancel, MATCH_TIMEOUT)
+        except SpotdlError as exc:
+            log.warning("%s", exc)
             return None
-        deadline = time.monotonic() + MATCH_TIMEOUT
-        while proc.poll() is None:
-            if cancel is not None and cancel.is_set():
-                _terminate(proc)
-                return None
-            if time.monotonic() > deadline:
-                _terminate(proc)
-                log.warning("spotDL match timed out for %s", song.display_title)
-                return None
-            time.sleep(0.2)
-        stdout, stderr = proc.communicate()
+        if outcome is None:
+            return None
+        returncode, stdout, stderr = outcome
+        if returncode is None:
+            log.warning("spotDL match timed out for %s", song.display_title)
+            return None
         for line in stdout.splitlines():
             candidate = line.strip()
             if is_youtube_url(candidate):
@@ -328,13 +325,58 @@ def _json_array(text: str) -> list[Any] | None:
     return data if isinstance(data, list) else None
 
 
+def _run_cancellable(
+    argv: list[str], env: dict[str, str], cancel: threading.Event | None, timeout: float
+) -> tuple[int | None, str, str] | None:
+    """Run spotDL, draining its output while watching ``cancel``.
+
+    Returns ``None`` when cancelled, ``(None, "", "")`` on timeout, else
+    ``(returncode, stdout, stderr)``. Output is read as it comes, so a long track
+    list never blocks the child on a full pipe.
+    """
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise ResolveError(f"cannot run spotDL: {exc}") from exc
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            stdout, stderr = proc.communicate(timeout=0.25)
+        except subprocess.TimeoutExpired:
+            if cancel is not None and cancel.is_set():
+                _terminate(proc)
+                with contextlib.suppress(Exception):
+                    proc.communicate(timeout=KILL_GRACE_SECONDS)
+                return None
+            if time.monotonic() > deadline:
+                _terminate(proc)
+                with contextlib.suppress(Exception):
+                    proc.communicate(timeout=KILL_GRACE_SECONDS)
+                return None, "", ""
+            continue
+        return proc.returncode, stdout, stderr
+
+
 def _terminate(proc: subprocess.Popen[str]) -> None:
+    """Stop spotDL: SIGTERM first (it exits cleanly on that, SIGINT it often ignores), then
+    SIGKILL if it lingers.
+    """
     try:
         pgid = os.getpgid(proc.pid)
     except ProcessLookupError:
         return
     with contextlib.suppress(ProcessLookupError):
-        os.killpg(pgid, signal.SIGINT)
+        os.killpg(pgid, signal.SIGTERM)
     deadline = time.monotonic() + KILL_GRACE_SECONDS
     while proc.poll() is None and time.monotonic() < deadline:
         time.sleep(0.1)

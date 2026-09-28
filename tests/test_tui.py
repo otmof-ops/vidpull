@@ -8,9 +8,10 @@ import threading
 from textual.widgets import DataTable, Input
 
 from tests.helpers import FakeEngine, FakeSongEngine, wait_until
-from vidpull.models import JobStatus, Selection, SelectionKind
+from vidpull.models import GroupStatus, JobStatus, Selection, SelectionKind
 from vidpull.tui.app import PostExit, VidpullApp
 from vidpull.tui.screens.confirm import ConfirmScreen
+from vidpull.tui.screens.group import GroupScreen
 from vidpull.tui.screens.picker import FormatPicker
 from vidpull.tui.screens.settings import SettingsScreen
 from vidpull.tui.screens.uninstall import UninstallScreen
@@ -396,6 +397,69 @@ def test_spotify_link_without_spotdl_offers_install(config, paths, store, video_
             assert "spotDL" in app.screen.question
             await pilot.press("n")
             assert await until(pilot, lambda: not isinstance(app.screen, ConfirmScreen))
+            assert store.list() == []
+
+    run(flow())
+
+
+ALBUM = "https://open.spotify.com/album/6dVIqQ8qmQ5GBnJ9shOYGE"
+
+
+def test_album_link_is_one_row_with_its_songs_behind_it(config, paths, store, video_info):
+    from tests.helpers import sample_song
+
+    engine = FakeEngine(info=video_info)
+    songs = [
+        sample_song(title="Airbag", track_number=1),
+        sample_song(title="Paranoid Android", track_number=2),
+    ]
+    for song in songs:
+        song.list_name = "OK Computer"
+    app = make_app(config, paths, store, engine, song_engine=FakeSongEngine(songs=songs))
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = ALBUM
+            await pilot.press("enter")
+            table = app.query_one("#jobs", DataTable)
+            assert await until(pilot, lambda: len(store.list_groups()) == 1)
+            group = store.list_groups()[0]
+            assert await until(pilot, lambda: store.get_group(group.id).status == GroupStatus.DONE)
+            assert await until(pilot, lambda: "done 2/2" in str(table.get_row(f"g{group.id}")[3]))
+            assert table.row_count == 1  # the two songs are behind the row, not beside it
+            assert "OK Computer · 2 songs" in str(table.get_row(f"g{group.id}")[1])
+            assert len(store.list(group_id=group.id)) == 2
+            await pilot.press("escape")
+            await pilot.press("enter")  # enter on the group row opens its songs
+            assert await until(pilot, lambda: isinstance(app.screen, GroupScreen))
+            assert await until(
+                pilot, lambda: app.screen.query_one("#songs", DataTable).row_count == 2
+            )
+            await pilot.press("escape")
+            assert await until(pilot, lambda: not isinstance(app.screen, GroupScreen))
+
+    run(flow())
+
+
+def test_cancel_key_stops_a_run_while_it_fetches_the_list(config, paths, store, video_info):
+    block = threading.Event()
+    engine = FakeEngine(info=video_info)
+    song_engine = FakeSongEngine(resolve_block=block)
+    app = make_app(config, paths, store, engine, song_engine=song_engine)
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = ALBUM
+            await pilot.press("enter")
+            table = app.query_one("#jobs", DataTable)
+            assert await until(pilot, lambda: table.row_count == 1)
+            assert "fetching the track list" in str(table.get_row("g1")[1])
+            await pilot.press("escape")  # leave the link box; the cursor is on the row
+            await pilot.press("c")
+            assert await until(pilot, lambda: store.get_group(1).status == GroupStatus.CANCELLED)
+            assert await until(pilot, lambda: "cancelled" in str(table.get_row("g1")[3]))
             assert store.list() == []
 
     run(flow())

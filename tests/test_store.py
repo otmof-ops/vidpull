@@ -113,7 +113,7 @@ def test_migrates_a_version_1_database(paths):
 
     store = Store(path)
     try:
-        assert store.get_meta("schema_version") == "2"
+        assert store.get_meta("schema_version") == str(SCHEMA_VERSION)
         old = store.get(1)
         assert old is not None and old.song is None and old.matched_url == ""
         song = Song(title="Airbag", artists=["Radiohead"], album="OK Computer", track_number=1)
@@ -129,5 +129,51 @@ def test_migrates_a_version_1_database(paths):
         store.close()
     # opening it again is a no-op, not a second migration
     again = Store(path)
-    assert again.get_meta("schema_version") == "2" and len(again.list()) == 2
+    assert again.get_meta("schema_version") == str(SCHEMA_VERSION) and len(again.list()) == 2
     again.close()
+
+
+def test_groups_crud_and_job_membership(store: Store):
+    from vidpull.models import Group, GroupStatus, Song
+
+    selection = Selection(SelectionKind.PRESET, "bestaudio/best", "Audio as MP3")
+    group = store.add_group(
+        Group(
+            url="https://open.spotify.com/album/6dVIqQ8qmQ5GBnJ9shOYGE",
+            kind="album",
+            selection=selection,
+        )
+    )
+    assert group.id == 1 and group.status == GroupStatus.RESOLVING
+    loaded = store.get_group(group.id)
+    assert loaded.kind == "album" and loaded.selection.label == "Audio as MP3"
+    for n, title in enumerate(("Airbag", "Paranoid Android"), 1):
+        store.add(
+            Job(
+                url="https://open.spotify.com/track/x",
+                selection=selection,
+                song=Song(title=title, artists=["Radiohead"], track_number=n),
+                group_id=group.id,
+            )
+        )
+    store.add(_job())  # not in the group
+    assert [j.song.title for j in store.list(group_id=group.id)] == ["Airbag", "Paranoid Android"]
+    assert len(store.list()) == 3 and store.list()[2].group_id is None
+    updated = store.update_group(
+        group.id, status=GroupStatus.ACTIVE, name="OK Computer", entry_count=2
+    )
+    assert updated.status == GroupStatus.ACTIVE and updated.display_title == "OK Computer"
+    assert store.group_counts(group.id) == {"queued": 2}
+    try:
+        store.update_group(group.id, nope=1)
+    except ValueError as exc:
+        assert "nope" in str(exc)
+    assert [g.id for g in store.list_groups()] == [1]
+    assert store.delete_group(group.id) and store.list_groups() == []
+    # a group still resolving when the app died is failed on the next start
+    stuck = store.add_group(
+        Group(url="https://open.spotify.com/playlist/p", kind="playlist", selection=selection)
+    )
+    store.requeue_stale()
+    assert store.get_group(stuck.id).status == GroupStatus.FAILED
+    assert "paste the link again" in store.get_group(stuck.id).error

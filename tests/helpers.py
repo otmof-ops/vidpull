@@ -39,11 +39,13 @@ class FakeSongEngine:
         match_url: str | None = MATCHED_URL,
         available: bool = True,
         resolve_error: str | None = None,
+        resolve_block: threading.Event | None = None,
     ):
         self.songs = songs if songs is not None else [sample_song()]
         self.match_url = match_url
         self._available = available
         self.resolve_error = resolve_error
+        self.resolve_block = resolve_block  # when set, resolve waits for it (or for cancel)
         self.resolved: list[str] = []
         self.matched: list[str] = []
 
@@ -53,10 +55,15 @@ class FakeSongEngine:
     def version(self) -> str:
         return "fake-4.5.2"
 
-    def resolve(self, url: str) -> list[Song]:
-        from vidpull.spotdl import ResolveError
+    def resolve(self, url: str, cancel: threading.Event | None = None) -> list[Song]:
+        from vidpull.spotdl import ResolveCancelled, ResolveError
 
         self.resolved.append(url)
+        if self.resolve_block is not None:
+            while not self.resolve_block.is_set():
+                if cancel is not None and cancel.is_set():
+                    raise ResolveCancelled("cancelled")
+                time.sleep(0.01)
         if self.resolve_error:
             raise ResolveError(self.resolve_error)
         return [Song.from_json(s.to_json()) for s in self.songs]
@@ -77,8 +84,10 @@ class FakeEngine:
         probe_error: str | None = None,
         block: threading.Event | None = None,
         files: tuple[str, ...] = ("clip.mp4",),
+        fail_first_with: str | None = None,
     ):
         self.info = info
+        self.fail_first_with = fail_first_with
         self.steps = steps
         self.delay = delay
         self.fail = fail
@@ -155,6 +164,8 @@ class FakeEngine:
             time.sleep(self.delay)
         if self.fail:
             return DownloadResult(ok=False, error="boom")
+        if self.fail_first_with and len(self.downloads) == 1:
+            return DownloadResult(ok=False, error=self.fail_first_with)
         on_progress(Progress(status="processing", phase="merging streams"))
         download_dir.mkdir(parents=True, exist_ok=True)
         produced = []

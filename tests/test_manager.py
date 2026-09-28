@@ -2,7 +2,7 @@ import threading
 
 from tests.helpers import MATCHED_URL, FakeEngine, FakeSongEngine, sample_song, wait_until
 from vidpull.manager import NO_MATCH_PHASE, DownloadManager
-from vidpull.models import JobStatus, Selection, SelectionKind
+from vidpull.models import Group, GroupStatus, Job, JobStatus, Selection, SelectionKind
 
 
 def selection():
@@ -187,5 +187,221 @@ def test_song_job_without_song_engine_fails(store, config, paths):
         job = manager.enqueue_song(sample_song(), selection())
         assert wait_until(lambda: store.get(job.id).status == JobStatus.FAILED)
         assert "spotDL" in store.get(job.id).error and engine.downloads == []
+    finally:
+        manager.stop()
+
+
+ALBUM = "https://open.spotify.com/album/6dVIqQ8qmQ5GBnJ9shOYGE"
+
+
+def two_songs():
+    return [
+        sample_song(title="Airbag", track_number=1),
+        sample_song(title="Paranoid Android", track_number=2),
+    ]
+
+
+def test_group_resolves_queues_and_settles_done(store, config, paths):
+    engine = FakeEngine()
+    song_engine = FakeSongEngine(songs=two_songs())
+    for song in song_engine.songs:
+        song.list_name = "OK Computer"
+    group_events = []
+    manager, events = make_manager(store, config, paths, engine)
+    manager.song_engine = song_engine
+    manager.on_group_event = group_events.append
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        assert group.status == GroupStatus.RESOLVING and group_events[-1].group.id == group.id
+        resolved = manager.resolve_group(group.id)
+        assert resolved.status == GroupStatus.ACTIVE and resolved.entry_count == 2
+        assert resolved.name == "OK Computer"
+        songs = store.list(group_id=group.id)
+        assert [j.song.title for j in songs] == ["Airbag", "Paranoid Android"]
+        assert all(j.group_id == group.id for j in songs)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        progress = manager.group_progress(store.get_group(group.id))
+        assert progress.total == 2 and progress.done == 2 and progress.percent == 100.0
+        assert any(e.group.status == GroupStatus.DONE for e in group_events)
+    finally:
+        manager.stop()
+
+
+def test_cancel_group_while_fetching_the_track_list(store, config, paths):
+    block = threading.Event()
+    song_engine = FakeSongEngine(songs=two_songs(), resolve_block=block)
+    manager, _ = make_manager(store, config, paths, FakeEngine())
+    manager.song_engine = song_engine
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        result = {}
+        worker = threading.Thread(target=lambda: result.update(g=manager.resolve_group(group.id)))
+        worker.start()
+        assert wait_until(lambda: song_engine.resolved == [ALBUM])
+        assert manager.cancel_group(group.id)
+        worker.join(timeout=5)
+        assert result["g"].status == GroupStatus.CANCELLED
+        assert store.list(group_id=group.id) == []  # nothing was queued
+    finally:
+        block.set()
+        manager.stop()
+
+
+def test_cancel_group_while_songs_run(store, config, paths):
+    block = threading.Event()
+    engine = FakeEngine(block=block)
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.song_engine = FakeSongEngine(songs=two_songs())
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert engine.started.wait(5)  # the first song is downloading, the second is queued
+        assert manager.cancel_group(group.id)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.CANCELLED)
+        assert wait_until(
+            lambda: all(j.status == JobStatus.CANCELLED for j in store.list(group_id=group.id))
+        )
+        assert manager.retry_group(group.id) == 2
+        block.set()
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+    finally:
+        block.set()
+        manager.stop()
+
+
+def test_group_resolve_error_and_delete(store, config, paths):
+    manager, _ = make_manager(store, config, paths, FakeEngine())
+    manager.song_engine = FakeSongEngine(resolve_error="Couldn't get metadata")
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        failed = manager.resolve_group(group.id)
+        assert failed.status == GroupStatus.FAILED and "metadata" in failed.error
+        assert manager.retry_group(group.id) == 0
+        assert manager.delete_group(group.id) and store.get_group(group.id) is None
+        manager.song_engine = None
+        group = manager.start_group(ALBUM, "album", selection())
+        assert manager.resolve_group(group.id).status == GroupStatus.FAILED
+    finally:
+        manager.stop()
+
+
+def test_run_releases_songs_in_batches(store, config, paths):
+    config.stage_size = 2
+    songs = [
+        sample_song(title=f"Song {n}", track_number=n) for n in range(1, 6)
+    ]  # 5 songs, 3 batches
+    block = threading.Event()
+    engine = FakeEngine(block=block)
+    manager, _ = make_manager(store, config, paths, engine, workers=2)
+    manager.song_engine = FakeSongEngine(songs=songs)
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        jobs = store.list(group_id=group.id)
+        assert [j.status for j in jobs[2:]] == [JobStatus.STAGED] * 3
+        assert all(j.status != JobStatus.STAGED for j in jobs[:2])
+        progress = manager.group_progress(store.get_group(group.id))
+        assert (progress.staged, progress.stage, progress.stages) == (3, 1, 3)
+        assert engine.started.wait(5)
+        assert len(engine.downloads) <= 2  # the held songs never reached a worker
+        block.set()
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert all(j.status == JobStatus.DONE for j in store.list(group_id=group.id))
+        assert len(engine.downloads) == 5
+    finally:
+        block.set()
+        manager.stop()
+
+
+def test_batch_pause_and_cancel_of_held_songs(store, config, paths):
+    config.stage_size = 1
+    config.stage_pause = 1
+    songs = [sample_song(title=f"Song {n}", track_number=n) for n in range(1, 4)]
+    manager, _ = make_manager(store, config, paths, FakeEngine(), workers=1)
+    manager.song_engine = FakeSongEngine(songs=songs)
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        first = store.list(group_id=group.id)[0]
+        assert wait_until(lambda: store.get(first.id).status == JobStatus.DONE)
+        assert wait_until(lambda: manager.group_progress(store.get_group(group.id)).resting)
+        second = store.list(group_id=group.id)[1]
+        assert store.get(second.id).status == JobStatus.STAGED  # still held during the pause
+        assert wait_until(lambda: store.get(second.id).status == JobStatus.DONE, timeout=6)
+        assert manager.cancel_group(group.id)  # the third is held or resting: cancelled outright
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.CANCELLED)
+        third = store.list(group_id=group.id)[2]
+        assert store.get(third.id).status == JobStatus.CANCELLED and not manager._stage_timers
+    finally:
+        manager.stop()
+
+
+def test_restart_releases_a_batch_and_unmatched_songs_do_not_hold_a_run(store, config, paths):
+    config.stage_size = 1
+    group = store.add_group(
+        Group(
+            url=ALBUM,
+            kind="album",
+            selection=selection(),
+            status=GroupStatus.ACTIVE,
+            name="X",
+            entry_count=2,
+        )
+    )
+    store.add(
+        Job(
+            url="u",
+            selection=selection(),
+            song=sample_song(title="A"),
+            group_id=group.id,
+            status=JobStatus.PENDING,
+            phase=NO_MATCH_PHASE,
+        )
+    )
+    store.add(
+        Job(
+            url="u",
+            selection=selection(),
+            song=sample_song(title="B"),
+            group_id=group.id,
+            status=JobStatus.STAGED,
+        )
+    )
+    manager, _ = make_manager(store, config, paths, FakeEngine())
+    manager.song_engine = FakeSongEngine()
+    manager.start()  # B is released and runs; A waits as pending but does not hold the run open
+    try:
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert "1 not found" in store.get_group(group.id).error
+        assert manager.retry_group(group.id) == 1  # the unmatched song is staged and released again
+        assert wait_until(
+            lambda: (
+                store.get_group(group.id).status == GroupStatus.DONE
+                and all(j.status == JobStatus.DONE for j in store.list(group_id=group.id))
+            )
+        )
+    finally:
+        manager.stop()
+
+
+def test_song_download_retries_once_with_a_fresh_extraction_after_403(store, config, paths):
+    engine = FakeEngine(fail_first_with="unable to download video data: HTTP Error 403: Forbidden")
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.song_engine = FakeSongEngine()
+    manager.start()
+    try:
+        job = manager.enqueue_song(sample_song(), selection())
+        assert wait_until(lambda: store.get(job.id).status == JobStatus.DONE)
+        assert len(engine.downloads) == 2 and engine.json_probes == [MATCHED_URL, MATCHED_URL]
+        assert engine.infos[1]["track"] == "Cut To The Feeling"  # the retry carries the tags too
+        # a plain media job is not retried this way
+        plain = manager.enqueue("https://e/v", selection())
+        assert wait_until(lambda: store.get(plain.id).is_terminal)
     finally:
         manager.stop()

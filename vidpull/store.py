@@ -15,11 +15,27 @@ import threading
 from collections.abc import Iterable
 from pathlib import Path
 
-from vidpull.models import Job, JobStatus, Selection, Song, utcnow
+from vidpull.models import Group, GroupStatus, Job, JobStatus, Selection, Song, utcnow
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
-_SCHEMA = """
+_GROUPS_TABLE = """
+CREATE TABLE IF NOT EXISTS groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    url TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    selection TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    entry_count INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+_SCHEMA = (
+    """
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     url TEXT NOT NULL,
@@ -45,7 +61,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     started_at TEXT,
     finished_at TEXT,
     song TEXT NOT NULL DEFAULT '',
-    matched_url TEXT NOT NULL DEFAULT ''
+    matched_url TEXT NOT NULL DEFAULT '',
+    group_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE TABLE IF NOT EXISTS meta (
@@ -53,13 +70,21 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 """
+    + _GROUPS_TABLE
+)
 
 # Statements that take a database from version N-1 to N. ``ALTER TABLE ... ADD COLUMN`` is
-# skipped when the column already exists, so a run interrupted half-way can be repeated.
+# skipped when the column already exists and the CREATE statements say IF NOT EXISTS, so a
+# run interrupted half-way can be repeated.
 _MIGRATIONS: dict[int, tuple[str, ...]] = {
     2: (
         "ALTER TABLE jobs ADD COLUMN song TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE jobs ADD COLUMN matched_url TEXT NOT NULL DEFAULT ''",
+    ),
+    3: (
+        "ALTER TABLE jobs ADD COLUMN group_id INTEGER",
+        "CREATE INDEX IF NOT EXISTS idx_jobs_group ON jobs(group_id)",
+        _GROUPS_TABLE,
     ),
 }
 
@@ -88,6 +113,19 @@ _COLUMNS = (
     "finished_at",
     "song",
     "matched_url",
+    "group_id",
+)
+
+_GROUP_COLUMNS = (
+    "url",
+    "kind",
+    "selection",
+    "name",
+    "status",
+    "entry_count",
+    "error",
+    "created_at",
+    "updated_at",
 )
 
 
@@ -110,6 +148,7 @@ class Store:
                 self.set_meta("schema_version", str(SCHEMA_VERSION))
             else:
                 self._migrate(int(recorded))
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_group ON jobs(group_id)")
         if str(path) != ":memory:":
             with contextlib.suppress(OSError):
                 self.path.chmod(0o600)
@@ -137,7 +176,8 @@ class Store:
                 )
                 self._conn.execute("COMMIT")
             except Exception:
-                self._conn.execute("ROLLBACK")
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.execute("ROLLBACK")
                 raise
 
     # ------------------------------------------------------------- meta
@@ -174,16 +214,26 @@ class Store:
         return None if row is None else _from_row(row)
 
     def list(
-        self, statuses: Iterable[JobStatus] | None = None, *, limit: int | None = None
+        self,
+        statuses: Iterable[JobStatus] | None = None,
+        *,
+        limit: int | None = None,
+        group_id: int | None = None,
     ) -> list[Job]:
         sql = "SELECT * FROM jobs"
+        clauses: list[str] = []
         params: list[object] = []
         if statuses is not None:
             wanted = [str(s) for s in statuses]
             if not wanted:
                 return []
-            sql += f" WHERE status IN ({', '.join('?' for _ in wanted)})"
+            clauses.append(f"status IN ({', '.join('?' for _ in wanted)})")
             params.extend(wanted)
+        if group_id is not None:
+            clauses.append("group_id = ?")
+            params.append(int(group_id))
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY id"
         if limit is not None:
             sql += " LIMIT ?"
@@ -246,7 +296,10 @@ class Store:
         return cur.rowcount
 
     def requeue_stale(self) -> int:
-        """Jobs left active by a crashed run go back to the queue; yt-dlp resumes .part files."""
+        """Jobs left active by a crashed run go back to the queue; yt-dlp resumes .part files.
+
+        A group still fetching its track list cannot be resumed and is marked failed.
+        """
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE jobs SET status = ?, worker = '', speed = NULL, eta = NULL, "
@@ -257,6 +310,15 @@ class Store:
                     str(JobStatus.MATCHING),
                     str(JobStatus.DOWNLOADING),
                     str(JobStatus.PROCESSING),
+                ),
+            )
+            self._conn.execute(
+                "UPDATE groups SET status = ?, error = ?, updated_at = ? WHERE status = ?",
+                (
+                    str(GroupStatus.FAILED),
+                    "interrupted before the track list arrived; paste the link again",
+                    utcnow(),
+                    str(GroupStatus.RESOLVING),
                 ),
             )
         return cur.rowcount
@@ -275,16 +337,62 @@ class Store:
             ).fetchall()
         return {str(r["status"]): int(r["n"]) for r in rows}
 
+    # ------------------------------------------------------------ groups
+    def add_group(self, group: Group) -> Group:
+        group.created_at = group.created_at or utcnow()
+        group.updated_at = utcnow()
+        values = _group_to_row(group)
+        placeholders = ", ".join("?" for _ in _GROUP_COLUMNS)
+        with self._lock:
+            cur = self._conn.execute(
+                f"INSERT INTO groups({', '.join(_GROUP_COLUMNS)}) VALUES({placeholders})",
+                [values[c] for c in _GROUP_COLUMNS],
+            )
+            group.id = int(cur.lastrowid or 0)
+        return group
+
+    def get_group(self, group_id: int) -> Group | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM groups WHERE id = ?", (group_id,)).fetchone()
+        return None if row is None else _group_from_row(row)
+
+    def list_groups(self) -> list[Group]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM groups ORDER BY id").fetchall()
+        return [_group_from_row(r) for r in rows]
+
+    def update_group(self, group_id: int, **fields: object) -> Group | None:
+        if not fields:
+            return self.get_group(group_id)
+        unknown = set(fields) - set(_GROUP_COLUMNS)
+        if unknown:
+            raise ValueError(f"unknown group columns: {sorted(unknown)}")
+        fields["updated_at"] = utcnow()
+        assignments = ", ".join(f"{k} = ?" for k in fields)
+        params = [_encode_group(k, v) for k, v in fields.items()]
+        params.append(group_id)
+        with self._lock:
+            self._conn.execute(f"UPDATE groups SET {assignments} WHERE id = ?", params)
+        return self.get_group(group_id)
+
+    def delete_group(self, group_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
+        return cur.rowcount > 0
+
+    def group_counts(self, group_id: int) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) AS n FROM jobs WHERE group_id = ? GROUP BY status",
+                (group_id,),
+            ).fetchall()
+        return {str(r["status"]): int(r["n"]) for r in rows}
+
 
 def _added_column(statement: str) -> str | None:
     words = statement.split()
-    if len(words) >= 6 and [w.upper() for w in words[:5]] == [
-        "ALTER",
-        "TABLE",
-        "JOBS",
-        "ADD",
-        "COLUMN",
-    ]:
+    heads = [w.upper() for w in words[:5]]
+    if len(words) >= 6 and heads == ["ALTER", "TABLE", "JOBS", "ADD", "COLUMN"]:
         return words[5]
     return None
 
@@ -300,6 +408,14 @@ def _encode(column: str, value: object) -> object:
         return str(value)
     if column == "is_playlist":
         return 1 if value else 0
+    return value
+
+
+def _encode_group(column: str, value: object) -> object:
+    if column == "selection" and isinstance(value, Selection):
+        return value.to_json()
+    if column == "status" and isinstance(value, GroupStatus):
+        return str(value)
     return value
 
 
@@ -329,6 +445,7 @@ def _to_row(job: Job) -> dict[str, object]:
         "finished_at": job.finished_at,
         "song": job.song.to_json() if job.song is not None else "",
         "matched_url": job.matched_url,
+        "group_id": job.group_id,
     }
 
 
@@ -360,4 +477,34 @@ def _from_row(row: sqlite3.Row) -> Job:
         finished_at=row["finished_at"],
         song=Song.from_json(song_text) if song_text else None,
         matched_url=row["matched_url"] or "",
+        group_id=row["group_id"],
+    )
+
+
+def _group_to_row(group: Group) -> dict[str, object]:
+    return {
+        "url": group.url,
+        "kind": group.kind,
+        "selection": group.selection.to_json(),
+        "name": group.name,
+        "status": str(group.status),
+        "entry_count": group.entry_count,
+        "error": group.error,
+        "created_at": group.created_at,
+        "updated_at": group.updated_at,
+    }
+
+
+def _group_from_row(row: sqlite3.Row) -> Group:
+    return Group(
+        id=int(row["id"]),
+        url=row["url"],
+        kind=row["kind"],
+        selection=Selection.from_json(row["selection"]),
+        name=row["name"],
+        status=GroupStatus(row["status"]),
+        entry_count=int(row["entry_count"] or 0),
+        error=row["error"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
