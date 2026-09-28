@@ -28,7 +28,7 @@ from vidpull.formats import (
 from vidpull.log import setup_logging
 from vidpull.manager import DownloadManager
 from vidpull.manifest import Manifest
-from vidpull.models import Job, JobEvent, JobStatus, Selection
+from vidpull.models import GroupStatus, Job, JobEvent, JobStatus, Selection
 from vidpull.paths import Paths
 from vidpull.procs import redact_url
 from vidpull.semver import Version
@@ -37,6 +37,7 @@ from vidpull.spotdl import (
     ResolveError,
     SpotdlEngine,
     is_spotify_link,
+    spotify_kind,
 )
 from vidpull.spotdl import disclosure as spotdl_disclosure
 from vidpull.spotdl import install as spotdl_install
@@ -352,6 +353,18 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
         try:
             for url in args.urls:
                 if song_engine is not None and is_spotify_link(url):
+                    kind = spotify_kind(url)
+                    if kind in {"album", "playlist"}:
+                        group = manager.start_group(url, kind, song_selection)
+                        group = manager.resolve_group(group.id or 0) or group
+                        if group.status != GroupStatus.ACTIVE:
+                            console.print(
+                                f"[red]error:[/] {redact_url(url)}: {group.error or group.status}"
+                            )
+                            continue
+                        console.print(f"{group.display_title}: {group.entry_count} songs")
+                        ids.extend(j.id or 0 for j in store.list(group_id=group.id))
+                        continue
                     try:
                         songs = song_engine.resolve(url)
                     except ResolveError as exc:
@@ -666,9 +679,12 @@ def cmd_queue_list(args: argparse.Namespace, ctx: Context) -> int:
         return EXIT_OK
     store = Store(ctx.paths.db_file)
     jobs = store.list()
+    groups = store.list_groups()
+    counts = {g.id: store.group_counts(g.id or 0) for g in groups}
     store.close()
     if not args.all:
         jobs = [j for j in jobs if not j.is_terminal or j.status == JobStatus.FAILED]
+        groups = [g for g in groups if not g.is_terminal or g.status == GroupStatus.FAILED]
     if args.json:
         print(
             json.dumps(
@@ -678,11 +694,21 @@ def cmd_queue_list(args: argparse.Namespace, ctx: Context) -> int:
             )
         )
         return EXIT_OK
-    if not jobs:
+    if not jobs and not groups:
         print("no jobs")
         return EXIT_OK
+    for group in groups:
+        done = counts.get(group.id, {}).get("done", 0)
+        total = sum(counts.get(group.id, {}).values())
+        title = _short(group.display_title, 50)
+        print(
+            f"G{group.id:>3}  {group.status:<11} {done:>3}/{total:<3} songs  {title:<50}  "
+            f"{group.selection.label}"
+        )
     for job in jobs:
         title = _short(job.display_title, 50)
+        if job.group_id is not None:
+            title = _short(f"[G{job.group_id}] {job.display_title}", 50)
         print(
             f"{job.id:>4}  {job.status:<11} {job.progress:>5.1f}%  {title:<50}  "
             f"{job.selection.label}"

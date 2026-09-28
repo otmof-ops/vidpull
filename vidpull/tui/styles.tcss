@@ -97,3 +97,11 @@ TabPane DataTable {
 VerticalScroll {
     height: 1fr;
 }
+
+GroupScreen #dialog {
+    height: 85%;
+}
+
+GroupScreen DataTable {
+    height: 1fr;
+}

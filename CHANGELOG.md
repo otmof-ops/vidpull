@@ -6,6 +6,20 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Album and playlist links are one run: a single row (`G#`) that appears as soon as the link
+  is pasted, shows the track list being fetched with the elapsed time, then counts its songs
+  through with combined progress. `c` cancels the whole run at any stage, including while
+  spotDL is still fetching the list; `r` retries its failed songs; `d` deletes it; Enter or `p`
+  opens the songs behind it with their own status, match, cancel and retry. `vidpull queue
+  list` shows runs above their songs. Job database schema 3 (`groups`, `jobs.group_id`).
+
+### Fixed
+
+- A Spotify fetch (`spotdl save`) is now read as it runs, so a long playlist can no longer stall
+  on a full pipe, and it stops at once when cancelled or when the app quits.
+
 ## [1.1.0] - 2026-09-27
 
 ### Added

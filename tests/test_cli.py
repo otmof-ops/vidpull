@@ -187,3 +187,26 @@ def test_get_spotify_link_without_spotdl_explains(monkeypatch, capsys, paths, vi
     out = capsys.readouterr().out
     assert "spotDL" in out and str(paths.spotdl_venv) in out and "--yes" in out
     assert engine.downloads == []
+
+
+def test_get_album_link_runs_as_a_group(monkeypatch, capsys, paths, video_info):
+    from tests.helpers import sample_song
+
+    engine = FakeEngine(info=video_info)
+    songs = [
+        sample_song(title="Airbag", track_number=1),
+        sample_song(title="Paranoid Android", track_number=2),
+    ]
+    for song in songs:
+        song.list_name = "OK Computer"
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: engine)
+    monkeypatch.setattr(cli, "SpotdlEngine", lambda *a, **k: FakeSongEngine(songs=songs))
+    code = cli.main(["get", "https://open.spotify.com/album/6dVIqQ8qmQ5GBnJ9shOYGE", "-a", "mp3"])
+    out = capsys.readouterr().out
+    assert code == 0 and "OK Computer: 2 songs" in out and out.count("saved") == 2
+    assert cli.main(["queue", "list", "--all"]) == 0
+    listed = capsys.readouterr().out
+    assert (
+        "G  1  done          2/2   songs  OK Computer" in listed
+        and "[G1] Carly Rae Jepsen - Airbag" in listed
+    )

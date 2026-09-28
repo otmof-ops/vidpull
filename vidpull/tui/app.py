@@ -10,6 +10,7 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.text import Text
@@ -28,7 +29,17 @@ from vidpull.formats import build_menu, human_size, preset_selection
 from vidpull.log import RingBufferHandler, setup_logging
 from vidpull.manager import DownloadManager
 from vidpull.manifest import Manifest
-from vidpull.models import Job, JobEvent, JobStatus, MediaInfo, Selection, Song
+from vidpull.models import (
+    Group,
+    GroupEvent,
+    GroupStatus,
+    Job,
+    JobEvent,
+    JobStatus,
+    MediaInfo,
+    Selection,
+    Song,
+)
 from vidpull.paths import Paths
 from vidpull.procs import redact_url, which
 from vidpull.spotdl import (
@@ -37,11 +48,13 @@ from vidpull.spotdl import (
     SongEngine,
     SpotdlEngine,
     is_spotify_link,
+    spotify_kind,
 )
 from vidpull.spotdl import disclosure as spotdl_disclosure
 from vidpull.spotdl import install as spotdl_install
 from vidpull.store import Store
 from vidpull.tui.screens.confirm import ConfirmScreen, TextScreen
+from vidpull.tui.screens.group import GroupScreen
 from vidpull.tui.screens.logview import LogScreen
 from vidpull.tui.screens.picker import FormatPicker, Pick
 from vidpull.tui.screens.settings import SettingsScreen
@@ -65,14 +78,22 @@ STATUS_STYLE = {
     JobStatus.FAILED: "red",
     JobStatus.CANCELLED: "dim red",
 }
+GROUP_STYLE = {
+    GroupStatus.RESOLVING: "yellow",
+    GroupStatus.ACTIVE: "cyan",
+    GroupStatus.DONE: "green",
+    GroupStatus.FAILED: "red",
+    GroupStatus.CANCELLED: "dim red",
+}
 
 HELP = """\
 a      focus the link box (Enter probes the link and opens the format picker)
 esc    leave the link box
 paste  anywhere: Ctrl+Shift+V, right click, or Ctrl+V / v; several links at once are fine
-p      pick a format for a pending job (clipboard watcher)
-c      cancel the selected download          r  retry a failed or cancelled job
-d      delete the selected job (asks; can also delete its files)
+       a Spotify album or playlist link is one row (G#): enter or p shows its songs
+p      pick a format for a pending job (clipboard watcher); look again for an unmatched song
+c      cancel the selected download or run    r  retry a failed or cancelled job or run
+d      delete the selected job or run (asks; can also delete its files)
 o      open the download folder              f  clear finished jobs from the table
 w      toggle the clipboard watcher          s  settings
 u      update vidpull / yt-dlp               x  uninstall
@@ -95,6 +116,12 @@ class PostExit:
 
 class JobChanged(Message):
     def __init__(self, event: JobEvent):
+        super().__init__()
+        self.event = event
+
+
+class GroupChanged(Message):
+    def __init__(self, event: GroupEvent):
         super().__init__()
         self.event = event
 
@@ -156,6 +183,7 @@ class VidpullApp(App[PostExit | None]):
         self.ring = ring
         self.manager = manager or DownloadManager(store, engine, config, paths)
         self.manager.on_event = self._on_manager_event
+        self.manager.on_group_event = self._on_group_event
         self.song_engine: SongEngine = song_engine or SpotdlEngine(
             config, paths, engine_python=getattr(engine, "python", None)
         )
@@ -169,6 +197,7 @@ class VidpullApp(App[PostExit | None]):
         self._engine_version = "…"
         self._notify_tool = which("notify-send")
         self._seen_status: dict[int, JobStatus] = {}
+        self._seen_group_status: dict[str, GroupStatus] = {}
         self._url_queue: list[str] = [u.strip() for u in (initial_urls or []) if u.strip()]
         self._batch_selection: Selection | None = None
         self._table: DataTable | None = None
@@ -213,9 +242,12 @@ class VidpullApp(App[PostExit | None]):
         table = self._table
         keys = table.add_columns(*COLUMNS)
         self._columns = dict(zip(COLUMNS, keys, strict=True))
+        self.manager.start()  # requeues interrupted jobs first, so the rows below are current
+        for group in self.store.list_groups():
+            self._upsert_group(group)
         for job in self.store.list():
-            self._upsert(job)
-        self.manager.start()
+            if job.group_id is None:
+                self._upsert(job)
         self.set_interval(1.0, self._refresh_status)
         self._refresh_status()
         self.load_engine_version()
@@ -230,10 +262,46 @@ class VidpullApp(App[PostExit | None]):
     def _on_manager_event(self, event: JobEvent) -> None:
         self.post_message(JobChanged(event))
 
+    def _on_group_event(self, event: GroupEvent) -> None:
+        self.post_message(GroupChanged(event))
+
+    @on(GroupChanged)
+    def _group_changed(self, message: GroupChanged) -> None:
+        event = message.event
+        group = event.group
+        if event.kind == "removed":
+            self._remove_group_row(group)
+            return
+        if group.id is None:
+            return
+        self._upsert_group(group)
+        key = f"g{group.id}"
+        previous = self._seen_group_status.get(key)
+        self._seen_group_status[key] = group.status
+        if previous is None and group.status == GroupStatus.RESOLVING and self._table is not None:
+            # a run that just started: put the cursor on it so c, d and enter act on it
+            with contextlib.suppress(Exception):
+                self._table.move_cursor(row=self._table.get_row_index(key))
+        if group.status == GroupStatus.DONE and previous not in {None, GroupStatus.DONE}:
+            self._desktop_notify(f"{group.kind.capitalize()} finished", group.display_title)
+        elif group.status == GroupStatus.FAILED and previous not in {None, GroupStatus.FAILED}:
+            self.notify(
+                f"{_short(group.display_title, 50)}: {group.error}",
+                title=f"{group.kind.capitalize()} failed",
+                severity="error",
+                timeout=8,
+            )
+
     @on(JobChanged)
     def _job_changed(self, message: JobChanged) -> None:
         event = message.event
         job = event.job
+        if job.group_id is not None:  # a song inside a run: the run's row carries it
+            if event.kind == "update":
+                group = self.store.get_group(job.group_id)
+                if group is not None:
+                    self._upsert_group(group)
+            return
         if event.kind == "removed":
             self._remove_row(job)
             return
@@ -326,8 +394,12 @@ class VidpullApp(App[PostExit | None]):
             return
         url = self._url_queue.pop(0)
         if is_spotify_link(url):
-            self.notify(f"resolving {_short(url, 60)} through spotDL", timeout=3)
-            self.resolve_spotify(url)
+            kind = spotify_kind(url) or "track"
+            if kind in {"album", "playlist"}:
+                self.start_group(url, kind)
+            else:
+                self.notify(f"resolving {_short(url, 60)} through spotDL", timeout=3)
+                self.resolve_spotify(url)
             return
         if not url.lower().startswith(("http://", "https://")):
             self.notify(f"not a URL: {_short(url, 60)}", severity="warning")
@@ -370,6 +442,30 @@ class VidpullApp(App[PostExit | None]):
             self.table.focus()
         self._probe_next()
 
+    def start_group(self, url: str, kind: str) -> None:
+        """An album or playlist link: one row right away, its songs once the list arrives."""
+        if not self.song_engine.available():
+            self._offer_spotdl(url)
+            return
+        selection = preset_selection(self.config.song_format, self.config)
+        group = self.manager.start_group(url, kind, selection)
+        self.notify(f"fetching the {kind}'s track list; c on its row cancels", timeout=5)
+        if not self._modal_open():
+            self.table.focus()  # so c, d and enter act on the new row straight away
+        self.resolve_group(group.id or 0)
+
+    @work(thread=True, group="probe")
+    def resolve_group(self, group_id: int) -> None:
+        group = self.manager.resolve_group(group_id)
+        if group is not None and group.status == GroupStatus.ACTIVE:
+            self.call_from_thread(
+                self.notify,
+                f"{_short(group.display_title, 40)}: {group.entry_count} songs queued · "
+                f"{group.selection.label} · audio from YouTube Music",
+                timeout=6,
+            )
+        self.call_from_thread(self._probe_next)
+
     def _offer_spotdl(self, url: str) -> None:
         def decided(result: tuple[bool, bool] | None) -> None:
             if result is not None and result[0]:
@@ -399,7 +495,11 @@ class VidpullApp(App[PostExit | None]):
             self.call_from_thread(self._probe_next)
             return
         self.call_from_thread(self.notify, "spotDL installed", timeout=5)
-        self.call_from_thread(self.resolve_spotify, url)
+        kind = spotify_kind(url) or "track"
+        if kind in {"album", "playlist"}:
+            self.call_from_thread(self.start_group, url, kind)
+        else:
+            self.call_from_thread(self.resolve_spotify, url)
 
     # ------------------------------------------------------------- flows
     @on(Input.Submitted, "#url")
@@ -508,8 +608,19 @@ class VidpullApp(App[PostExit | None]):
     def action_paste(self) -> None:
         self.paste_from_clipboard()
 
+    @on(DataTable.RowSelected, "#jobs")
+    def _row_selected(self, event: DataTable.RowSelected) -> None:
+        selected = self._selected()
+        if isinstance(selected, Group) and selected.id is not None:
+            self.push_screen(GroupScreen(self.store, self.manager, selected.id))
+
     def action_pick(self) -> None:
-        job = self._selected_job()
+        selected = self._selected()
+        if isinstance(selected, Group):
+            if selected.id is not None:
+                self.push_screen(GroupScreen(self.store, self.manager, selected.id))
+            return
+        job = selected
         if job is None or job.id is None:
             return
         if job.status != JobStatus.PENDING:
@@ -522,21 +633,61 @@ class VidpullApp(App[PostExit | None]):
         self.probe(job.url, job.id)
 
     def action_cancel(self) -> None:
-        job = self._selected_job()
+        selected = self._selected()
+        if isinstance(selected, Group):
+            if selected.id is not None and not selected.is_terminal:
+                self.manager.cancel_group(selected.id)
+                self.notify(f"cancelling {_short(selected.display_title, 50)}", timeout=4)
+            else:
+                self.notify("this run is already over", severity="warning")
+            return
+        job = selected
         if job is None or job.id is None:
             return
         if not self.manager.cancel(job.id):
             self.notify("only queued or running jobs can be cancelled", severity="warning")
 
     def action_retry(self) -> None:
-        job = self._selected_job()
+        selected = self._selected()
+        if isinstance(selected, Group):
+            if selected.id is None:
+                return
+            count = self.manager.retry_group(selected.id)
+            if count:
+                self.notify(f"retrying {count} song(s) of {_short(selected.display_title, 40)}")
+            else:
+                self.notify("nothing in this run to retry", severity="warning")
+            return
+        job = selected
         if job is None or job.id is None:
             return
         if self.manager.retry(job.id) is None:
             self.notify("only failed or cancelled jobs can be retried", severity="warning")
 
     def action_delete(self) -> None:
-        job = self._selected_job()
+        selected = self._selected()
+        if isinstance(selected, Group):
+            if selected.id is None:
+                return
+            group_id = selected.id
+            progress = self.manager.group_progress(selected)
+
+            def decided_group(result: tuple[bool, bool] | None) -> None:
+                if result and result[0]:
+                    self.manager.delete_group(group_id, delete_files=result[1])
+
+            self.push_screen(
+                ConfirmScreen(
+                    f"Delete {_short(selected.display_title, 50)} and its "
+                    f"{progress.total} song(s)?",
+                    checkbox="Also delete the downloaded file(s)" if progress.done else None,
+                    danger=True,
+                    yes_label="Delete",
+                ),
+                callback=decided_group,
+            )
+            return
+        job = selected
         if job is None or job.id is None:
             return
         job_id = job.id
@@ -666,7 +817,8 @@ class VidpullApp(App[PostExit | None]):
         )
 
     # ------------------------------------------------------------ helpers
-    def _selected_job(self) -> Job | None:
+    def _selected(self) -> Job | Group | None:
+        """The row under the cursor: a job, or a group (album or playlist run)."""
         table = self.table
         if table.row_count == 0:
             return None
@@ -676,7 +828,66 @@ class VidpullApp(App[PostExit | None]):
             return None
         if row_key is None or row_key.value is None:
             return None
-        return self.store.get(int(row_key.value))
+        value = str(row_key.value)
+        if value.startswith("g"):
+            return self.store.get_group(int(value[1:]))
+        return self.store.get(int(value))
+
+    def _selected_job(self) -> Job | None:
+        selected = self._selected()
+        return selected if isinstance(selected, Job) else None
+
+    def _cells_group(self, group: Group) -> list[object]:
+        progress = self.manager.group_progress(group)
+        if group.status == GroupStatus.RESOLVING:
+            title = f"{group.kind}: fetching the track list… ({_elapsed(group.created_at)})"
+            status = "resolving"
+            bar = ""
+        else:
+            title = f"{group.display_title} · {group.entry_count} songs"
+            if group.status == GroupStatus.ACTIVE:
+                stage = progress.active.status.value if progress.active else "queued"
+                status = f"{stage} {progress.done}/{progress.total}"
+            elif group.status == GroupStatus.DONE:
+                status = f"done {progress.done}/{progress.total}"
+                if progress.failed or progress.pending:
+                    status += f", {progress.failed + progress.pending} not found or failed"
+            elif group.status == GroupStatus.CANCELLED:
+                status = f"cancelled, {progress.done}/{progress.total} done"
+            else:
+                status = f"failed: {group.error}" if group.error else "failed"
+            bar = _bar_percent(progress.percent)
+        active = progress.active
+        return [
+            f"G{group.id}",
+            Text(_short(title, 48)),
+            Text(_short(group.selection.label, 34)),
+            Text(_short(status, 40), style=GROUP_STYLE.get(group.status, "")),
+            Text(bar),
+            Text(_speed(active.speed) if active else ""),
+            Text(_eta(active.eta) if active else ""),
+            Text(human_size(progress.bytes) if progress.bytes else ""),
+        ]
+
+    def _upsert_group(self, group: Group) -> None:
+        if group.id is None or self._table is None:
+            return
+        table = self._table
+        key = f"g{group.id}"
+        cells = self._cells_group(group)
+        if key in table.rows:
+            for column, value in zip(COLUMNS, cells, strict=True):
+                table.update_cell(key, self._columns[column], value)  # type: ignore[arg-type]
+        else:
+            table.add_row(*cells, key=key)
+
+    def _remove_group_row(self, group: Group) -> None:
+        if self._table is None:
+            return
+        key = f"g{group.id}"
+        if key in self._table.rows:
+            self._table.remove_row(key)
+        self._seen_group_status.pop(key, None)
 
     def _cells(self, job: Job) -> list[object]:
         status_text = job.phase if job.status.is_active and job.phase else job.status.value
@@ -716,6 +927,9 @@ class VidpullApp(App[PostExit | None]):
         self._seen_status.pop(job.id or -1, None)
 
     def _refresh_status(self) -> None:
+        for group in self.store.list_groups():
+            if group.status == GroupStatus.RESOLVING:
+                self._upsert_group(group)  # keeps the elapsed time moving while spotDL works
         counts = self.store.counts()
         parts = [
             f"vidpull {__version__}",
@@ -777,9 +991,22 @@ def _short(text: str, width: int) -> str:
 def _bar(job: Job) -> str:
     if job.status in {JobStatus.PENDING, JobStatus.QUEUED}:
         return ""
-    percent = max(0.0, min(100.0, job.progress))
+    return _bar_percent(job.progress)
+
+
+def _bar_percent(percent: float) -> str:
+    percent = max(0.0, min(100.0, percent))
     filled = int(percent / 10)
     return f"{'█' * filled}{'░' * (10 - filled)} {percent:3.0f}%"
+
+
+def _elapsed(since_iso: str) -> str:
+    try:
+        started = datetime.fromisoformat(since_iso)
+    except ValueError:
+        return ""
+    seconds = max(0, int((datetime.now(UTC) - started).total_seconds()))
+    return f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
 
 
 def _speed(value: float | None) -> str:

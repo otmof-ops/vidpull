@@ -13,13 +13,25 @@ import shutil
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from vidpull.config import Config
 from vidpull.engine import DownloadResult, Engine, ProbeError, Progress
-from vidpull.models import Job, JobEvent, JobStatus, MediaInfo, Selection, Song, utcnow
+from vidpull.models import (
+    Group,
+    GroupEvent,
+    GroupStatus,
+    Job,
+    JobEvent,
+    JobStatus,
+    MediaInfo,
+    Selection,
+    Song,
+    utcnow,
+)
 from vidpull.paths import Paths
-from vidpull.spotdl import SongEngine, tagged_info
+from vidpull.spotdl import ResolveCancelled, ResolveError, SongEngine, tagged_info
 from vidpull.store import Store
 
 log = logging.getLogger(__name__)
@@ -27,6 +39,27 @@ log = logging.getLogger(__name__)
 PROGRESS_THROTTLE_SECONDS = 0.2
 NO_MATCH_PHASE = "no confident match on YouTube Music"
 EventHandler = Callable[[JobEvent], None]
+GroupEventHandler = Callable[[GroupEvent], None]
+
+
+@dataclass
+class GroupProgress:
+    """What a group's songs add up to, for one row in the queue."""
+
+    total: int = 0
+    done: int = 0
+    failed: int = 0
+    cancelled: int = 0
+    pending: int = 0
+    active: Job | None = None
+    bytes: int = 0
+
+    @property
+    def percent(self) -> float:
+        if not self.total:
+            return 0.0
+        partial = (self.active.progress / 100.0) if self.active is not None else 0.0
+        return max(0.0, min(100.0, (self.done + partial) * 100.0 / self.total))
 
 
 class DownloadManager:
@@ -41,6 +74,7 @@ class DownloadManager:
         workers: int | None = None,
         download_dir: Path | None = None,
         song_engine: SongEngine | None = None,
+        on_group_event: GroupEventHandler | None = None,
     ):
         self.store = store
         self.engine = engine
@@ -48,6 +82,7 @@ class DownloadManager:
         self.config = config
         self.paths = paths
         self.on_event = on_event
+        self.on_group_event = on_group_event
         self.download_dir = download_dir or config.resolved_download_dir(paths)
         self._worker_count = max(1, workers or config.concurrency)
         self._queue: queue.Queue[int | None] = queue.Queue()
@@ -55,6 +90,7 @@ class DownloadManager:
         self._lock = threading.Lock()
         self._cancel: dict[int, threading.Event] = {}
         self._delete_after: dict[int, bool] = {}
+        self._resolving: dict[int, threading.Event] = {}
         self._stopping = threading.Event()
         self._started = False
 
@@ -81,6 +117,8 @@ class DownloadManager:
         self._stopping.set()
         with self._lock:
             for event in self._cancel.values():
+                event.set()
+            for event in self._resolving.values():
                 event.set()
         for _ in self._threads:
             self._queue.put(None)
@@ -132,7 +170,12 @@ class DownloadManager:
         return job
 
     def enqueue_song(
-        self, song: Song, selection: Selection, *, status: JobStatus = JobStatus.QUEUED
+        self,
+        song: Song,
+        selection: Selection,
+        *,
+        status: JobStatus = JobStatus.QUEUED,
+        group_id: int | None = None,
     ) -> Job:
         """Queue a song from a music link; a worker matches it on YouTube Music, then downloads."""
         job = Job(
@@ -143,12 +186,155 @@ class DownloadManager:
             uploader=song.artist,
             duration=song.duration,
             song=song,
+            group_id=group_id,
         )
         job = self.store.add(job)
         self._emit(job)
         if status == JobStatus.QUEUED and job.id is not None:
             self._queue.put(job.id)
         return job
+
+    # -------------------------------------------------------------- groups
+    def start_group(self, url: str, kind: str, selection: Selection) -> Group:
+        """Open an album or playlist run: one row now, its songs once the track list arrives."""
+        group = self.store.add_group(Group(url=url, kind=kind, selection=selection))
+        self._emit_group(group)
+        return group
+
+    def resolve_group(self, group_id: int) -> Group | None:
+        """Fetch a group's track list and queue one song job per track.
+
+        Blocking: run it off the UI thread. ``cancel_group`` interrupts it and the
+        group ends cancelled; a spotDL failure ends it failed.
+        """
+        group = self.store.get_group(group_id)
+        if group is None or group.status != GroupStatus.RESOLVING:
+            return group
+        if self.song_engine is None or not self.song_engine.available():
+            return self._finish_group(group_id, GroupStatus.FAILED, "spotDL is not installed")
+        cancel = threading.Event()
+        with self._lock:
+            self._resolving[group_id] = cancel
+        try:
+            songs = self.song_engine.resolve(group.url, cancel)
+        except ResolveCancelled:
+            return self._finish_group(group_id, GroupStatus.CANCELLED, "cancelled")
+        except ResolveError as exc:
+            return self._finish_group(group_id, GroupStatus.FAILED, str(exc))
+        finally:
+            with self._lock:
+                self._resolving.pop(group_id, None)
+        if cancel.is_set() or self._stopping.is_set():
+            return self._finish_group(group_id, GroupStatus.CANCELLED, "cancelled")
+        name = next((s.list_name for s in songs if s.list_name), "") or group.display_title
+        updated = self.store.update_group(
+            group_id, name=name, entry_count=len(songs), status=GroupStatus.ACTIVE, error=""
+        )
+        if updated is not None:
+            self._emit_group(updated)
+        for song in songs:
+            self.enqueue_song(song, group.selection, group_id=group_id)
+        return self.store.get_group(group_id)
+
+    def cancel_group(self, group_id: int) -> bool:
+        """Stop a run at any stage: the track-list fetch, queued songs and the active ones."""
+        group = self.store.get_group(group_id)
+        if group is None:
+            return False
+        with self._lock:
+            resolving = self._resolving.get(group_id)
+        if resolving is not None:
+            resolving.set()  # resolve_group records the cancelled state itself
+            return True
+        for job in self.store.list(group_id=group_id):
+            if job.id is None or job.is_terminal:
+                continue
+            with self._lock:
+                event = self._cancel.get(job.id)
+            if event is not None:
+                event.set()  # the worker records the cancel once yt-dlp or spotDL has stopped
+            else:
+                updated = self.store.update(job.id, status=JobStatus.CANCELLED, phase="cancelled")
+                if updated is not None:
+                    self._emit(updated)
+        if not group.is_terminal:
+            self._finish_group(group_id, GroupStatus.CANCELLED, "")
+        return True
+
+    def retry_group(self, group_id: int) -> int:
+        """Queue a group's failed, cancelled and unmatched songs again; returns how many."""
+        group = self.store.get_group(group_id)
+        if group is None or group.status == GroupStatus.RESOLVING:
+            return 0
+        retried = 0
+        for job in self.store.list(group_id=group_id):
+            if job.id is not None and self.retry(job.id) is not None:
+                retried += 1
+        if retried:
+            updated = self.store.update_group(group_id, status=GroupStatus.ACTIVE, error="")
+            if updated is not None:
+                self._emit_group(updated)
+        return retried
+
+    def delete_group(self, group_id: int, *, delete_files: bool = False) -> bool:
+        group = self.store.get_group(group_id)
+        if group is None:
+            return False
+        self.cancel_group(group_id)
+        for job in self.store.list(group_id=group_id):
+            if job.id is not None:
+                self.delete(job.id, delete_files=delete_files)
+        self.store.delete_group(group_id)
+        self._emit_group(group, kind="removed")
+        return True
+
+    def group_progress(self, group: Group) -> GroupProgress:
+        progress = GroupProgress()
+        if group.id is None:
+            return progress
+        for job in self.store.list(group_id=group.id):
+            progress.total += 1
+            if job.status == JobStatus.DONE:
+                progress.done += 1
+                progress.bytes += job.total_bytes or job.downloaded_bytes or 0
+            elif job.status == JobStatus.FAILED:
+                progress.failed += 1
+            elif job.status == JobStatus.CANCELLED:
+                progress.cancelled += 1
+            elif job.status == JobStatus.PENDING:
+                progress.pending += 1
+            if job.status.is_active and progress.active is None:
+                progress.active = job
+        return progress
+
+    def _finish_group(self, group_id: int, status: GroupStatus, error: str) -> Group | None:
+        updated = self.store.update_group(group_id, status=status, error=error)
+        if updated is not None:
+            self._emit_group(updated)
+        return updated
+
+    def _settle_group(self, group_id: int) -> None:
+        """Once every song of an active group is over, the group is over too."""
+        group = self.store.get_group(group_id)
+        if group is None or group.status != GroupStatus.ACTIVE:
+            return
+        jobs = self.store.list(group_id=group_id)
+        if any(not j.is_terminal for j in jobs):
+            return
+        statuses = {j.status for j in jobs}
+        if statuses == {JobStatus.CANCELLED}:
+            self._finish_group(group_id, GroupStatus.CANCELLED, "")
+            return
+        failed = sum(1 for j in jobs if j.status == JobStatus.FAILED)
+        self._finish_group(group_id, GroupStatus.DONE, f"{failed} failed" if failed else "")
+
+    def _emit_group(self, group: Group, kind: str = "update") -> None:
+        if self.on_group_event is None:
+            return
+        try:
+            self.on_group_event(GroupEvent(group=group, kind=kind))
+        except Exception:
+            log.exception("group event handler failed")
 
     def promote(self, job_id: int, selection: Selection) -> Job | None:
         """Give a pending (clipboard) job its format choice and queue it."""
@@ -381,6 +567,8 @@ class DownloadManager:
             return
         if updated is not None:
             self._emit(updated)
+        if job.group_id is not None:
+            self._settle_group(job.group_id)
 
     def _prepare_song(
         self, job: Job, cancel: threading.Event, on_log: Callable[[str, str], None]

@@ -32,6 +32,18 @@ class JobStatus(StrEnum):
         return self in {JobStatus.DONE, JobStatus.FAILED, JobStatus.CANCELLED}
 
 
+class GroupStatus(StrEnum):
+    RESOLVING = "resolving"  # fetching the track list
+    ACTIVE = "active"  # songs queued, matching or downloading
+    DONE = "done"
+    FAILED = "failed"  # the track list could not be fetched
+    CANCELLED = "cancelled"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in {GroupStatus.DONE, GroupStatus.FAILED, GroupStatus.CANCELLED}
+
+
 class SelectionKind(StrEnum):
     VIDEO = "video"  # a specific video format (merged with best audio when video-only)
     AUDIO = "audio"  # a specific native audio format, no re-encode
@@ -134,6 +146,7 @@ class Job:
     finished_at: str | None = None
     song: Song | None = None  # set when the job came from a music link, not a media URL
     matched_url: str = ""  # the upload the song was matched to; empty until matched
+    group_id: int | None = None  # the album or playlist run this song belongs to
 
     @property
     def display_title(self) -> str:
@@ -148,6 +161,38 @@ class Job:
     @property
     def is_terminal(self) -> bool:
         return self.status.is_terminal
+
+
+@dataclass
+class Group:
+    """An album or playlist run: one row in the queue, one song job per track behind it."""
+
+    url: str
+    kind: str  # album | playlist
+    selection: Selection
+    id: int | None = None
+    name: str = ""
+    status: GroupStatus = GroupStatus.RESOLVING
+    entry_count: int = 0
+    error: str = ""
+    created_at: str = field(default_factory=utcnow)
+    updated_at: str = field(default_factory=utcnow)
+
+    @property
+    def display_title(self) -> str:
+        return self.name or self.url
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status.is_terminal
+
+
+@dataclass(frozen=True)
+class GroupEvent:
+    """Emitted by the manager whenever a group changes; ``group`` is a snapshot."""
+
+    group: Group
+    kind: str = "update"  # update | removed
 
 
 @dataclass(frozen=True)

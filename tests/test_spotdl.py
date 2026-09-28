@@ -8,6 +8,7 @@ import pytest
 
 from vidpull.spotdl import (
     InstallError,
+    ResolveCancelled,
     ResolveError,
     SpotdlEngine,
     disclosure,
@@ -173,3 +174,13 @@ def test_install_failure_and_disclosure(paths):
     text = disclosure(paths)
     assert str(paths.spotdl_venv) in text and "Nothing is downloaded" in text
     assert "ytmusicapi==1.12.1" in text
+
+
+def test_resolve_cancel_kills_spotdl(fake_song_engine):
+    fake_song_engine.mode_file.write_text("hang")
+    cancel = threading.Event()
+    threading.Timer(0.3, cancel.set).start()
+    started = time.monotonic()
+    with pytest.raises(ResolveCancelled):
+        fake_song_engine.resolve(TRACK, cancel)
+    assert time.monotonic() - started < 10
