@@ -108,6 +108,11 @@ Music waits as pending; `p` or `r` looks again. The quality ceiling is YouTube's
 vidpull update                  # or press u
 ```
 
+The app checks for a new release when it starts (`update_check`, at most once an hour) and
+says so in the status bar. With `vidpull config set auto_update true` it installs the release in
+the background instead and asks before restarting into it; downloads in progress are never
+interrupted, the update waits for them.
+
 Sites change their pages and yt-dlp changes with them, so vidpull can refresh just the
 engine with `vidpull update --engine-only`. An update builds the new version next to the
 one you are running, checks that it works, and only then switches over; if anything goes

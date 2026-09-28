@@ -62,7 +62,7 @@ from vidpull.tui.screens.uninstall import UninstallScreen
 from vidpull.tui.screens.update import UpdateScreen
 from vidpull.tui.widgets import UrlInput
 from vidpull.uninstall import UninstallPlan
-from vidpull.update import UpdatePipeline
+from vidpull.update import BusyError, NotInstalledError, UpdateError, UpdatePipeline
 from vidpull.urls import extract_urls
 
 log = logging.getLogger(__name__)
@@ -199,6 +199,8 @@ class VidpullApp(App[PostExit | None]):
         self._notify_tool = which("notify-send")
         self._seen_status: dict[int, JobStatus] = {}
         self._seen_group_status: dict[str, GroupStatus] = {}
+        self._auto_updating = False
+        self._deferred_update: str | None = None  # a release waiting for the downloads to end
         self._url_queue: list[str] = [u.strip() for u in (initial_urls or []) if u.strip()]
         self._batch_selection: Selection | None = None
         self._table: DataTable | None = None
@@ -313,6 +315,10 @@ class VidpullApp(App[PostExit | None]):
         self._seen_status[job.id] = job.status
         if job.status == JobStatus.DONE and previous not in {None, JobStatus.DONE}:
             self._desktop_notify("Download finished", job.display_title)
+        if job.is_terminal and self._deferred_update and self.manager.is_idle:
+            tag, self._deferred_update = self._deferred_update, None
+            self._auto_updating = True
+            self.auto_update(tag)
         elif job.status == JobStatus.FAILED and previous not in {None, JobStatus.FAILED}:
             self.notify(
                 f"{_short(job.display_title, 50)}: {job.error}",
@@ -337,8 +343,60 @@ class VidpullApp(App[PostExit | None]):
     @on(UpdateAvailable)
     def _update_available(self, message: UpdateAvailable) -> None:
         self._update_tag = message.tag
-        self.notify(f"vidpull {message.tag} is available; press u to update", timeout=8)
+        if self.config.auto_update and not self._auto_updating:
+            self._auto_updating = True
+            self.notify(
+                f"vidpull {message.tag} is available; installing it in the background", timeout=8
+            )
+            self.auto_update(message.tag)
+        else:
+            self.notify(f"vidpull {message.tag} is available; press u to update", timeout=8)
         self._refresh_status()
+
+    @work(thread=True, group="auto-update")
+    def auto_update(self, tag: str) -> None:
+        """Build the new release next to this one, then ask before restarting into it."""
+        try:
+            result = self.pipeline.run(busy=lambda: self.manager.active_count > 0)
+        except BusyError:
+            self._deferred_update = tag
+            self.call_from_thread(
+                self.notify, f"vidpull {tag} installs once the downloads finish", timeout=8
+            )
+            return
+        except NotInstalledError as exc:  # a checkout or pipx install updates its own way
+            log.info("auto-update skipped: %s", exc)
+            return
+        except UpdateError as exc:
+            self.call_from_thread(
+                self.notify, str(exc), title="Update failed", severity="error", timeout=10
+            )
+            return
+        finally:
+            self._auto_updating = False
+        if result.restart_required:
+            self.call_from_thread(self._offer_restart, tag)
+        else:
+            self.call_from_thread(self.notify, result.message, timeout=6)
+
+    def _offer_restart(self, tag: str) -> None:
+        self._update_tag = None
+        self._refresh_status()
+
+        def decided(result: tuple[bool, bool] | None) -> None:
+            if result is not None and result[0]:
+                self.exit(PostExit("restart"))
+                return
+            self.notify(f"vidpull {tag} runs the next time you start vidpull", timeout=8)
+
+        self.push_screen(
+            ConfirmScreen(
+                f"vidpull {tag} is installed. Restart into it now? "
+                "Downloads in progress resume on the next start.",
+                yes_label="Restart",
+            ),
+            callback=decided,
+        )
 
     # ------------------------------------------------------------ workers
     @work(thread=True, group="engine-version")

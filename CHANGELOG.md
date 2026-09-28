@@ -14,6 +14,9 @@ All notable changes to vidpull are recorded here. The format follows
   spotDL is still fetching the list; `r` retries its failed songs; `d` deletes it; Enter or `p`
   opens the songs behind it with their own status, match, cancel and retry. `vidpull queue
   list` shows runs above their songs. Job database schema 3 (`groups`, `jobs.group_id`).
+- `auto_update`: when the app finds a new release at startup it installs it in the background
+  and asks before restarting into it; with downloads running it waits for them. The startup
+  check now runs at most once an hour instead of once a day (`update_check_hours`).
 - Runs go in batches: `stage_size` songs (10 by default) are released to the queue at a time,
   the next batch when the current one is done, after `stage_pause` seconds when set; the row
   shows `batch 3/68`. A song with no match no longer holds a run open; `r` re-stages it.
