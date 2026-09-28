@@ -6,6 +6,8 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-28
+
 ### Added
 
 - Album and playlist links are one run: a single row (`G#`) that appears as soon as the link
