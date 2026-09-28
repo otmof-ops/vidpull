@@ -84,8 +84,10 @@ class FakeEngine:
         probe_error: str | None = None,
         block: threading.Event | None = None,
         files: tuple[str, ...] = ("clip.mp4",),
+        fail_first_with: str | None = None,
     ):
         self.info = info
+        self.fail_first_with = fail_first_with
         self.steps = steps
         self.delay = delay
         self.fail = fail
@@ -162,6 +164,8 @@ class FakeEngine:
             time.sleep(self.delay)
         if self.fail:
             return DownloadResult(ok=False, error="boom")
+        if self.fail_first_with and len(self.downloads) == 1:
+            return DownloadResult(ok=False, error=self.fail_first_with)
         on_progress(Progress(status="processing", phase="merging streams"))
         download_dir.mkdir(parents=True, exist_ok=True)
         produced = []

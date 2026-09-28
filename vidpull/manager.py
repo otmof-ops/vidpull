@@ -612,6 +612,29 @@ class DownloadManager:
                 result = self.engine.download(
                     job, self.download_dir, temp_dir, on_progress, cancel, on_log, info=info
                 )
+            if (
+                job.song is not None
+                and info is not None
+                and not result.ok
+                and not result.cancelled
+                and "403" in result.error
+            ):
+                # the probe's stream URLs went stale or were refused: extract again, once
+                on_log("warning", f"{result.error}; retrying with a fresh extraction")
+                try:
+                    raw = self.engine.probe_json(job.matched_url)
+                except ProbeError as exc:
+                    on_log("error", f"fresh extraction failed: {exc}")
+                else:
+                    result = self.engine.download(
+                        job,
+                        self.download_dir,
+                        temp_dir,
+                        on_progress,
+                        cancel,
+                        on_log,
+                        info=tagged_info(raw, job.song),
+                    )
         finally:
             with self._lock:
                 self._cancel.pop(job_id, None)

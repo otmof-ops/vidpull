@@ -388,3 +388,20 @@ def test_restart_releases_a_batch_and_unmatched_songs_do_not_hold_a_run(store, c
         )
     finally:
         manager.stop()
+
+
+def test_song_download_retries_once_with_a_fresh_extraction_after_403(store, config, paths):
+    engine = FakeEngine(fail_first_with="unable to download video data: HTTP Error 403: Forbidden")
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.song_engine = FakeSongEngine()
+    manager.start()
+    try:
+        job = manager.enqueue_song(sample_song(), selection())
+        assert wait_until(lambda: store.get(job.id).status == JobStatus.DONE)
+        assert len(engine.downloads) == 2 and engine.json_probes == [MATCHED_URL, MATCHED_URL]
+        assert engine.infos[1]["track"] == "Cut To The Feeling"  # the retry carries the tags too
+        # a plain media job is not retried this way
+        plain = manager.enqueue("https://e/v", selection())
+        assert wait_until(lambda: store.get(plain.id).is_terminal)
+    finally:
+        manager.stop()
