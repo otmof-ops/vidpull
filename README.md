@@ -95,6 +95,11 @@ starts when the current one is done, after `stage_pause` seconds if you set one,
 never hammers the site. Downloads run two at a time (`concurrency`), so a 12-track album takes a few
 minutes and a 600-song playlist an evening.
 
+A playlist Spotify does not show without a login (a private one, or one Spotify made for you:
+On Repeat, Daily Mix, Your Top Songs) is refused straight away with the way round it: in Spotify,
+make it public, or add its songs to a playlist of your own and make that public, then paste that
+link. vidpull never asks for your Spotify login.
+
 The first Spotify link offers to install spotDL into its own environment under
 `~/.local/share/vidpull/spotdl-venv` (about 200 MB, no sudo); nothing is installed without your
 yes, `vidpull update` keeps it current and `vidpull uninstall` removes it with everything else.

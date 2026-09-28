@@ -292,7 +292,7 @@ class VidpullApp(App[PostExit | None]):
                 f"{_short(group.display_title, 50)}: {group.error}",
                 title=f"{group.kind.capitalize()} failed",
                 severity="error",
-                timeout=8,
+                timeout=20,
             )
 
     @on(JobChanged)
