@@ -8,6 +8,10 @@ All notable changes to vidpull are recorded here. The format follows
 
 ### Fixed
 
+- A private or Spotify-made playlist is refused in well under a second with the way round it
+  (make it public, or copy its songs into a playlist of your own), from Spotify's own answer
+  about the link, instead of spotDL crashing on it ten seconds later. The failed-run notice
+  stays up long enough to read.
 - Long Spotify playlists no longer fail with "spotDL did not answer within the resolve
   timeout". The track list is now fetched on its own, in seconds (676 songs in under 10 s,
   where `spotdl save` needed about 15 minutes for its three lookups per song), and each song's

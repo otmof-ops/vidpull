@@ -26,6 +26,9 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,11 +66,17 @@ _SPOTIFY_URI = re.compile(
 )
 # Spotify's own playlists (Daily Mix, Wrapped, Your Top Songs, editorial lists) carry this id
 # prefix and are not served to third-party apps
-_SPOTIFY_MADE = re.compile(r"/playlist/37i9dQZF1", re.IGNORECASE)
-SPOTIFY_MADE_HINT = (
-    "Spotify-made playlists are not open to other apps; "
-    "in Spotify, add its songs to a playlist of your own and paste that link"
-)
+OEMBED_URL = "https://open.spotify.com/oembed?url="
+VISIBILITY_TIMEOUT = 8.0
+NOT_VISIBLE = {
+    "playlist": "Spotify does not show this playlist without a login: it is private, or one "
+    "Spotify made for you (On Repeat, Daily Mix, Your Top Songs). In Spotify, make it public, "
+    "or add its songs to a playlist of your own and make that public, then paste that link.",
+    "album": "Spotify does not show this album without a login (removed, or not available "
+    "in your region).",
+    "track": "Spotify does not show this track without a login (removed, or not available "
+    "in your region).",
+}
 _YOUTUBE_URL = re.compile(
     r"^https?://(?:(?:www|music|m)\.)?(?:youtube\.com/watch\?|youtu\.be/)\S+$", re.IGNORECASE
 )
@@ -116,6 +125,24 @@ def normalize_spotify_link(text: str) -> str:
     if match is None:
         return token
     return f"https://open.spotify.com/{match.group('kind').lower()}/{match.group('id')}"
+
+
+def spotify_visible(link: str) -> bool | None:
+    """Whether Spotify shows ``link`` to anyone, from its public oEmbed endpoint.
+
+    ``False`` on a 404 (private, Spotify-made, removed), ``True`` on 200, ``None`` when the
+    answer is anything else or the request fails, in which case the caller carries on.
+    """
+    request = urllib.request.Request(
+        OEMBED_URL + urllib.parse.quote(link, safe=""), headers={"User-Agent": "vidpull"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=VISIBILITY_TIMEOUT) as response:
+            return response.status == 200
+    except urllib.error.HTTPError as exc:
+        return False if exc.code == 404 else None
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
 
 
 def is_youtube_url(text: str) -> bool:
@@ -222,9 +249,11 @@ class SpotdlEngine:
         *,
         python: str | None = None,
         engine_python: str | None = None,
+        visibility: Callable[[str], bool | None] | None = None,
     ):
         self.config = config
         self.paths = paths
+        self._visibility = visibility or spotify_visible
         self._python = python or str(paths.spotdl_venv / "bin" / "python")
         # deno and ffmpeg live next to the yt-dlp engine's interpreter; spotDL finds them on PATH
         self._prefer_bin = Path(engine_python).parent if engine_python else None
@@ -278,6 +307,8 @@ class SpotdlEngine:
         ``cancel`` is set while spotDL is still working.
         """
         link = normalize_spotify_link(url)
+        if self._visibility(link) is False:  # Spotify's own answer, in well under a second
+            raise ResolveError(NOT_VISIBLE.get(spotify_kind(link) or "track", NOT_VISIBLE["track"]))
         args = [
             self._python,
             str(TRACKLIST_SCRIPT),
@@ -302,8 +333,6 @@ class SpotdlEngine:
                     if returncode == 0
                     else f"spotDL exited with code {returncode}"
                 )
-            if _SPOTIFY_MADE.search(link):
-                detail = f"{detail} ({SPOTIFY_MADE_HINT})"
             raise ResolveError(detail)
         songs = [song_from_spotdl(d) for d in data if isinstance(d, dict) and d.get("name")]
         if not songs:

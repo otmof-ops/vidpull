@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from vidpull.spotdl import (
+    NOT_VISIBLE,
     TRACKLIST_SCRIPT,
     InstallError,
     ResolveCancelled,
@@ -22,6 +23,7 @@ from vidpull.spotdl import (
     normalize_spotify_link,
     song_from_spotdl,
     spotify_kind,
+    spotify_visible,
     tagged_info,
 )
 
@@ -41,7 +43,7 @@ def fake_song_engine(tmp_path, config, paths):
     shutil.copytree(FIXTURES, script_dir / "fixtures")
     script = script_dir / "fake_spotdl.py"
     script.chmod(0o755)
-    engine = SpotdlEngine(config, paths, python=str(script))
+    engine = SpotdlEngine(config, paths, python=str(script), visibility=lambda link: True)
     engine.mode_file = script_dir / "mode"  # type: ignore[attr-defined]
     engine.args_file = script_dir / "last-args.json"  # type: ignore[attr-defined]
     engine.script_file = script_dir / "last-script"  # type: ignore[attr-defined]
@@ -108,10 +110,10 @@ def test_resolve_errors(fake_song_engine):
     with pytest.raises(ResolveError) as excinfo:
         fake_song_engine.resolve(TRACK)
     assert "Couldn't get metadata" in str(excinfo.value)
-    assert "Spotify-made" not in str(excinfo.value)
+    # a playlist Spotify shows but spotDL still fails on keeps spotDL's own error, no guessing
     with pytest.raises(ResolveError) as excinfo:
         fake_song_engine.resolve("https://open.spotify.com/playlist/37i9dQZF1F5p3rmiWPIYgZ")
-    assert "Spotify-made playlists are not open to other apps" in str(excinfo.value)
+    assert str(excinfo.value) == "Couldn't get metadata for the query"
 
 
 def test_match_and_no_match(fake_song_engine):
@@ -265,3 +267,63 @@ def test_tracklist_script(tmp_path):
     argv[3] = PLAYLIST.replace("playlist/", "playlist/bad")
     proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30, check=False)
     assert proc.returncode == 1 and "Invalid playlist URL." in proc.stderr
+
+
+def test_hidden_playlist_is_refused_before_spotdl_runs(tmp_path, config, paths):
+    script_dir = tmp_path / "fake-spotdl"
+    script_dir.mkdir()
+    shutil.copy(FAKE, script_dir / "fake_spotdl.py")
+    shutil.copytree(FIXTURES, script_dir / "fixtures")
+    (script_dir / "fake_spotdl.py").chmod(0o755)
+    seen: list[str] = []
+
+    def hidden(link: str) -> bool | None:
+        seen.append(link)
+        return False
+
+    engine = SpotdlEngine(
+        config, paths, python=str(script_dir / "fake_spotdl.py"), visibility=hidden
+    )
+    with pytest.raises(ResolveError) as excinfo:
+        engine.resolve("https://open.spotify.com/playlist/37i9dQZF1F5p3rmiWPIYgZ?si=abc")
+    assert str(excinfo.value) == NOT_VISIBLE["playlist"]
+    assert "make it public" in str(excinfo.value)
+    assert seen == ["https://open.spotify.com/playlist/37i9dQZF1F5p3rmiWPIYgZ"]
+    assert not (script_dir / "last-args.json").exists()  # spotDL never ran
+
+    # an unknown answer (network trouble) does not block the fetch
+    engine = SpotdlEngine(
+        config, paths, python=str(script_dir / "fake_spotdl.py"), visibility=lambda link: None
+    )
+    assert [s.title for s in engine.resolve(TRACK)] == ["Cut To The Feeling"]
+
+
+def test_spotify_visible_reads_the_status(monkeypatch):
+    import io
+    import urllib.error
+    import urllib.request
+
+    class Response(io.BytesIO):
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    calls: list[str] = []
+
+    def fake_open(request, timeout):
+        calls.append(request.full_url)
+        if "hidden" in request.full_url:
+            raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+        if "broken" in request.full_url:
+            raise urllib.error.URLError("no network")
+        return Response(b"{}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_open)
+    assert spotify_visible("https://open.spotify.com/playlist/public") is True
+    assert spotify_visible("https://open.spotify.com/playlist/hidden") is False
+    assert spotify_visible("https://open.spotify.com/playlist/broken") is None
+    assert calls[0].startswith("https://open.spotify.com/oembed?url=https%3A%2F%2Fopen.spotify.com")
