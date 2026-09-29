@@ -17,11 +17,21 @@ from rich.text import Text
 from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.message import Message
-from textual.widgets import DataTable, Footer, Header, Input, Static
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    RichLog,
+    Static,
+    TabbedContent,
+    TabPane,
+)
 
-from vidpull import CREDIT, REPO_URL, __version__
+from vidpull import CREDIT, REPO_URL, __version__, history
 from vidpull.clipboard import ClipboardWatcher, available_reader, read_clipboard
 from vidpull.config import Config
 from vidpull.engine import Engine, ProbeError, YtDlpEngine
@@ -76,6 +86,8 @@ from vidpull.urls import extract_urls
 log = logging.getLogger(__name__)
 
 COLUMNS = ("#", "Title", "Format", "Status", "Progress", "Speed", "ETA", "Size")
+HISTORY_COLUMNS = ("Ended", "Title", "Format", "Result", "Size", "On list")
+HISTORY_VIEWS = {"log-download": "download", "log-app": "app", "log-updates": "updates"}
 STATUS_STYLE = {
     JobStatus.PENDING: "yellow",
     JobStatus.QUEUED: "dim",
@@ -103,7 +115,9 @@ paste  anywhere: Ctrl+Shift+V, right click, or Ctrl+V / v; several links at once
 p      pick a format for a pending job (clipboard watcher); look again for an unmatched song
 c      cancel the selected download or run    r  retry a failed or cancelled job or run
 d      delete the selected job or run (asks; can also delete its files)
-o      open the download folder              f  clear finished jobs from the table
+o      open the download folder              f  clear the list: what is finished moves to History
+h      History: every finished download with its own log, the app log, the update log
+       (r brings one back onto the list, d deletes it for good, esc returns to the list)
 w      toggle the clipboard watcher          s  settings
 u      update vidpull / yt-dlp               x  uninstall
 l      this session's log                    q  quit (running downloads resume next time)
@@ -151,21 +165,22 @@ class VidpullApp(App[PostExit | None]):
     TITLE = "vidpull"
     CSS_PATH = "styles.tcss"
     BINDINGS = [
-        Binding("a", "focus_url", "Add URL"),
+        Binding("a", "focus_url", "Add"),
         Binding("escape", "focus_table", "Table", show=False),
         Binding("v", "paste", "Paste", show=False),
         Binding("ctrl+v", "paste", "Paste", show=False),
-        Binding("p", "pick", "Pick format"),
+        Binding("p", "pick", "Pick"),
         Binding("c", "cancel", "Cancel"),
         Binding("r", "retry", "Retry"),
         Binding("d", "delete", "Delete"),
-        Binding("o", "open", "Open folder"),
-        Binding("f", "clear_finished", "Clear done", show=False),
+        Binding("o", "open", "Open"),
+        Binding("f", "clear_finished", "Clear list"),
+        Binding("h", "history", "History"),
         Binding("w", "toggle_watch", "Clipboard", show=False),
         Binding("s", "settings", "Settings"),
         Binding("u", "update", "Update"),
-        Binding("x", "uninstall", "Uninstall"),
-        Binding("l", "logs", "Log"),
+        Binding("x", "uninstall", "Uninstall", show=False),
+        Binding("l", "logs", "Log", show=False),
         Binding("question_mark", "help", "Help"),
         Binding("q", "quit", "Quit"),
     ]
@@ -213,6 +228,7 @@ class VidpullApp(App[PostExit | None]):
         self._url_queue: list[str] = [u.strip() for u in (initial_urls or []) if u.strip()]
         self._batch_selection: Selection | None = None
         self._table: DataTable | None = None
+        self._history_view = "download"  # which log the History tab shows
         self._status: Static | None = None
         self._url_box: UrlInput | None = None
 
@@ -225,6 +241,24 @@ class VidpullApp(App[PostExit | None]):
     def url_box(self) -> UrlInput:
         assert self._url_box is not None
         return self._url_box
+
+    @property
+    def history_table(self) -> DataTable:
+        return self.query_one("#history", DataTable)
+
+    @property
+    def views(self) -> TabbedContent:
+        return self.query_one("#views", TabbedContent)
+
+    def _in_history(self) -> bool:
+        return self.views.active == "tab-history"
+
+    def _focus_list(self) -> None:
+        """Bring the Downloads tab forward and put the cursor in its table."""
+        if self._in_history():
+            self.views.active = "tab-downloads"
+        table = self.table
+        table.focus()
 
     def _modal_open(self) -> bool:
         return len(self.screen_stack) > 1
@@ -242,7 +276,24 @@ class VidpullApp(App[PostExit | None]):
                 "or type one and press Enter",
                 id="url",
             )
-            yield DataTable(id="jobs", cursor_type="row", zebra_stripes=True)
+            with TabbedContent(initial="tab-downloads", id="views"):
+                with TabPane("Downloads", id="tab-downloads"):
+                    with Horizontal(classes="bar"):
+                        yield Button("Clear list", id="clear-list", compact=True)
+                        yield Static(
+                            "takes finished downloads off the list; they stay in History, "
+                            "files are not touched",
+                            classes="bar-hint",
+                        )
+                    yield DataTable(id="jobs", cursor_type="row", zebra_stripes=True)
+                with TabPane("History", id="tab-history"):
+                    with Horizontal(classes="bar"):
+                        yield Button("This download", id="log-download", compact=True)
+                        yield Button("App log", id="log-app", compact=True)
+                        yield Button("Update log", id="log-updates", compact=True)
+                        yield Button("Forget history", id="forget-history", compact=True)
+                    yield DataTable(id="history", cursor_type="row", zebra_stripes=True)
+                    yield RichLog(id="history-log", wrap=True, markup=False, highlight=False)
             yield Static("", id="status")
         yield Footer()
 
@@ -254,10 +305,11 @@ class VidpullApp(App[PostExit | None]):
         table = self._table
         keys = table.add_columns(*COLUMNS)
         self._columns = dict(zip(COLUMNS, keys, strict=True))
+        self.history_table.add_columns(*HISTORY_COLUMNS)
         self.manager.start()  # requeues interrupted jobs first, so the rows below are current
-        for group in self.store.list_groups():
+        for group in self.store.list_groups(cleared=False):
             self._upsert_group(group)
-        for job in self.store.list():
+        for job in self.store.list(cleared=False):
             if job.group_id is None:
                 self._upsert(job)
         self.set_interval(1.0, self._refresh_status)
@@ -288,6 +340,8 @@ class VidpullApp(App[PostExit | None]):
         if group.id is None:
             return
         self._upsert_group(group)
+        if group.is_terminal and self._in_history():
+            self._reload_history()
         key = f"g{group.id}"
         previous = self._seen_group_status.get(key)
         self._seen_group_status[key] = group.status
@@ -332,6 +386,8 @@ class VidpullApp(App[PostExit | None]):
                 severity="error",
                 timeout=8,
             )
+        if job.is_terminal and self._in_history():
+            self._reload_history()
         if job.is_terminal and self._deferred_update and self.manager.is_idle:
             tag, self._deferred_update = self._deferred_update, None
             self._auto_updating = True
@@ -531,7 +587,7 @@ class VidpullApp(App[PostExit | None]):
             f"queued {_short(what, 50)} · {selection.label} · audio from YouTube Music", timeout=6
         )
         if not self._modal_open():
-            self.table.focus()
+            self._focus_list()
         self._probe_next()
 
     def start_group(self, url: str, kind: str) -> None:
@@ -543,7 +599,7 @@ class VidpullApp(App[PostExit | None]):
         group = self.manager.start_group(url, kind, selection)
         self.notify(f"fetching the {kind}'s track list; c on its row cancels", timeout=5)
         if not self._modal_open():
-            self.table.focus()  # so c, d and enter act on the new row straight away
+            self._focus_list()  # so c, d and enter act on the new row straight away
         self.resolve_group(group.id or 0)
 
     @work(thread=True, group="probe")
@@ -691,14 +747,74 @@ class VidpullApp(App[PostExit | None]):
         if job is not None:
             self.notify(f"queued {_short(job.display_title, 40)} · {selection.label}", timeout=4)
         if not self._modal_open():
-            self.table.focus()
+            self._focus_list()
 
     # ------------------------------------------------------------ actions
     def action_focus_url(self) -> None:
         self.url_box.focus()
 
     def action_focus_table(self) -> None:
-        self.table.focus()
+        self._focus_list()
+
+    def action_history(self) -> None:
+        """h: the History tab, and back."""
+        if self._in_history():
+            self._focus_list()
+            return
+        self.views.active = "tab-history"
+        self._reload_history()
+        self.history_table.focus()
+
+    @on(TabbedContent.TabActivated, "#views")
+    def _view_changed(self, event: TabbedContent.TabActivated) -> None:
+        if event.pane.id == "tab-history":
+            self._reload_history()
+
+    @on(Button.Pressed, "#clear-list")
+    def _clear_pressed(self) -> None:
+        self.action_clear_finished()
+
+    @on(Button.Pressed, "#log-download, #log-app, #log-updates")
+    def _log_view_pressed(self, event: Button.Pressed) -> None:
+        self._history_view = HISTORY_VIEWS.get(event.button.id or "", "download")
+        self._show_history_log()
+
+    @on(Button.Pressed, "#forget-history")
+    def _forget_pressed(self) -> None:
+        cleared = len(self.store.list(cleared=True)) + len(self.store.list_groups(cleared=True))
+        if not cleared:
+            self.notify("nothing has been cleared from the list yet", severity="warning")
+            return
+
+        def decided(result: tuple[bool, bool] | None) -> None:
+            if result and result[0]:
+                count = self.manager.forget_history()
+                self.notify(f"forgot {count} cleared download(s); their files are untouched")
+                self._reload_history()
+
+        self.push_screen(
+            ConfirmScreen(
+                "Forget every download that was cleared from the list? Their records and logs "
+                "are deleted for good; the downloaded files are not touched.",
+                danger=True,
+                yes_label="Forget",
+            ),
+            callback=decided,
+        )
+
+    @on(DataTable.RowHighlighted, "#history")
+    def _history_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if self._history_view == "download":
+            self._show_history_log()
+
+    @on(DataTable.RowSelected, "#history")
+    def _history_selected(self, event: DataTable.RowSelected) -> None:
+        selected = self._selected()
+        if isinstance(selected, Group) and selected.id is not None:
+            self.push_screen(GroupScreen(self.store, self.manager, selected.id))
+        else:
+            self._history_view = "download"
+            self._show_history_log()
 
     def action_paste(self) -> None:
         self.paste_from_clipboard()
@@ -744,6 +860,7 @@ class VidpullApp(App[PostExit | None]):
 
     def action_retry(self) -> None:
         selected = self._selected()
+        from_history = self._in_history()
         if isinstance(selected, Group):
             if selected.id is None:
                 return
@@ -752,12 +869,16 @@ class VidpullApp(App[PostExit | None]):
                 self.notify(f"retrying {count} song(s) of {_short(selected.display_title, 40)}")
             else:
                 self.notify("nothing in this run to retry", severity="warning")
+            if from_history and count:
+                self._focus_list()  # it is back on the list
             return
         job = selected
         if job is None or job.id is None:
             return
         if self.manager.retry(job.id) is None:
             self.notify("only failed or cancelled jobs can be retried", severity="warning")
+        elif from_history:
+            self._focus_list()  # it is back on the list
 
     def action_delete(self) -> None:
         selected = self._selected()
@@ -770,6 +891,8 @@ class VidpullApp(App[PostExit | None]):
             def decided_group(result: tuple[bool, bool] | None) -> None:
                 if result and result[0]:
                     self.manager.delete_group(group_id, delete_files=result[1])
+                    if self._in_history():
+                        self._reload_history()
 
             self.push_screen(
                 ConfirmScreen(
@@ -791,6 +914,8 @@ class VidpullApp(App[PostExit | None]):
         def decided(result: tuple[bool, bool] | None) -> None:
             if result and result[0]:
                 self.manager.delete(job_id, delete_files=result[1])
+                if self._in_history():
+                    self._reload_history()
 
         self.push_screen(
             ConfirmScreen(
@@ -820,8 +945,73 @@ class VidpullApp(App[PostExit | None]):
             self.notify(f"cannot open {target}: {exc}", severity="error")
 
     def action_clear_finished(self) -> None:
-        removed = self.manager.clear_finished()
-        self.notify(f"cleared {removed} finished job(s)")
+        cleared = self.manager.clear_finished()
+        if cleared:
+            self.notify(
+                f"cleared {cleared} finished download(s) from the list; they are in History (h)",
+                timeout=6,
+            )
+        else:
+            self.notify("nothing finished to clear", timeout=3)
+        self._refresh_status()  # the counts are the list's
+        if self._in_history():
+            self._reload_history()
+
+    # ------------------------------------------------------------ history
+    def _history_key(self) -> str | None:
+        table = self.history_table
+        if table.row_count == 0:
+            return None
+        try:
+            row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+        except Exception:
+            return None
+        return None if row_key is None or row_key.value is None else str(row_key.value)
+
+    def _reload_history(self) -> None:
+        """Fill the History table, newest first, keeping the cursor where it was."""
+        table = self.history_table
+        before = self._history_key()
+        table.clear()
+        keys: list[str] = []
+        for entry in history.entries(self.store):
+            style = "green" if entry.ok else "red" if entry.result.startswith("failed") else "dim"
+            table.add_row(
+                history.local_time(entry.when, "%m-%d %H:%M"),
+                Text(_short(entry.title, 42)),
+                Text(_short(entry.format, 20)),
+                Text(_short(entry.result, 30), style=style),
+                Text(human_size(entry.size) if entry.size else ""),
+                Text("" if entry.cleared else "yes", style="dim"),
+                key=entry.key,
+            )
+            keys.append(entry.key)
+        if before in keys:
+            with contextlib.suppress(Exception):
+                table.move_cursor(row=table.get_row_index(before))
+        self._show_history_log()
+
+    def _show_history_log(self) -> None:
+        """The lower half of the History tab: one download's record, or a whole log."""
+        pane = self.query_one("#history-log", RichLog)
+        pane.clear()
+        if self._history_view == "app":
+            lines = history.app_log_tail(self.paths) or ["the app log is empty"]
+            lines = [f"--- {self.paths.log_file} ---", *lines]
+        elif self._history_view == "updates":
+            recorded = UpdateLog(self.paths.update_log).tail(200)
+            lines = [f"--- {self.paths.update_log} ---", *(recorded or ["no update recorded yet"])]
+        else:
+            key = self._history_key()
+            lines = (
+                history.record(self.store, key, self.paths) if key else ["nothing has finished yet"]
+            )
+        for line in lines:
+            pane.write(line)
+        if self._history_view == "download":
+            pane.scroll_home(animate=False)
+        else:
+            pane.scroll_end(animate=False)
 
     def action_toggle_watch(self) -> None:
         if self._watcher is not None:
@@ -918,6 +1108,9 @@ class VidpullApp(App[PostExit | None]):
     # ------------------------------------------------------------ helpers
     def _selected(self) -> Job | Group | None:
         """The row under the cursor: a job, or a group (album or playlist run)."""
+        if self._in_history():
+            key = self._history_key()
+            return history.find(self.store, key) if key else None
         table = self.table
         if table.row_count == 0:
             return None

@@ -223,6 +223,7 @@ class DownloadManager:
     def start_group(self, url: str, kind: str, selection: Selection) -> Group:
         """Open an album or playlist run: one row now, its songs once the track list arrives."""
         group = self.store.add_group(Group(url=url, kind=kind, selection=selection))
+        self.store.add_log("info", f"fetching the track list of {url}", group_id=group.id)
         self._emit_group(group)
         return group
 
@@ -258,6 +259,8 @@ class DownloadManager:
         if updated is not None:
             self._emit_group(updated)
         size = self.config.stage_size or len(songs)
+        batches = f", {size} at a time" if size < len(songs) else ""
+        self.store.add_log("info", f"{name}: {len(songs)} songs{batches}", group_id=group_id)
         for index, song in enumerate(songs):
             status = JobStatus.QUEUED if index < size else JobStatus.STAGED
             self.enqueue_song(song, group.selection, group_id=group_id, status=status)
@@ -313,12 +316,19 @@ class DownloadManager:
                 speed=None,
                 eta=None,
                 worker="",
+                cleared_at=None,
             )
             if updated_job is not None:
                 self._emit(updated_job)
             retried += 1
         if retried:
-            updated = self.store.update_group(group_id, status=GroupStatus.ACTIVE, error="")
+            for job in self.store.list(group_id=group_id, cleared=True):
+                if job.id is not None:
+                    self.store.update(job.id, cleared_at=None)  # the whole run is back
+            updated = self.store.update_group(
+                group_id, status=GroupStatus.ACTIVE, error="", cleared_at=None
+            )
+            self.store.add_log("info", f"retrying {retried} song(s)", group_id=group_id)
             if updated is not None:
                 self._emit_group(updated)
             self._settle_group(group_id)  # nothing is live, so this releases the first batch
@@ -361,6 +371,11 @@ class DownloadManager:
         return progress
 
     def _finish_group(self, group_id: int, status: GroupStatus, error: str) -> Group | None:
+        self.store.add_log(
+            "error" if status == GroupStatus.FAILED else "info",
+            f"{status.value}: {error}" if error else status.value,
+            group_id=group_id,
+        )
         updated = self.store.update_group(group_id, status=status, error=error)
         if updated is not None:
             self._emit_group(updated)
@@ -431,6 +446,9 @@ class DownloadManager:
                     self._queue.put(job.id)
                     released += 1
             if released:
+                self.store.add_log(
+                    "info", f"released the next {released} song(s)", group_id=group_id
+                )
                 self._emit_group(group)
 
     def _emit_group(self, group: Group, kind: str = "update") -> None:
@@ -501,23 +519,57 @@ class DownloadManager:
             speed=None,
             eta=None,
             worker="",
+            cleared_at=None,  # back on the list
         )
         if job is not None:
+            self.store.add_log("info", "queued again", job_id=job_id, group_id=job.group_id)
             self._emit(job)
             self._queue.put(job_id)
         return job
 
     def clear_finished(self) -> int:
-        finished = self.store.list([JobStatus.DONE, JobStatus.CANCELLED, JobStatus.FAILED])
-        removed = 0
-        for job in finished:
-            if job.id is None:
+        """Take every finished download off the list; returns how many rows went.
+
+        Nothing is deleted: the downloads, their logs and their files stay, and the
+        history shows them. A run goes with its songs once the run itself is over.
+        """
+        now = utcnow()
+        cleared = 0
+        for group in self.store.list_groups(cleared=False):
+            if group.id is None or not group.is_terminal:
                 continue
+            for job in self.store.list(group_id=group.id):
+                if job.id is not None:
+                    self._cleanup_temp(job.id)
+                    self.store.update(job.id, cleared_at=now)
+            updated = self.store.update_group(group.id, cleared_at=now)
+            self._emit_group(updated or group, kind="removed")
+            cleared += 1
+        finished = [JobStatus.DONE, JobStatus.CANCELLED, JobStatus.FAILED]
+        for job in self.store.list(finished, cleared=False):
+            if job.id is None or job.group_id is not None:
+                continue  # a song stays with its run
             self._cleanup_temp(job.id)
-            if self.store.delete(job.id):
-                removed += 1
-                self._emit(job, kind="removed")
-        return removed
+            updated_job = self.store.update(job.id, cleared_at=now)
+            self._emit(updated_job or job, kind="removed")
+            cleared += 1
+        return cleared
+
+    def forget_history(self) -> int:
+        """Delete what was cleared, for good: records and logs, never the downloaded files."""
+        forgotten = 0
+        for group in self.store.list_groups(cleared=True):
+            if group.id is None:
+                continue
+            for job in self.store.list(group_id=group.id):
+                if job.id is not None:
+                    self.store.delete(job.id)
+            self.store.delete_group(group.id)
+            forgotten += 1
+        for job in self.store.list(cleared=True):
+            if job.id is not None and self.store.delete(job.id):
+                forgotten += 1
+        return forgotten
 
     # -------------------------------------------------------------- workers
     def _worker(self) -> None:
@@ -600,6 +652,7 @@ class DownloadManager:
             getattr(log, level if level in {"info", "warning", "error"} else "info")(
                 "job %s: %s", job_id, message
             )
+            self.store.add_log(level, message, job_id=job_id, group_id=job.group_id)
             self._emit(job, kind="log", message=f"{level}: {message}")
 
         unmatched = False

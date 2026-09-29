@@ -113,7 +113,10 @@ def test_pending_promote_and_clear_finished(store, config, paths):
         assert manager.promote(pending.id, selection()) is not None
         assert wait_until(lambda: store.get(pending.id).status == JobStatus.DONE)
         assert manager.promote(pending.id, selection()) is None
-        assert manager.clear_finished() == 1 and store.list() == []
+        assert manager.clear_finished() == 1 and store.list(cleared=False) == []
+        kept = store.get(pending.id)  # off the list, not gone
+        assert kept.status == JobStatus.DONE and kept.cleared_at and kept.files
+        assert manager.clear_finished() == 0
     finally:
         manager.stop()
 
@@ -422,5 +425,78 @@ def test_song_download_retries_once_with_a_fresh_extraction_after_403(store, con
         # a plain media job is not retried this way
         plain = manager.enqueue("https://e/v", selection())
         assert wait_until(lambda: store.get(plain.id).is_terminal)
+    finally:
+        manager.stop()
+
+
+def test_clear_takes_finished_downloads_and_runs_off_the_list_and_nothing_else(
+    store, config, paths
+):
+    block = threading.Event()
+    engine = FakeEngine()
+    manager, events = make_manager(store, config, paths, engine, workers=1)
+    group_events = []
+    manager.on_group_event = group_events.append
+    manager.song_engine = FakeSongEngine(songs=two_songs())
+    manager.start()
+    try:
+        single = manager.enqueue("https://e/v", selection())
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert wait_until(lambda: store.get(single.id).status == JobStatus.DONE)
+        engine.block = block  # the next download stays active
+        active = manager.enqueue("https://e/still-running", selection())
+        assert wait_until(lambda: store.get(active.id).status == JobStatus.DOWNLOADING)
+
+        assert manager.clear_finished() == 2  # the single download and the run; not the songs
+        assert [j.id for j in store.list(cleared=False)] == [active.id]
+        assert store.list_groups(cleared=False) == []
+        assert store.get(single.id).cleared_at and store.get_group(group.id).cleared_at
+        assert all(j.cleared_at for j in store.list(group_id=group.id))
+        assert (paths.home / "dl" / "clip.mp4").exists()  # files are not touched
+        assert any(e.kind == "removed" and e.job.id == single.id for e in events)
+        assert any(e.kind == "removed" and e.group.id == group.id for e in group_events)
+
+        # each download kept its own log, and so did the run
+        assert [line.message for line in store.job_log(single.id)] == ["fake engine starting"]
+        run_log = [line.message for line in store.group_log(group.id)]
+        assert run_log[0].startswith("fetching the track list of ") and "2 songs" in run_log[1]
+        assert run_log[-1] == "done"
+        song = store.list(group_id=group.id)[0]
+        assert any("matched " in line.message for line in store.job_log(song.id))
+    finally:
+        block.set()
+        manager.stop()
+
+
+def test_retry_brings_a_cleared_download_back_and_forget_deletes_the_rest(store, config, paths):
+    engine = FakeEngine(fail=True)
+    manager, _ = make_manager(store, config, paths, engine)
+    manager.song_engine = FakeSongEngine(songs=two_songs())
+    manager.start()
+    try:
+        failed = manager.enqueue("https://e/v", selection())
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert wait_until(lambda: store.get(failed.id).status == JobStatus.FAILED)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert manager.clear_finished() == 2
+        engine.fail = False
+
+        assert manager.retry(failed.id) is not None  # from the history, back onto the list
+        assert store.get(failed.id).cleared_at is None
+        assert wait_until(lambda: store.get(failed.id).status == JobStatus.DONE)
+        assert "queued again" in [line.message for line in store.job_log(failed.id)]
+
+        assert manager.retry_group(group.id) == 2
+        assert store.get_group(group.id).cleared_at is None
+        assert all(j.cleared_at is None for j in store.list(group_id=group.id))
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+
+        assert manager.clear_finished() == 2 and manager.forget_history() == 2
+        assert store.list() == [] and store.list_groups() == []
+        assert store.job_log(failed.id) == [] and store.group_log(group.id) == []
+        assert manager.forget_history() == 0
     finally:
         manager.stop()

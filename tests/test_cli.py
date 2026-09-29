@@ -231,3 +231,55 @@ def test_update_log_command(capsys, paths):
     assert cli.main(["doctor"]) in (0, 1)
     report = capsys.readouterr().out
     assert "update log" in report and "1 transaction(s); last: engine-only at " in report
+
+
+def test_queue_clear_history_and_log(capsys, paths):
+    store = Store(paths.db_file)
+    selection = Selection(SelectionKind.PRESET, "best", "Best")
+    done = store.add(
+        Job(
+            url="https://e/v",
+            selection=selection,
+            status="done",
+            title="Thing",
+            files=[str(paths.home / "dl" / "thing.mp4")],
+            finished_at="2026-09-29T10:00:00+00:00",
+        )
+    )
+    store.add(Job(url="https://e/queued", selection=selection, title="Waiting"))
+    store.add_log("warning", "Replacing existing file", job_id=done.id)
+    store.close()
+
+    assert cli.main(["queue", "clear"]) == 0
+    out = capsys.readouterr().out
+    assert "cleared 1 finished download(s) from the list" in out and "vidpull queue history" in out
+    assert cli.main(["queue", "list", "--all"]) == 0
+    listed = capsys.readouterr().out
+    assert "Waiting" in listed and "Thing" not in listed  # off the list
+
+    assert cli.main(["queue", "history"]) == 0
+    assert "Thing" in capsys.readouterr().out  # and in the history
+    assert cli.main(["queue", "history", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data == [
+        {
+            "id": f"j{done.id}",
+            "ended": "2026-09-29T10:00:00+00:00",
+            "title": "Thing",
+            "format": "Best",
+            "result": "done",
+            "bytes": 0,
+            "cleared": True,
+        }
+    ]
+    assert cli.main(["queue", "log", str(done.id)]) == 0
+    record = capsys.readouterr().out
+    assert "Thing" in record and "thing.mp4" in record and "Replacing existing file" in record
+    assert cli.main(["queue", "log", "G9"]) == 1
+    assert "nothing in the history is called G9" in capsys.readouterr().err
+
+    assert cli.main(["queue", "clear", "--forget"]) == 0
+    assert "forgot 1 cleared download(s)" in capsys.readouterr().out
+    assert cli.main(["queue", "history"]) == 0
+    assert "nothing has finished yet" in capsys.readouterr().out
+    assert [j.title for j in Store(paths.db_file).list()] == ["Waiting"]

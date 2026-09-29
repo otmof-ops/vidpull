@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from vidpull import APP_NAME, AUTHOR, CREDIT, REPO_URL, __version__
+from vidpull import APP_NAME, AUTHOR, CREDIT, REPO_URL, __version__, history
 from vidpull.config import PRESETS, Config
 from vidpull.doctor import format_report, run_checks, worst
 from vidpull.engine import ProbeError, YtDlpEngine
@@ -194,7 +194,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     queue = sub.add_parser("queue", help="inspect or edit the job queue")
     queue_sub = queue.add_subparsers(dest="queue_command", metavar="action", required=True)
-    q_list = queue_sub.add_parser("list", help="list jobs")
+    q_list = queue_sub.add_parser("list", help="list the jobs on the list")
     q_list.add_argument("--all", action="store_true", help="include finished jobs")
     q_list.add_argument("--json", action="store_true")
     q_list.set_defaults(func=cmd_queue_list)
@@ -205,9 +205,24 @@ def build_parser() -> argparse.ArgumentParser:
     q_retry = queue_sub.add_parser("retry", help="queue a failed or cancelled job again")
     q_retry.add_argument("id", type=int)
     q_retry.set_defaults(func=cmd_queue_retry)
-    queue_sub.add_parser("clear", help="remove finished, failed and cancelled jobs").set_defaults(
-        func=cmd_queue_clear
+    q_clear = queue_sub.add_parser(
+        "clear", help="take finished jobs off the list; they stay in the history"
     )
+    q_clear.add_argument(
+        "--forget",
+        action="store_true",
+        help="also delete the history of everything cleared (records and logs, never files)",
+    )
+    q_clear.set_defaults(func=cmd_queue_clear)
+    q_history = queue_sub.add_parser("history", help="every download that is over, newest first")
+    q_history.add_argument("-n", "--limit", type=int, default=40, metavar="N")
+    q_history.add_argument("--json", action="store_true")
+    q_history.set_defaults(func=cmd_queue_history)
+    q_log = queue_sub.add_parser("log", help="one download's record and its own log")
+    q_log.add_argument(
+        "id", metavar="ID", help="a job number, or G<number> for an album or playlist"
+    )
+    q_log.set_defaults(func=cmd_queue_log)
 
     config = sub.add_parser("config", help="read or change settings")
     config_sub = config.add_subparsers(dest="config_command", metavar="action", required=True)
@@ -703,8 +718,8 @@ def cmd_queue_list(args: argparse.Namespace, ctx: Context) -> int:
         print("no jobs")
         return EXIT_OK
     store = Store(ctx.paths.db_file)
-    jobs = store.list()
-    groups = store.list_groups()
+    jobs = store.list(cleared=False)
+    groups = store.list_groups(cleared=False)
     counts = {g.id: store.group_counts(g.id or 0) for g in groups}
     store.close()
     if not args.all:
@@ -778,10 +793,66 @@ def cmd_queue_clear(args: argparse.Namespace, ctx: Context) -> int:
         print("no jobs")
         return EXIT_OK
     store = Store(ctx.paths.db_file)
-    removed = store.clear([JobStatus.DONE, JobStatus.FAILED, JobStatus.CANCELLED])
+    manager = DownloadManager(store, YtDlpEngine(ctx.config, ctx.paths), ctx.config, ctx.paths)
+    cleared = manager.clear_finished()
+    print(f"cleared {cleared} finished download(s) from the list")
+    if args.forget:
+        print(f"forgot {manager.forget_history()} cleared download(s); their files are untouched")
+    elif cleared:
+        print("they stay in the history: vidpull queue history")
     store.close()
-    print(f"removed {removed} job(s)")
     return EXIT_OK
+
+
+def cmd_queue_history(args: argparse.Namespace, ctx: Context) -> int:
+    if not ctx.paths.db_file.exists():
+        print("nothing has finished yet")
+        return EXIT_OK
+    store = Store(ctx.paths.db_file)
+    found = history.entries(store, limit=max(1, args.limit))
+    store.close()
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "id": entry.key,
+                        "ended": entry.when,
+                        "title": entry.title,
+                        "format": entry.format,
+                        "result": entry.result,
+                        "bytes": entry.size,
+                        "cleared": entry.cleared,
+                    }
+                    for entry in found
+                ],
+                indent=1,
+            )
+        )
+        return EXIT_OK
+    if not found:
+        print("nothing has finished yet")
+        return EXIT_OK
+    for entry in found:
+        name = entry.key.upper() if entry.key.startswith("g") else entry.key[1:]
+        print(
+            f"{name:>5}  {history.local_time(entry.when):<16}  {_short(entry.title, 46):<46}  "
+            f"{_short(entry.result, 40)}"
+        )
+    print("\nvidpull queue log ID shows one download's record and its own log", file=sys.stderr)
+    return EXIT_OK
+
+
+def cmd_queue_log(args: argparse.Namespace, ctx: Context) -> int:
+    if not ctx.paths.db_file.exists():
+        print(f"nothing in the history is called {args.id}", file=sys.stderr)
+        return EXIT_FAILURE
+    store = Store(ctx.paths.db_file)
+    found = history.find(store, args.id)
+    lines = history.record(store, args.id, ctx.paths)
+    store.close()
+    print("\n".join(lines), file=sys.stdout if found is not None else sys.stderr)
+    return EXIT_OK if found is not None else EXIT_FAILURE
 
 
 def cmd_config_list(args: argparse.Namespace, ctx: Context) -> int:

@@ -105,3 +105,27 @@ GroupScreen #dialog {
 GroupScreen DataTable {
     height: 1fr;
 }
+
+.bar {
+    height: 1;
+    margin: 0 1;
+}
+
+.bar Button {
+    margin-right: 2;
+}
+
+.bar-hint {
+    color: $text-muted;
+    width: 1fr;
+}
+
+#history {
+    height: 1fr;
+    margin: 0 1;
+}
+
+#history-log {
+    height: 1fr;
+    margin: 0 1;
+}
