@@ -44,6 +44,8 @@ def local_time(iso: str | None, fmt: str = "%Y-%m-%d %H:%M") -> str:
 
 
 def job_result(job: Job) -> str:
+    if job.skipped:
+        return job.phase  # a duplicate that was not downloaded again, and why
     if job.status == JobStatus.DONE:
         return "done (with errors)" if job.error else "done"
     if job.status == JobStatus.FAILED:
@@ -53,13 +55,16 @@ def job_result(job: Job) -> str:
     return job.status.value
 
 
-def group_result(group: Group, counts: dict[str, int]) -> str:
+def group_result(group: Group, counts: dict[str, int], skipped: int = 0) -> str:
+    """``counts`` by status; ``skipped`` of the done ones were duplicates, not downloaded."""
     total = sum(counts.values())
     done = counts.get("done", 0)
     if group.status == GroupStatus.FAILED:
         return f"failed: {group.error}" if group.error else "failed"
     text = f"{group.status.value} {done}/{total}"
     notes = []
+    if skipped:
+        notes.append(f"{skipped} skipped")
     if counts.get("failed"):
         notes.append(f"{counts['failed']} failed")
     if counts.get("pending"):
@@ -96,13 +101,14 @@ def entries(store: Store, *, limit: int = MAX_ENTRIES) -> list[Entry]:
         for song in songs:
             counts[song.status.value] = counts.get(song.status.value, 0) + 1
         total = len(songs) or group.entry_count
+        skipped = sum(1 for song in songs if song.skipped)
         found.append(
             Entry(
                 key=f"g{group.id}",
                 when=group.updated_at,
                 title=f"{group.display_title} · {total} songs" if total else group.display_title,
                 format=group.selection.label,
-                result=group_result(group, counts),
+                result=group_result(group, counts, skipped),
                 ok=group.status == GroupStatus.DONE and not counts.get("failed"),
                 size=sum(s.total_bytes or s.downloaded_bytes or 0 for s in songs),
                 cleared=group.cleared_at is not None,
@@ -175,9 +181,10 @@ def group_record(store: Store, group: Group) -> list[str]:
     counts: dict[str, int] = {}
     for song in songs:
         counts[song.status.value] = counts.get(song.status.value, 0) + 1
+    skipped = sum(1 for song in songs if song.skipped)
     lines = [
         f"{group.display_title} · {group.kind} · {len(songs) or group.entry_count} songs",
-        f"{group_result(group, counts)} · {group.selection.label} · ended "
+        f"{group_result(group, counts, skipped)} · {group.selection.label} · ended "
         f"{local_time(group.updated_at)}",
         f"from     {group.url}",
     ]

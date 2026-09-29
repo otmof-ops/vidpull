@@ -8,6 +8,10 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
+# How a duplicate that was not downloaded again is kept: a job that is done, whose phase
+# starts with this word. No status of its own, so an older vidpull can still read the list.
+SKIPPED = "skipped"
+
 
 def utcnow() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
@@ -163,6 +167,11 @@ class Job:
     @property
     def is_terminal(self) -> bool:
         return self.status.is_terminal
+
+    @property
+    def skipped(self) -> bool:
+        """A duplicate the user chose not to download again: nothing of its own was made."""
+        return self.status == JobStatus.DONE and self.phase.startswith(SKIPPED)
 
 
 @dataclass

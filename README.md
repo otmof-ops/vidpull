@@ -87,6 +87,41 @@ result. The buttons above switch that half to the app's log file or the update l
 From the command line: `vidpull queue clear`, `vidpull queue history`, `vidpull queue log ID`
 (`G3` for a run), and `vidpull queue clear --forget`.
 
+### Duplicates
+
+vidpull notices a link you have had before and asks before it downloads it a second time:
+
+```
+ Already downloaded
+ CORPSE, Scarlxrd, Kordhell - MISA MISA!
+ downloaded 2026-09-30 00:45 as MP3 320 kbps
+   ~/Videos/vidpull/CORPSE, Scarlxrd, Kordhell - MISA MISA!.mp3
+ [X] Apply to all 12 duplicates in Hevs199099
+        [ Skip ]   [ Download again ]
+```
+
+**Skip** (`s`, or `esc`) leaves what is there alone, **Download again** (`d`) replaces it.
+Tick **Apply to all** (`a`) and the answer holds for every other duplicate: the rest of the
+album or playlist, or the links still waiting from the same paste. Without the tick the next
+duplicate asks again.
+
+| A link is a duplicate when | The question says |
+| --- | --- |
+| it was downloaded before and its file is still there | Already downloaded, when, as what, where |
+| it is waiting or running on the list | Already on the list |
+| it comes a second time in the album or playlist being added | Twice in this list |
+| a file with its name (songs) or its id (videos) is in the download folder | The file is already there |
+
+A link counts as the same link however it is spelled: `youtu.be/ID`, `youtube.com/watch?v=ID`
+with a timestamp or a share code, a Spotify link with `?si=`. A file you deleted is no
+duplicate; the link downloads again without a question.
+
+In an album or playlist the skipped songs stay in the run, marked `skipped: already downloaded`
+(`done 676/676, 12 skipped`); `r` on one of them in the run's song list downloads it after all.
+To stop being asked, set `duplicates` in the settings (`s`): `ask`, `skip` or `download`.
+On the command line `--duplicates skip|download|ask` does the same for one command; `ask`
+prompts in a terminal (`s`, `d`, `a` skip all, `l` download all) and skips where there is none.
+
 ### Without the picker
 
 ```sh

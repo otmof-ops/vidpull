@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -6,6 +7,7 @@ import pytest
 
 from tests.helpers import FakeEngine, FakeSongEngine
 from vidpull import __version__, cli
+from vidpull.config import Config
 from vidpull.models import Job, Selection, SelectionKind
 from vidpull.store import Store
 
@@ -252,6 +254,135 @@ def test_get_shows_why_a_track_list_is_late_and_retries_failed_songs(
 
     assert cli.main(["get", SPOTIFY_TRACK, "--list"]) == 0
     assert f"note: {note}" in " ".join(capsys.readouterr().out.split())
+
+
+def flat(text: str) -> str:
+    """Output as words: a terminal's colors and cursor moves out, line breaks aside."""
+    return " ".join(re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text).split())
+
+
+def test_get_skips_what_was_downloaded_before_when_it_cannot_ask(
+    monkeypatch, capsys, paths, video_info
+):
+    engine = FakeEngine(info=video_info)
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: engine)
+    url = "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+    assert cli.main(["get", url, "-q", "720p"]) == 0
+    assert "saved" in capsys.readouterr().out and len(engine.downloads) == 1
+
+    # the same video under another spelling; no terminal to ask on, so it is skipped
+    assert cli.main(["get", "https://youtu.be/aqz-KE-bpKQ?si=x", "-q", "720p"]) == 0
+    out = flat(capsys.readouterr().out)
+    assert "not a terminal, so duplicates are skipped" in out
+    assert "skipped Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film: " in out
+    assert "already downloaded (downloaded 20" in out
+    assert len(engine.downloads) == 1 and len(engine.probes) == 1  # not even probed
+
+    assert cli.main(["get", url, "-q", "720p", "--duplicates", "download"]) == 0
+    assert "saved" in capsys.readouterr().out and len(engine.downloads) == 2
+    assert cli.main(["get", url, "-q", "720p", "--duplicates", "skip"]) == 0
+    out = flat(capsys.readouterr().out)
+    assert "not a terminal" not in out and "Short Film: already downloaded" in out
+    assert len(engine.downloads) == 2
+    assert Config.load(paths.config_file).duplicates == "ask"  # the flag is for the run
+
+
+def answers(monkeypatch, *replies):
+    """A terminal whose user types ``replies`` in turn."""
+    given = list(replies)
+    asked: list[str] = []
+
+    def reply(prompt: str = "") -> str:
+        asked.append(prompt)
+        if not given:
+            raise EOFError
+        return given.pop(0)
+
+    monkeypatch.setattr("builtins.input", reply)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
+    return asked
+
+
+def test_get_asks_on_a_terminal_and_an_answer_for_all_holds(monkeypatch, capsys, paths, video_info):
+    engine = FakeEngine(info=video_info)
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: engine)
+    links = [f"https://www.youtube.com/watch?v=video-{n}-id" for n in (1, 2, 3)]
+    assert cli.main(["get", *links, "-q", "720p", "--duplicates", "download"]) == 0
+    capsys.readouterr()
+    assert len(engine.downloads) == 3
+
+    asked = answers(monkeypatch, "what?", "d", "s")
+    assert cli.main(["get", *links[:2], "-q", "720p"]) == 0
+    out = flat(capsys.readouterr().out)
+    assert len(asked) == 3 and asked[0].startswith("[s]kip, [d]ownload again, skip [a]ll")
+    assert "Already downloaded:" in out and links[0] in out and links[1] in out
+    assert out.count("downloading again: Big Buck Bunny") == 1
+    assert out.count("skipped Big Buck Bunny") == 1
+    assert len(engine.downloads) == 4
+
+    asked = answers(monkeypatch, "a")  # skip all: one question for three links
+    assert cli.main(["get", *links, "-q", "720p"]) == 0
+    assert len(asked) == 1 and len(engine.downloads) == 4
+    assert flat(capsys.readouterr().out).count("skipped Big Buck Bunny") == 3
+
+    asked = answers(monkeypatch, "l")  # download all
+    assert cli.main(["get", *links, "-q", "720p"]) == 0
+    assert len(asked) == 1 and len(engine.downloads) == 7
+    capsys.readouterr()
+
+    asked = answers(monkeypatch)  # the terminal closes on the question: nothing is downloaded
+    assert cli.main(["get", *links, "-q", "720p"]) == 0
+    assert len(asked) == 1 and len(engine.downloads) == 7
+
+
+def test_get_asks_about_the_duplicates_of_an_album(monkeypatch, capsys, paths, video_info):
+    from tests.helpers import sample_song
+
+    engine = FakeEngine(info=video_info)
+    songs = [sample_song(title=f"Song {n}", track_number=n) for n in (1, 2, 3)]
+    for song in songs:
+        song.list_name = "OK Computer"
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: engine)
+    monkeypatch.setattr(cli, "SpotdlEngine", lambda *a, **k: FakeSongEngine(songs=songs))
+    album = "https://open.spotify.com/album/6dVIqQ8qmQ5GBnJ9shOYGE"
+    assert cli.main(["get", album, "-a", "mp3"]) == 0
+    assert flat(capsys.readouterr().out).count("saved") == 3
+
+    asked = answers(monkeypatch, "d", "a")  # the first again, the rest skipped
+    assert cli.main(["get", album, "-a", "mp3"]) == 0
+    out = flat(capsys.readouterr().out)
+    assert "(3 duplicates in OK Computer)" in asked[0] and len(asked) == 2
+    assert "note: waiting for your answer: 3 of 3 songs are duplicates" in out
+    assert out.count("skipped Carly Rae Jepsen - Song") == 2 and out.count("saved") == 1
+    assert len(engine.downloads) == 4
+
+    assert cli.main(["get", album, "-a", "mp3", "--duplicates", "skip"]) == 0  # all of them
+    out = flat(capsys.readouterr().out)
+    assert "OK Computer: 3 songs" in out and "saved" not in out and "error" not in out
+    assert len(engine.downloads) == 4
+    assert cli.main(["queue", "list", "--all"]) == 0
+    listed = capsys.readouterr().out
+    assert "G  3  done          3/3   songs  OK Computer" in listed
+    assert listed.count("skipped") == 5 and "[G3] Carly Rae Jepsen - Song 1" in listed
+    assert cli.main(["queue", "history"]) == 0
+    assert "done 3/3, 3 skipped" in flat(capsys.readouterr().out)
+    assert cli.main(["queue", "log", "G3"]) == 0
+    record = flat(capsys.readouterr().out)
+    assert "3 duplicate(s): 3 skipped" in record and "skipped: already downloaded" in record
+
+
+def test_get_asks_about_a_song_link_downloaded_before(monkeypatch, capsys, paths, video_info):
+    engine = FakeEngine(info=video_info)
+    song_engine = FakeSongEngine()
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: engine)
+    monkeypatch.setattr(cli, "SpotdlEngine", lambda *a, **k: song_engine)
+    assert cli.main(["get", SPOTIFY_TRACK]) == 0
+    capsys.readouterr()
+    assert cli.main(["get", SPOTIFY_TRACK]) == 0  # skipped, and that is no failure
+    out = flat(capsys.readouterr().out)
+    assert "skipped Carly Rae Jepsen - Cut To The Feeling: already downloaded" in out
+    assert len(engine.downloads) == 1 and len(song_engine.matched) == 1
 
 
 def test_update_log_command(capsys, paths):

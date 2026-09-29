@@ -14,8 +14,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from vidpull import APP_NAME, AUTHOR, CREDIT, REPO_URL, __version__, history
-from vidpull.config import PRESETS, Config
+from vidpull.config import DUPLICATES, PRESETS, Config
 from vidpull.doctor import format_report, run_checks, worst
+from vidpull.duplicates import Duplicate, Finder, describe
 from vidpull.engine import ProbeError, YtDlpEngine
 from vidpull.formats import (
     AUDIO_CONVERSIONS,
@@ -28,7 +29,7 @@ from vidpull.formats import (
 from vidpull.log import setup_logging
 from vidpull.manager import DownloadManager
 from vidpull.manifest import Manifest
-from vidpull.models import GroupEvent, GroupStatus, JobEvent, JobStatus, Selection
+from vidpull.models import SKIPPED, GroupEvent, GroupStatus, JobEvent, JobStatus, Selection
 from vidpull.paths import Paths
 from vidpull.procs import redact_url
 from vidpull.semver import Version
@@ -133,6 +134,12 @@ def build_parser() -> argparse.ArgumentParser:
     get.add_argument("-l", "--list", action="store_true", help="list available formats and exit")
     get.add_argument(
         "--playlist", action="store_true", help="download the whole playlist the URL belongs to"
+    )
+    get.add_argument(
+        "--duplicates",
+        choices=DUPLICATES,
+        help="a link that was downloaded before: ask (skip or download again; without a "
+        "terminal it is skipped), skip, or download; the setting of the same name otherwise",
     )
     get.add_argument("-o", "--output-dir", metavar="DIR", help="download directory for this run")
     get.add_argument("-j", "--jobs", type=int, metavar="N", help="parallel downloads for this run")
@@ -298,6 +305,8 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
         extra = ["--cookies-from-browser", args.cookies_from_browser]
     engine = YtDlpEngine(ctx.config, ctx.paths, extra_args=extra)
     download_dir = Path(args.output_dir).expanduser() if args.output_dir else None
+    if args.duplicates:
+        ctx.config.duplicates = args.duplicates  # for this run; the file keeps its setting
 
     song_engine: SpotdlEngine | None = None
     if any(is_spotify_link(u) for u in args.urls):
@@ -357,6 +366,10 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
         if event.kind != "update" or event.job.id is None:
             return
         job = event.job
+        if job.skipped:  # a duplicate in a run: said once, and no progress bar for it
+            reason = job.phase.removeprefix(f"{SKIPPED}: ")
+            asker.say(f"skipped {job.display_title}: {reason}")
+            return
         with progress_lock:
             task = tasks.get(job.id)
             if task is None:
@@ -372,6 +385,8 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
         if event.group.status == GroupStatus.RESOLVING and event.group.error:
             _waiting(console)(event.group.error)  # why the track list is not there yet
 
+    asker = _Asker(console, progress)
+
     import threading
 
     progress_lock = threading.Lock()
@@ -386,8 +401,26 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
         song_engine=song_engine,
         on_group_event=on_group_event,
     )
+    manager.on_duplicates = asker
     ids: list[int] = []
     runs: list[int] = []
+    skipped = 0
+
+    def wanted(found: Duplicate | None) -> bool:
+        """Whether a link goes ahead: it is no duplicate, or it is downloaded again."""
+        nonlocal skipped
+        if found is None:
+            return True
+        again = bool((manager.decide([found], "this command") or [False])[0])
+        if again:
+            asker.say(f"downloading again: {found.title}")
+        else:
+            skipped += 1
+            asker.say(f"skipped {found.title}: {found.phrase} ({found.detail})")
+        return again
+
+    def finder() -> Finder:
+        return Finder(store, manager.download_dir, ctx.config)
 
     def over(job_id: int) -> bool:
         job = store.get(job_id)
@@ -408,7 +441,8 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
                     if kind in {"album", "playlist"}:
                         group = manager.start_group(url, kind, song_selection)
                         group = manager.resolve_group(group.id or 0) or group
-                        if group.status != GroupStatus.ACTIVE:
+                        # done already: every song of it was a duplicate, and skipped
+                        if group.status not in {GroupStatus.ACTIVE, GroupStatus.DONE}:
                             console.print(
                                 f"[red]error:[/] {redact_url(url)}: {group.error or group.status}"
                             )
@@ -421,14 +455,23 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
                     except ResolveError as exc:
                         console.print(f"[red]error:[/] {redact_url(url)}: {exc}")
                         continue
+                    known = finder()
                     for song in songs:
+                        if not wanted(known.song(song)):
+                            continue
                         job = manager.enqueue_song(song, song_selection)
                         ids.append(job.id or 0)
+                    continue
+                before = finder().media(url, remember=False)
+                if not wanted(before):  # asked before the probe: a skipped link costs nothing
                     continue
                 try:
                     info = engine.probe(url, playlist=args.playlist)
                 except ProbeError as exc:
                     console.print(f"[red]error:[/] {redact_url(url)}: {exc}")
+                    continue
+                # and after it, when the page the link leads to and its id are known
+                if before is None and not wanted(finder().media(url, info, remember=False)):
                     continue
                 chosen = selection
                 if (info.is_playlist or args.playlist) and not chosen.playlist:
@@ -454,6 +497,8 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
         job = store.get(job_id)
         if job is None:
             continue
+        if job.skipped:
+            continue  # said when it was decided
         if job.status == JobStatus.DONE:
             for name in job.files:
                 console.print(f"[green]saved[/] {name}")
@@ -463,7 +508,71 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
             failures += 1
             console.print(f"[red]{job.status}[/] {redact_url(job.url)}: {job.error}")
     store.close()
-    return EXIT_FAILURE if failures or not ids else EXIT_OK
+    if failures:
+        return EXIT_FAILURE
+    return EXIT_OK if ids or skipped else EXIT_FAILURE  # skipping what is there is no failure
+
+
+class _Asker:
+    """Asks about duplicates on the terminal: skip or download again, this one or all.
+
+    An answer given for all holds for every duplicate the command meets after it.
+    Without a terminal nothing can be asked, and duplicates are skipped.
+    """
+
+    def __init__(self, console, progress=None):
+        self.console = console
+        self.progress = progress
+        self.for_all: bool | None = None
+
+    def __call__(self, found: list[Duplicate], context: str, cancel=None) -> list[bool] | None:
+        decisions: list[bool] = []
+        paused = False
+        try:
+            for index, one in enumerate(found):
+                if self.for_all is None and not (sys.stdin.isatty() and sys.stdout.isatty()):
+                    self.for_all = False
+                    self.say(
+                        "note: not a terminal, so duplicates are skipped; "
+                        "--duplicates download downloads them again"
+                    )
+                if self.for_all is None:
+                    if self.progress is not None and not paused:
+                        self.progress.stop()  # a live progress bar and a prompt do not mix
+                        paused = True
+                    decisions.append(self._ask(one, len(found) - index, context))
+                else:
+                    decisions.append(self.for_all)
+        finally:
+            if paused and self.progress is not None:
+                self.progress.start()
+        return decisions
+
+    def say(self, text: str) -> None:
+        self.console.print(text, style="yellow", markup=False, highlight=False)
+
+    def _ask(self, one: Duplicate, left: int, context: str) -> bool:
+        self.console.print(f"{one.phrase.capitalize()}:", style="bold", highlight=False)
+        for line in describe(one):
+            self.console.print(f"  {line}", markup=False, highlight=False)
+        more = f" ({left} duplicates in {context})" if left > 1 else ""
+        prompt = f"[s]kip, [d]ownload again, skip [a]ll, download a[l]l{more}? "
+        while True:
+            try:
+                answer = input(prompt).strip().lower()
+            except EOFError:
+                self.for_all = False
+                return False
+            if answer in {"s", "skip", ""}:
+                return False
+            if answer in {"d", "download", "download again"}:
+                return True
+            if answer in {"a", "skip all"}:
+                self.for_all = False
+                return False
+            if answer in {"l", "download all"}:
+                self.for_all = True
+                return True
 
 
 def _waiting(console):
@@ -774,9 +883,9 @@ def cmd_queue_list(args: argparse.Namespace, ctx: Context) -> int:
         title = _short(job.display_title, 50)
         if job.group_id is not None:
             title = _short(f"[G{job.group_id}] {job.display_title}", 50)
+        status = "skipped" if job.skipped else str(job.status)
         print(
-            f"{job.id:>4}  {job.status:<11} {job.progress:>5.1f}%  {title:<50}  "
-            f"{job.selection.label}"
+            f"{job.id:>4}  {status:<11} {job.progress:>5.1f}%  {title:<50}  {job.selection.label}"
         )
     return EXIT_OK
 

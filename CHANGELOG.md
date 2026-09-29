@@ -6,6 +6,29 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Duplicates.** A link that was downloaded before (and whose file is still there), that is
+  on the list already, that comes twice in the album or playlist being added, or whose file is
+  in the download folder raises a question before anything is downloaded: **Skip** or
+  **Download again**, with an **Apply to all** tick box that settles every other duplicate of
+  the album, the playlist or the paste with the same answer.
+- A link is the same link however it is spelled (`youtu.be/ID`, `watch?v=ID&t=…`, a Spotify
+  link with `?si=`); a file that was deleted is no duplicate.
+- Skipped songs stay in their run, marked `skipped: already downloaded`, and the run counts
+  them (`done 676/676, 12 skipped`). `r` on a skipped song downloads it after all.
+- The `duplicates` setting (`ask`, `skip`, `download`) and `vidpull get --duplicates …`.
+  On the command line `ask` prompts in a terminal and skips where there is none.
+
+### Fixed
+
+- A run cancelled moments before quitting left the song it was downloading queued, and the
+  next start downloaded it.
+- An event that arrived while the app was closing (a run cancelled at quit) could end it with
+  a traceback.
+- A release that waited for the downloads to end was not installed when what ended was an
+  album or a playlist; it took until the next hourly check.
+
 ## [1.3.1] - 2026-09-29
 
 ### Fixed

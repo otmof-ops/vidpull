@@ -684,3 +684,230 @@ def test_the_second_pass_is_one_pass(store, config, paths):
         assert [j.status for j in store.list(group_id=group.id)] == [JobStatus.DONE] * 2
     finally:
         manager.stop()
+
+
+def earlier_download(store, paths, song, name="song.mp3"):
+    """A song that was downloaded some time ago and is still on disk."""
+    target = paths.home / "dl" / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"x")
+    job = Job(url=song.url, selection=selection(), status=JobStatus.DONE, song=song)
+    job.files = [str(target)]
+    job.finished_at = "2026-09-28T07:55:47+00:00"
+    return store.add(job)
+
+
+def five_songs():
+    return [sample_song(title=f"Song {n}", track_number=n) for n in range(1, 6)]
+
+
+def test_a_run_skips_its_duplicates_when_the_setting_says_so(store, config, paths):
+    config.duplicates = "skip"
+    config.stage_size = 2
+    songs = five_songs()
+    earlier_download(store, paths, songs[0], "one.mp3")
+    earlier_download(store, paths, songs[3], "four.mp3")
+    engine = FakeEngine()
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.song_engine = FakeSongEngine(songs=songs)
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        jobs = store.list(group_id=group.id)
+        assert [j.skipped for j in jobs] == [True, False, False, True, False]
+        assert jobs[0].phase == "skipped: already downloaded" and jobs[0].files == []
+        assert jobs[0].status == JobStatus.DONE and jobs[0].progress == 100.0
+        # the first batch is two songs that are downloaded, not two places in the list
+        assert [j.status for j in jobs if not j.skipped][2] == JobStatus.STAGED
+        progress = manager.group_progress(store.get_group(group.id))
+        assert (progress.skipped, progress.stages) == (2, 2)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        done = store.get_group(group.id)
+        assert done.error == "2 skipped"
+        assert len(engine.downloads) == 3 and len(manager.song_engine.matched) == 3
+        progress = manager.group_progress(done)
+        assert (progress.done, progress.total, progress.skipped) == (5, 5, 2)
+        messages = [line.message for line in store.group_log(group.id)]
+        assert "2 duplicate(s): 2 skipped" in messages
+        logged = store.job_log(jobs[0].id)[0].message
+        assert logged.startswith("skipped: already downloaded (downloaded 2026-09-2")
+        assert logged.endswith(str(paths.home / "dl" / "one.mp3"))
+    finally:
+        manager.stop()
+
+
+def test_a_run_downloads_its_duplicates_again_when_the_setting_says_so(store, config, paths):
+    config.duplicates = "download"
+    songs = five_songs()
+    earlier_download(store, paths, songs[0])
+    engine = FakeEngine()
+    asked = []
+    manager, _ = make_manager(store, config, paths, engine)
+    manager.song_engine = FakeSongEngine(songs=songs)
+    manager.on_duplicates = lambda found, context, cancel: asked.append(found) or []
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert len(engine.downloads) == 5 and asked == []
+        assert not any(j.skipped for j in store.list(group_id=group.id))
+    finally:
+        manager.stop()
+
+
+def test_a_run_asks_about_its_duplicates_and_does_as_it_is_told(store, config, paths):
+    songs = five_songs()
+    for song in songs:
+        song.list_name = "OK Computer"
+    earlier_download(store, paths, songs[1], "two.mp3")
+    earlier_download(store, paths, songs[2], "three.mp3")
+    asked = []
+    seen = []
+
+    def decide(found, context, cancel):
+        asked.append(([d.title for d in found], context))
+        seen.append(store.get_group(1))  # what the run looks like while it waits
+        return [True, False]  # the first again, the second not
+
+    engine = FakeEngine()
+    manager, _ = make_manager(store, config, paths, engine)
+    manager.song_engine = FakeSongEngine(songs=songs)
+    manager.on_duplicates = decide
+    manager.start()
+    try:
+        assert config.duplicates == "ask"
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert asked == [
+            (["Carly Rae Jepsen - Song 2", "Carly Rae Jepsen - Song 3"], "OK Computer")
+        ]
+        waiting = seen[0]
+        assert waiting.status == GroupStatus.RESOLVING and waiting.entry_count == 5
+        assert waiting.name == "OK Computer"
+        assert waiting.error == "waiting for your answer: 2 of 5 songs are duplicates"
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert [j.skipped for j in store.list(group_id=group.id)] == [False] * 2 + [
+            True,
+            False,
+            False,
+        ]
+        assert len(engine.downloads) == 4 and store.get_group(group.id).error == "1 skipped"
+        assert "2 duplicate(s): 1 skipped, 1 downloaded again" in [
+            line.message for line in store.group_log(group.id)
+        ]
+    finally:
+        manager.stop()
+
+
+def test_with_nobody_to_ask_duplicates_are_kept_as_they_are(store, config, paths):
+    songs = two_songs()
+    earlier_download(store, paths, songs[0])
+    earlier_download(store, paths, songs[1], "other.mp3")
+    engine = FakeEngine()
+    manager, _ = make_manager(store, config, paths, engine)
+    manager.song_engine = FakeSongEngine(songs=songs)
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        resolved = manager.resolve_group(group.id)
+        # nothing but duplicates: the run is over the moment its list is here
+        assert resolved.status == GroupStatus.DONE and resolved.error == "2 skipped"
+        assert engine.downloads == [] and manager.song_engine.matched == []
+        assert manager.is_idle
+        # the one that was skipped can be had after all
+        first = store.list(group_id=group.id)[0]
+        assert manager.retry(first.id) is not None
+        assert wait_until(lambda: store.get(first.id).files != [])
+        again = store.get(first.id)
+        assert again.status == JobStatus.DONE and not again.skipped
+        assert manager.retry_group(group.id) == 0  # skipped songs are not what failed
+    finally:
+        manager.stop()
+
+
+def test_an_answer_that_never_comes_cancels_the_run(store, config, paths):
+    songs = two_songs()
+    earlier_download(store, paths, songs[0])
+    manager, _ = make_manager(store, config, paths, FakeEngine())
+    manager.song_engine = FakeSongEngine(songs=songs)
+    asked = threading.Event()
+
+    def decide(found, context, cancel):
+        asked.set()
+        assert cancel.wait(5)  # the run is cancelled while the question is up
+        return None
+
+    manager.on_duplicates = decide
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        worker = threading.Thread(target=manager.resolve_group, args=(group.id,))
+        worker.start()
+        assert asked.wait(5)
+        assert manager.cancel_group(group.id)
+        worker.join(5)
+        assert store.get_group(group.id).status == GroupStatus.CANCELLED
+        assert store.list(group_id=group.id) == []
+    finally:
+        manager.stop()
+
+
+def test_a_song_twice_in_one_list(store, config, paths):
+    config.duplicates = "skip"
+    songs = [sample_song(title="Airbag"), sample_song(title="Lucky"), sample_song(title="Airbag")]
+    engine = FakeEngine()
+    manager, _ = make_manager(store, config, paths, engine)
+    manager.song_engine = FakeSongEngine(songs=songs)
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        jobs = store.list(group_id=group.id)
+        assert [j.skipped for j in jobs] == [False, False, True]
+        assert jobs[2].phase == "skipped: twice in this list" and len(engine.downloads) == 2
+    finally:
+        manager.stop()
+
+
+def test_a_song_cancelled_just_before_quitting_stays_cancelled(store, config, paths):
+    """The worker learns of the cancel after the shutdown began; it was the user's all the same."""
+    block = threading.Event()
+    engine = FakeEngine(block=block)
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.song_engine = FakeSongEngine(songs=two_songs())
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert engine.started.wait(5)
+        running = store.list(group_id=group.id)[0]
+        assert manager.cancel_group(group.id)
+        manager._stopping.set()  # the app is closing before the worker has let go
+        block.set()
+        assert wait_until(lambda: not store.get(running.id).status.is_active)
+        assert store.get(running.id).status == JobStatus.CANCELLED
+        assert store.get_group(group.id).status == GroupStatus.CANCELLED
+    finally:
+        block.set()
+        manager.stop()
+
+
+def test_a_download_the_shutdown_interrupts_waits_for_the_next_start(store, config, paths):
+    block = threading.Event()
+    engine = FakeEngine(block=block)
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.start()
+    try:
+        job = manager.enqueue("https://e/v", selection())
+        assert engine.started.wait(5)
+        manager.stop(wait=False)  # nobody cancelled it: the app is closing
+        block.set()
+        assert wait_until(lambda: not store.get(job.id).status.is_active)
+        assert store.get(job.id).status == JobStatus.QUEUED
+        assert store.get(job.id).phase == "interrupted"
+    finally:
+        block.set()
+        manager.stop()

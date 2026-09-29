@@ -90,6 +90,8 @@ class GroupScreen(ModalScreen[None]):
             status = job.phase
         if job.status == JobStatus.FAILED and job.error:
             status = f"failed: {job.error}"
+        if job.skipped:
+            status = job.phase
         bar = ""
         if job.status not in {JobStatus.PENDING, JobStatus.QUEUED}:
             percent = max(0.0, min(100.0, job.progress))
