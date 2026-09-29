@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -155,11 +156,28 @@ def test_resolve_gives_up_with_the_reason_and_the_count(fake_song_engine):
     fake_song_engine.mode_file.write_text("flaky:9")
     with pytest.raises(ResolveError) as excinfo:
         fake_song_engine.resolve(PLAYLIST)
-    assert str(excinfo.value) == (
-        "Spotify did not answer in 3 attempts over 0 s: Could not get playlist info: "
-        "Status Code: 504, Response: upstream request timeout"
+    assert re.fullmatch(
+        r"Spotify did not answer in 3 attempts over \d+ s: Could not get playlist info: "
+        r"Status Code: 504, Response: upstream request timeout",
+        str(excinfo.value),
     )
     assert fake_song_engine.runs_file.read_text() == "3"
+
+
+def test_attempts_stop_at_the_deadline(fake_song_engine, monkeypatch):
+    """Attempts that hang until their timeout must not add up to a quarter of an hour."""
+    monkeypatch.setattr("vidpull.spotdl.RETRY_DEADLINE", 0.0)
+    fake_song_engine.mode_file.write_text("flaky:9")
+    notes: list[str] = []
+    with pytest.raises(ResolveError) as excinfo:
+        fake_song_engine.resolve(PLAYLIST, report=notes.append)
+    assert "in 1 attempt over" in str(excinfo.value) and notes == []
+    assert fake_song_engine.runs_file.read_text() == "1"
+    song = song_from_spotdl(json.loads((FIXTURES / "spotdl_track.json").read_text())[0])
+    with pytest.raises(MatchError) as excinfo:
+        fake_song_engine.match(song)
+    assert "in 1 attempt over" in str(excinfo.value)
+    assert fake_song_engine.runs_file.read_text() == "2"
 
 
 def test_resolve_does_not_repeat_an_answer_that_will_not_change(fake_song_engine):
@@ -171,6 +189,11 @@ def test_resolve_does_not_repeat_an_answer_that_will_not_change(fake_song_engine
         "Playlist not available or not accessible, make sure it is public."
     )
     assert fake_song_engine.runs_file.read_text() == "1" and notes == []
+    song = song_from_spotdl(json.loads((FIXTURES / "spotdl_track.json").read_text())[0])
+    with pytest.raises(MatchError) as excinfo:
+        fake_song_engine.match(song, report=notes.append)
+    assert str(excinfo.value).startswith("Playlist not available")
+    assert fake_song_engine.runs_file.read_text() == "2" and notes == []
 
 
 def test_cancel_during_the_wait_between_attempts(tmp_path, config, paths):
@@ -248,8 +271,8 @@ def test_match_tells_a_failed_lookup_from_no_match(fake_song_engine):
     fake_song_engine.mode_file.write_text("boxed")
     with pytest.raises(MatchError) as excinfo:
         fake_song_engine.match(song)
-    assert str(excinfo.value) == (
-        "YouTube Music did not answer in 3 attempts over 0 s: ConnectionError: "
+    assert re.sub(r"over \d+ s", "over N s", str(excinfo.value)) == (
+        "YouTube Music did not answer in 3 attempts over N s: ConnectionError: "
         "HTTPSConnectionPool(host='music.youtube.com', port=443): Max retries exceeded with "
         "url: / (Caused by NameResolutionError(\"Failed to resolve 'music.youtube.com'\"))"
     )

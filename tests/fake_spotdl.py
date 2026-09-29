@@ -5,8 +5,8 @@ Invoked by tests through SpotdlEngine(python=<this file>); the ``-m spotdl`` arg
 entries are ignored, and so is the ``spotdl_tracklist.py`` path vidpull runs for a
 track list (recorded as ``script`` in last-args.json). A ``mode`` file next to this
 script selects the behaviour: ``ok`` (default), ``nomatch`` (``save --preload``
-prints a null entry and exits 0, as spotDL does), ``error`` (``save`` fails),
-``noresults`` (the same, the way spotDL 4.5 logs it), ``hidden`` (``save`` fails with an
+prints a null entry and exits 0), ``error`` (``save`` fails), ``noresults`` (no match the
+way spotDL 4.5 reports it: a logged exception, then the null entry), ``hidden`` (``save`` fails with an
 answer no retry changes), ``boxed`` (``save`` fails the
 way spotDL itself does: a boxed traceback on stdout), ``searchfail`` (``save --preload``
 logs that its search raised and prints a null entry), ``hang``, or ``flaky:N`` (the first
@@ -101,7 +101,6 @@ def main(argv: list[str]) -> int:
             sys.stdout.write((HERE / "fixtures" / name).read_text())
             return 0
         if mode() == "nomatch":
-            print("Could not find a match for Carly Rae Jepsen - Cut To The Feeling")
             print(json.dumps([None]))  # spotDL exits 0 here too (spotDL/spotify-downloader#2768)
             return 0
         if mode() == "noresults":

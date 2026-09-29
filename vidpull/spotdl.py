@@ -61,6 +61,9 @@ KILL_GRACE_SECONDS = 5.0
 # second, third, ... attempt: a track list is tried for about three minutes, a song for one.
 RESOLVE_RETRY_DELAYS: tuple[float, ...] = (5.0, 15.0, 45.0, 90.0)
 MATCH_RETRY_DELAYS: tuple[float, ...] = (5.0, 15.0, 45.0)
+# no new attempt starts later than this after the first: attempts that hang until their
+# timeout would otherwise stretch five of them over a quarter of an hour
+RETRY_DEADLINE = 360.0
 # answers another attempt will not change
 FINAL_ANSWERS = (
     "not available or not accessible",
@@ -363,8 +366,11 @@ class SpotdlEngine:
                 return self._resolve_once(args, link, cancel)
             except _TryAgain as exc:
                 reason = str(exc)
-            if number >= tries:
-                raise ResolveError(_gave_up(reason, tries, time.monotonic() - started))
+            if cancel is not None and cancel.is_set():
+                raise ResolveCancelled("cancelled while fetching the track list")
+            spent = time.monotonic() - started
+            if number >= tries or spent + self._resolve_delays[number - 1] > RETRY_DEADLINE:
+                raise ResolveError(_gave_up(reason, number, spent))
             delay = self._resolve_delays[number - 1]
             number += 1
             _tell(report, _retry_note(reason, delay, number, tries))
@@ -440,8 +446,9 @@ class SpotdlEngine:
                 reason = str(exc)
             if cancel is not None and cancel.is_set():
                 return None
-            if number >= tries:
-                raise MatchError(_gave_up(reason, tries, time.monotonic() - started))
+            spent = time.monotonic() - started
+            if number >= tries or spent + self._match_delays[number - 1] > RETRY_DEADLINE:
+                raise MatchError(_gave_up(reason, number, spent))
             delay = self._match_delays[number - 1]
             number += 1
             _tell(report, _retry_note(reason, delay, number, tries))
@@ -465,6 +472,8 @@ class SpotdlEngine:
             detail = failure_text(stdout, stderr)
             if is_no_match(detail):
                 return None
+            if is_final(detail):
+                raise MatchError(detail)
             raise _TryAgain(
                 detail
                 or (
@@ -592,7 +601,8 @@ def _retry_note(reason: str, delay: float, number: int, tries: int) -> str:
 
 
 def _gave_up(reason: str, tries: int, seconds: float) -> str:
-    return f"{_who(reason)} in {tries} attempts over {_span(seconds)}: {reason}"
+    count = f"{tries} attempts" if tries != 1 else "1 attempt"
+    return f"{_who(reason)} in {count} over {_span(seconds)}: {reason}"
 
 
 _NOTE = re.compile(r"^(?P<who>[^,:]+), trying again .*?\(attempt (?P<number>\d+) of (?P<of>\d+)\)")
@@ -615,8 +625,10 @@ def _tell(report: Reporter | None, message: str) -> None:
     if report is None:
         log.warning("%s", message)
         return
-    with contextlib.suppress(Exception):  # a listener's trouble is not spotDL's
+    try:
         report(message)  # the listener logs it where it belongs: the run's log, the song's
+    except Exception:  # a listener's trouble is not spotDL's
+        log.warning("%s (and its listener failed)", message, exc_info=True)
 
 
 def _cancelled_during(delay: float, cancel: threading.Event | None) -> bool:

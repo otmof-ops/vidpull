@@ -612,6 +612,59 @@ def test_a_run_whose_track_list_never_arrived_can_be_sent_for_it_again(store, co
         manager.stop()
 
 
+def test_a_song_that_crashes_does_not_hold_its_run_open(store, config, paths):
+    """The run waits for every song to end; one that raised has ended too."""
+    engine = FakeEngine()
+    calls = []
+
+    def probe_json(url):
+        calls.append(url)
+        raise RuntimeError("disk full")  # nothing the manager expects
+
+    engine.probe_json = probe_json
+    manager, events = make_manager(store, config, paths, engine, workers=1)
+    manager.song_engine = FakeSongEngine(songs=two_songs())
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert store.get_group(group.id).error == "2 failed"
+        jobs = store.list(group_id=group.id)
+        assert [j.error for j in jobs] == ["internal error; see the log"] * 2
+        assert len(calls) == 4  # both songs, and both once more
+        assert manager.active_count == 0 and manager.is_idle
+        assert any(e.job.status == JobStatus.FAILED for e in events)
+    finally:
+        manager.stop()
+
+
+def test_cancel_leaves_no_song_waiting_in_a_cancelled_run(store, config, paths):
+    config.stage_size = 1
+    block = threading.Event()
+    engine = FakeEngine(block=block)
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    songs = [sample_song(title=f"Song {n}", track_number=n) for n in range(1, 4)]
+    manager.song_engine = FakeSongEngine(songs=songs)
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert engine.started.wait(5)
+        first = store.list(group_id=group.id)[0]
+        store.update(store.list(group_id=group.id)[1].id, status=JobStatus.FAILED, error="x")
+        assert manager.cancel_group(group.id)
+        block.set()
+        assert wait_until(lambda: store.get(first.id).status == JobStatus.CANCELLED)
+        assert store.get_group(group.id).status == GroupStatus.CANCELLED
+        statuses = [j.status for j in store.list(group_id=group.id)]
+        assert statuses == [JobStatus.CANCELLED, JobStatus.FAILED, JobStatus.CANCELLED]
+        assert manager.is_idle
+    finally:
+        block.set()
+        manager.stop()
+
+
 def test_the_second_pass_is_one_pass(store, config, paths):
     engine = FakeEngine(fail=True)
     manager, _ = make_manager(store, config, paths, engine, workers=1)
