@@ -6,6 +6,12 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A song whose upload YouTube will not let be read (age-restricted, private, removed) was
+  waited for like an outage: four attempts over three minutes, called "YouTube Music did not
+  answer". It is asked for once more and then fails with what it is.
+
 ## [1.4.0] - 2026-09-29
 
 ### Added

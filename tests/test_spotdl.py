@@ -290,6 +290,36 @@ def test_match_tells_a_failed_lookup_from_no_match(fake_song_engine):
     assert "cannot run spotDL" in str(excinfo.value)
 
 
+def test_an_upload_youtube_refuses_is_not_waited_for(tmp_path, config, paths):
+    """spotDL found the song and yt-dlp could not read the upload: age-restricted, private,
+    removed. Four attempts over a minute changed nothing and held a worker for three."""
+    script_dir = tmp_path / "fake-spotdl"
+    script_dir.mkdir()
+    shutil.copy(FAKE, script_dir / "fake_spotdl.py")
+    shutil.copytree(FIXTURES, script_dir / "fixtures")
+    (script_dir / "fake_spotdl.py").chmod(0o755)
+    (script_dir / "mode").write_text("refused")
+    engine = SpotdlEngine(
+        config,
+        paths,
+        python=str(script_dir / "fake_spotdl.py"),
+        visibility=lambda link: True,
+        match_delays=(0, 0, 0),
+    )
+    song = song_from_spotdl(json.loads((FIXTURES / "spotdl_track.json").read_text())[0])
+    notes: list[str] = []
+    with pytest.raises(MatchError) as excinfo:
+        engine.match(song, report=notes.append)
+    assert (script_dir / "runs").read_text() == "2"  # once more, in case it was the network
+    assert len(notes) == 1 and "(attempt 2 of 4)" in notes[0]
+    assert re.sub(r"over \d+ s", "over N s", str(excinfo.value)) == (
+        "YouTube refused the upload found for it in 2 attempts over N s: YT-DLP download "
+        "error - https://www.youtube.com/watch?v=Jg4bxoyywyA "
+        "(age-restricted, private or removed?)"
+    )
+    assert brief_note(notes[0]) == "YouTube refused the upload found for it, try 2/4"
+
+
 def test_reading_spotdl_answers():
     logged, data = _split_json("[12:25:03 AM] ERROR [x] went wrong\n[\n    null\n]\n")
     assert data == [None] and logged.startswith("[12:25:03 AM]")
