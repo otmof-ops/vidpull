@@ -7,6 +7,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.widgets import (
     Button,
@@ -34,6 +36,7 @@ from textual.widgets import (
 from vidpull import CREDIT, REPO_URL, __version__, history
 from vidpull.clipboard import ClipboardWatcher, available_reader, read_clipboard
 from vidpull.config import Config
+from vidpull.duplicates import Duplicate, Finder, settle
 from vidpull.engine import Engine, ProbeError, YtDlpEngine
 from vidpull.formats import build_menu, human_size, preset_selection
 from vidpull.log import RingBufferHandler, setup_logging
@@ -55,6 +58,7 @@ from vidpull.procs import redact_url, which
 from vidpull.semver import Version
 from vidpull.spotdl import (
     InstallError,
+    ResolveCancelled,
     ResolveError,
     SongEngine,
     SpotdlEngine,
@@ -66,6 +70,7 @@ from vidpull.spotdl import (
 from vidpull.spotdl import disclosure as spotdl_disclosure
 from vidpull.store import Store
 from vidpull.tui.screens.confirm import ConfirmScreen, TextScreen
+from vidpull.tui.screens.duplicate import DuplicateScreen
 from vidpull.tui.screens.group import GroupScreen
 from vidpull.tui.screens.logview import LogScreen
 from vidpull.tui.screens.picker import FormatPicker, Pick
@@ -115,6 +120,8 @@ esc    leave the link box
 paste  anywhere: Ctrl+Shift+V, right click, or Ctrl+V / v; several links at once are fine
        a Spotify album or playlist link is one row (G#): enter or p shows its songs
 p      pick a format for a pending job (clipboard watcher); look again for an unmatched song
+       a link you downloaded before asks first: skip it or download it again, and the
+       tick box applies the answer to every other duplicate (s: duplicates = ask, skip, download)
 c      cancel the selected download or run    r  retry a failed or cancelled job or run
 d      delete the selected job or run (asks; can also delete its files)
 o      open the download folder              f  clear the list: what is finished moves to History
@@ -129,6 +136,96 @@ Picker: enter selects · a shows every format · p queues the whole playlist (pr
 
 vidpull is BSD 3-Clause licensed · by Jay · https://github.com/otmof-ops/vidpull
 """
+
+
+class _Question:
+    """What a run wants to know about its duplicates, and where the answer goes."""
+
+    def __init__(self, found: list[Duplicate], context: str):
+        self.found = found
+        self.context = context
+        self.answered = threading.Event()
+        self.decisions: list[bool] | None = None
+        self.withdrawn = False
+
+
+class DuplicatesFound(Message):
+    def __init__(self, question: _Question):
+        super().__init__()
+        self.question = question
+
+
+class DuplicatesWithdrawn(Message):
+    def __init__(self, question: _Question):
+        super().__init__()
+        self.question = question
+
+
+class _Asking:
+    """The duplicates of one list, asked about one after the other."""
+
+    def __init__(
+        self,
+        app: VidpullApp,
+        found: list[Duplicate],
+        context: str,
+        done: Callable[[list[bool]], None],
+        batch: bool,
+    ):
+        self.app = app
+        self.found = found
+        self.context = context
+        self.done = done
+        self.batch = batch
+        self.decisions: list[bool] = []
+        self.abandoned = False
+        self.screen: DuplicateScreen | None = None
+        self.question: _Question | None = None  # set when a run is the one asking
+
+    def step(self) -> None:
+        if self.abandoned:
+            return
+        left = len(self.found) - len(self.decisions)
+        if self.batch and self.app._batch_duplicates is not None:
+            self.decisions += [self.app._batch_duplicates] * left
+            left = 0
+        if not left:
+            self.screen = None
+            self.done(self.decisions)
+            return
+        waiting = len(self.app._url_queue)
+        if left > 1:
+            label, enabled = f"Apply to all {left} duplicates in {self.context}", True
+        elif self.batch and waiting:
+            label = f"Apply to all duplicates among the {waiting} link(s) still waiting"
+            enabled = True
+        elif self.batch:
+            label, enabled = "Apply to all (nothing else is waiting)", False
+        else:
+            label, enabled = "Apply to all (this is the only one)", False
+        found = self.found[len(self.decisions)]
+        self.screen = DuplicateScreen(found, apply_label=label, apply_enabled=enabled)
+        self.app.push_screen(self.screen, callback=self.answered)
+
+    def answered(self, result: tuple[bool, bool] | None) -> None:
+        if self.abandoned:
+            return
+        again, for_all = result if result is not None else (False, False)
+        if for_all:
+            self.decisions += [again] * (len(self.found) - len(self.decisions))
+            if self.batch:
+                self.app._batch_duplicates = again
+        else:
+            self.decisions.append(again)
+        self.step()
+
+    def abandon(self) -> None:
+        """The run was cancelled while its question was up: take the question away."""
+        self.abandoned = True
+        screen, self.screen = self.screen, None
+        if screen is not None and screen.is_attached:
+            with contextlib.suppress(Exception):
+                screen.dismiss((False, False))
 
 
 @dataclass
@@ -210,6 +307,7 @@ class VidpullApp(App[PostExit | None]):
         self.manager = manager or DownloadManager(store, engine, config, paths)
         self.manager.on_event = self._on_manager_event
         self.manager.on_group_event = self._on_group_event
+        self.manager.on_duplicates = self._decide_duplicates
         self.song_engine: SongEngine = song_engine or SpotdlEngine(
             config, paths, engine_python=getattr(engine, "python", None)
         )
@@ -229,6 +327,12 @@ class VidpullApp(App[PostExit | None]):
         self._stale_gen: str | None = None  # a newer generation is installed; this window is old
         self._url_queue: list[str] = [u.strip() for u in (initial_urls or []) if u.strip()]
         self._batch_selection: Selection | None = None
+        # "apply to all" for the links still waiting: True downloads duplicates again
+        self._batch_duplicates: bool | None = None
+        self._known: Finder | None = None  # what was downloaded before, for one paste
+        self._quitting = threading.Event()  # set when the app is quit
+        self._asking: _Asking | None = None  # a run's duplicate question, while it is up
+        self._questions: list[_Question] = []  # runs waiting to ask theirs
         self._table: DataTable | None = None
         self._history_view = "download"  # which log the History tab shows
         self._status: Static | None = None
@@ -253,7 +357,10 @@ class VidpullApp(App[PostExit | None]):
         return self.query_one("#views", TabbedContent)
 
     def _in_history(self) -> bool:
-        return self.views.active == "tab-history"
+        try:
+            return self.views.active == "tab-history"
+        except NoMatches:  # an event that arrives while the app is being taken down
+            return False
 
     def _focus_list(self) -> None:
         """Bring the Downloads tab forward and put the cursor in its table."""
@@ -264,6 +371,46 @@ class VidpullApp(App[PostExit | None]):
 
     def _modal_open(self) -> bool:
         return len(self.screen_stack) > 1
+
+    def exit(self, result=None, return_code: int = 0, message=None) -> None:  # type: ignore[override]
+        self._let_go()
+        super().exit(result, return_code, message)
+
+    def on_unmount(self) -> None:
+        self._let_go()  # however the app came to its end: q, a signal, a closed terminal
+
+    def _let_go(self) -> None:
+        """Release what waits in a thread: a track list being fetched, a wait before
+        another attempt, a question. The app cannot close around a thread that waits;
+        the terminal would hang until it was done."""
+        quitting = getattr(self, "_quitting", None)
+        if quitting is None or quitting.is_set():
+            return  # the app ended before it began, or this was done
+        quitting.set()
+        self.manager.halt()
+        asking = self._asking.question if self._asking is not None else None
+        for question in [*self._questions, asking]:
+            if question is not None:
+                question.withdrawn = True
+                question.answered.set()
+
+    def notify(  # type: ignore[override]
+        self,
+        message: str,
+        *,
+        title: str = "",
+        severity: str = "information",
+        timeout: float | None = None,
+        markup: bool = False,
+    ) -> None:
+        """Titles and links are text: ``[Official Video]`` is not markup to be swallowed."""
+        super().notify(
+            message,
+            title=title,
+            severity=severity,  # type: ignore[arg-type]
+            timeout=timeout,
+            markup=markup,
+        )
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Main-screen actions stay inert while a modal screen is up."""
@@ -351,6 +498,8 @@ class VidpullApp(App[PostExit | None]):
             # a run that just started: put the cursor on it so c, d and enter act on it
             with contextlib.suppress(Exception):
                 self._table.move_cursor(row=self._table.get_row_index(key))
+        if group.is_terminal:
+            self._install_deferred()  # a run's songs do not come by one by one
         if group.status == GroupStatus.DONE and previous not in {None, GroupStatus.DONE}:
             self._desktop_notify(f"{group.kind.capitalize()} finished", group.display_title)
         elif group.status == GroupStatus.FAILED and previous not in {None, GroupStatus.FAILED}:
@@ -390,7 +539,12 @@ class VidpullApp(App[PostExit | None]):
             )
         if job.is_terminal and self._in_history():
             self._reload_history()
-        if job.is_terminal and self._deferred_update and self.manager.is_idle:
+        if job.is_terminal:
+            self._install_deferred()
+
+    def _install_deferred(self) -> None:
+        """A release that waited for the downloads to end: install it now that they have."""
+        if self._deferred_update and self.manager.is_idle:
             tag, self._deferred_update = self._deferred_update, None
             self._auto_updating = True
             self.auto_update(tag)
@@ -516,7 +670,11 @@ class VidpullApp(App[PostExit | None]):
 
     @work(thread=True, group="probe")
     def probe(
-        self, url: str, job_id: int | None = None, playlist: bool = False, batch: bool = False
+        self,
+        url: str,
+        job_id: int | None = None,
+        playlist: bool = False,
+        batch: bool = False,
     ) -> None:
         try:
             info = self.engine.probe(url, playlist=playlist)
@@ -533,12 +691,17 @@ class VidpullApp(App[PostExit | None]):
             )
             self.call_from_thread(self._probe_next)
             return
+        if self.config.duplicates != "download":
+            with contextlib.suppress(Exception):
+                self._finder().warm()  # the folder is read here, not on the thread that draws
         self.call_from_thread(self._offer, url, info, job_id, batch)
 
     def _probe_next(self) -> None:
         """Probe the next queued link: one picker at a time, or no picker in batch mode."""
         if not self._url_queue:
             self._batch_selection = None
+            self._batch_duplicates = None
+            self._known = None
             return
         if self._modal_open():
             return
@@ -555,8 +718,114 @@ class VidpullApp(App[PostExit | None]):
             self.notify(f"not a URL: {_short(url, 60)}", severity="warning")
             self._probe_next()
             return
+
         self.notify(f"probing {_short(redact_url(url), 60)}", timeout=3)
         self.probe(url, batch=self._batch_selection is not None)
+
+    # ---------------------------------------------------------- duplicates
+    def _finder(self) -> Finder:
+        """What was downloaded before, read once for the links of one paste."""
+        if self._known is None:
+            self._known = Finder(self.store, self.manager.download_dir, self.config)
+        return self._known
+
+    def _gate(
+        self,
+        found: Duplicate | None,
+        proceed: Callable[[], None],
+        skipped: Callable[[], None],
+    ) -> None:
+        """Let a pasted link through or not: the setting, an earlier "apply to all", or
+        the user decides."""
+        if found is None:
+            proceed()
+            return
+
+        def decided(decisions: list[bool]) -> None:
+            if decisions and decisions[0]:
+                self.notify(f"downloading {_short(found.title, 50)} again", timeout=4)
+                proceed()
+                return
+            self.notify(
+                f"skipped {_short(found.title, 50)}: {found.phrase}",
+                title="Duplicate",
+                timeout=6,
+            )
+            skipped()
+
+        self._ask_duplicates([found], "the links still waiting", decided, batch=True)
+
+    def _ask_duplicates(
+        self,
+        found: list[Duplicate],
+        context: str,
+        done: Callable[[list[bool]], None],
+        *,
+        batch: bool,
+    ) -> _Asking | None:
+        """Decide about each duplicate in turn and hand ``done`` one answer each.
+
+        ``batch``: the duplicates are pasted links, met one at a time, and a ticked
+        "apply to all" holds for the links still waiting; otherwise they are one list
+        (a playlist's songs) and it holds for the rest of that list.
+        """
+        settled = settle(self.config.duplicates, found)
+        if settled is not None:
+            done(settled)
+            return None
+        asking = _Asking(self, found, context, done, batch)
+        asking.step()
+        return asking
+
+    def _decide_duplicates(
+        self, found: list[Duplicate], context: str, cancel: threading.Event | None
+    ) -> list[bool] | None:
+        """The manager asks from its own thread; the answer comes from the screen.
+
+        Messages carry the question over and its withdrawal back: they are safe to post
+        from a thread, and posting to an app that is closing does nothing, where a call
+        into it would wait for ever.
+        """
+        question = _Question(found, context)
+        self.post_message(DuplicatesFound(question))
+        while not question.answered.wait(0.2):
+            if self._quitting.is_set() or (cancel is not None and cancel.is_set()):
+                self.post_message(DuplicatesWithdrawn(question))
+                return None
+        return None if question.withdrawn else question.decisions
+
+    @on(DuplicatesFound)
+    def _duplicates_found(self, message: DuplicatesFound) -> None:
+        self._questions.append(message.question)
+        self._next_question()
+
+    @on(DuplicatesWithdrawn)
+    def _duplicates_withdrawn(self, message: DuplicatesWithdrawn) -> None:
+        question = message.question
+        question.withdrawn = True
+        if question in self._questions:
+            self._questions.remove(question)
+        if self._asking is not None and self._asking.question is question:
+            asking, self._asking = self._asking, None
+            asking.abandon()
+        self._next_question()
+
+    def _next_question(self) -> None:
+        """Put the next run's question up, unless the user is in the middle of something."""
+        if self._asking is not None or not self._questions or self._modal_open():
+            return
+        question = self._questions.pop(0)
+
+        def done(decisions: list[bool]) -> None:
+            self._asking = None
+            question.decisions = decisions
+            question.answered.set()
+            self._next_question()
+
+        asking = self._ask_duplicates(question.found, question.context, done, batch=False)
+        if asking is not None and not question.answered.is_set():
+            asking.question = question
+            self._asking = asking
 
     # ------------------------------------------------------ spotify links
     @work(thread=True, group="probe")
@@ -577,7 +846,9 @@ class VidpullApp(App[PostExit | None]):
             )
 
         try:
-            songs = self.song_engine.resolve(url, report=waiting)
+            songs = self.song_engine.resolve(url, self._quitting, waiting)
+        except ResolveCancelled:
+            return  # the app is closing
         except ResolveError as exc:
             self.call_from_thread(
                 self.notify, str(exc), title="Spotify link failed", severity="error", timeout=8
@@ -587,6 +858,34 @@ class VidpullApp(App[PostExit | None]):
         self.call_from_thread(self._queue_songs, songs)
 
     def _queue_songs(self, songs: list[Song]) -> None:
+        finder = self._finder()
+        chosen = preset_selection(self.config.song_format, self.config)
+        places = [
+            (n, found)
+            for n, song in enumerate(songs)
+            if (found := finder.song(song, chosen)) is not None
+        ]
+
+        def decided(decisions: list[bool]) -> None:
+            skip = {n for (n, _), again in zip(places, decisions, strict=True) if not again}
+            for (_, found), again in zip(places, decisions, strict=True):
+                if not again:
+                    self.notify(
+                        f"skipped {_short(found.title, 50)}: {found.phrase}",
+                        title="Duplicate",
+                        timeout=6,
+                    )
+            self._queue_wanted([s for n, s in enumerate(songs) if n not in skip])
+
+        if not places:
+            self._queue_wanted(songs)
+            return
+        self._ask_duplicates([d for _, d in places], "this link", decided, batch=True)
+
+    def _queue_wanted(self, songs: list[Song]) -> None:
+        if not songs:
+            self._probe_next()
+            return
         selection = preset_selection(self.config.song_format, self.config)
         for song in songs:
             self.manager.enqueue_song(song, selection)
@@ -718,10 +1017,11 @@ class VidpullApp(App[PostExit | None]):
         self.notify("the clipboard holds no link", severity="warning")
 
     def _offer(self, url: str, info: MediaInfo, job_id: int | None, batch: bool = False) -> None:
+        """What a probe found: the format is chosen, then ``_queue`` goes on to the next
+        link, once a duplicate has been asked about."""
         if batch and self._batch_selection is not None:
             chosen = Selection(**{**self._batch_selection.__dict__, "playlist": info.is_playlist})
             self._queue(url, info, chosen, job_id)
-            self._probe_next()
             return
         menu = build_menu(info, self.config)
         if self.config.auto_pick:
@@ -729,20 +1029,20 @@ class VidpullApp(App[PostExit | None]):
                 self.config.default_preset, self.config, playlist=info.is_playlist
             )
             self._queue(url, info, selection, job_id)
-            self._probe_next()
             return
 
         def picked(result: Pick | None) -> None:
-            if result is not None:
-                self._queue(url, info, result.selection, job_id)
-                if result.for_rest is not None and self._url_queue:
-                    self._batch_selection = result.for_rest
-                    self.notify(
-                        f"using '{result.for_rest.label}' for the remaining "
-                        f"{len(self._url_queue)} link(s)",
-                        timeout=5,
-                    )
-            self._probe_next()
+            if result is None:
+                self._probe_next()
+                return
+            if result.for_rest is not None and self._url_queue:
+                self._batch_selection = result.for_rest  # before the next link is looked at
+                self.notify(
+                    f"using '{result.for_rest.label}' for the remaining "
+                    f"{len(self._url_queue)} link(s)",
+                    timeout=5,
+                )
+            self._queue(url, info, result.selection, job_id)
 
         self.push_screen(
             FormatPicker(info, menu, self.config, remaining=len(self._url_queue)),
@@ -750,6 +1050,29 @@ class VidpullApp(App[PostExit | None]):
         )
 
     def _queue(self, url: str, info: MediaInfo, selection: Selection, job_id: int | None) -> None:
+        """Queue what was chosen, unless it is a duplicate and is not wanted a second time.
+
+        Asked here, where the format is known: the MP3 of a video is no duplicate of the
+        video. The callers go on to the next link; with a question up that waits.
+        """
+        if job_id is None:
+            found = self._finder().media(url, info, selection)
+        else:  # the clipboard's pending job is the link itself, not an earlier copy of it
+            known = Finder(self.store, self.manager.download_dir, self.config, exclude=(job_id,))
+            found = known.media(url, info, selection)
+
+        def dropped() -> None:
+            if job_id is not None:
+                self.manager.delete(job_id)
+            self._probe_next()
+
+        def wanted() -> None:
+            self._enqueue(url, info, selection, job_id)
+            self._probe_next()
+
+        self._gate(found, wanted, dropped)
+
+    def _enqueue(self, url: str, info: MediaInfo, selection: Selection, job_id: int | None) -> None:
         if job_id is not None:
             self.store.update(
                 job_id, title=info.title, uploader=info.uploader, duration=info.duration
@@ -1151,7 +1474,9 @@ class VidpullApp(App[PostExit | None]):
         progress = self.manager.group_progress(group)
         if group.status == GroupStatus.RESOLVING:
             title = f"{group.kind}: fetching the track list… ({_elapsed(group.created_at)})"
-            # while it waits to ask again, the run's error holds the reason
+            if group.entry_count:  # the list is here; the run waits for an answer
+                title = f"{group.display_title} · {group.entry_count} songs"
+            # while it waits, the run's error holds the reason
             status = brief_note(group.error) if group.error else "resolving"
             bar = ""
         else:
@@ -1168,6 +1493,8 @@ class VidpullApp(App[PostExit | None]):
                     status += f" · batch {progress.stage}/{progress.stages}"
             elif group.status == GroupStatus.DONE:
                 status = f"done {progress.done}/{progress.total}"
+                if progress.skipped:
+                    status += f", {progress.skipped} skipped"
                 if progress.failed or progress.pending:
                     status += f", {progress.failed + progress.pending} not found or failed"
             elif group.status == GroupStatus.CANCELLED:
@@ -1211,6 +1538,8 @@ class VidpullApp(App[PostExit | None]):
         status_text = job.phase if job.status.is_active and job.phase else job.status.value
         if job.status == JobStatus.DONE and job.error:
             status_text = "done (with errors)"
+        if job.skipped:
+            status_text = job.phase
         cells: list[object] = [
             str(job.id),
             Text(_short(job.display_title, 48)),
@@ -1245,6 +1574,7 @@ class VidpullApp(App[PostExit | None]):
         self._seen_status.pop(job.id or -1, None)
 
     def _refresh_status(self) -> None:
+        self._next_question()  # a run's question that waited for a screen to close
         for group in self.store.list_groups():
             if group.status == GroupStatus.RESOLVING:
                 self._upsert_group(group)  # keeps the elapsed time moving while spotDL works

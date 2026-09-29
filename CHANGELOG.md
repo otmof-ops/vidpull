@@ -6,6 +6,38 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Duplicates.** Asking for something that is already there raises a question before
+  anything is downloaded: **Skip** or **Download again**, with an **Apply to all** tick box
+  that settles every other duplicate of the album, the playlist or the paste with the same
+  answer. A duplicate is a link that was downloaded before and whose files are all still
+  there, that is on the list already, that comes twice in the album or playlist being added,
+  or whose file is in the download folder.
+- What counts is the same source and the same kind of file: the MP3 of a video that is there
+  is another download, and so is the FLAC of a song that is there as MP3. A link is the same
+  link however it is spelled (`youtu.be/ID`, `watch?v=ID&t=…`, a Spotify link with `?si=`).
+  A file that was deleted, an empty one and a whole YouTube playlist are never duplicates.
+- Skipped songs stay in their run, marked `skipped: already downloaded`, and the run counts
+  them (`done 676/676, 12 skipped`). `r` on a skipped song downloads it after all.
+- The `duplicates` setting (`ask`, `skip`, `download`) and `vidpull get --duplicates …`.
+  On the command line `ask` prompts in a terminal and skips where there is none.
+
+### Fixed
+
+- Quitting while a track list was being fetched, or waited for between attempts, left the
+  terminal hanging until the fetch was over. The app now lets go of what waits the moment it
+  is quit.
+- A run cancelled moments before quitting left the song it was downloading queued, and the
+  next start downloaded it.
+- An event that arrived while the app was closing (a run cancelled at quit) could end it with
+  a traceback.
+- A release that waited for the downloads to end was not installed when what ended was an
+  album or a playlist; it took until the next hourly check.
+- A title or a playlist name with square brackets in it (`[Official Video]`) lost them in a
+  notification, or stopped it from showing.
+- A link with `user:password@` in it was shown and logged with the password.
+
 ## [1.3.1] - 2026-09-29
 
 ### Fixed

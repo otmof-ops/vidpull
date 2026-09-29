@@ -9,10 +9,19 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Select, Static, Switch
 
-from vidpull.config import CONTAINERS, FIELD_HELP, JS_RUNTIMES, MP3_QUALITIES, PRESETS, Config
+from vidpull.config import (
+    CONTAINERS,
+    DUPLICATES,
+    FIELD_HELP,
+    JS_RUNTIMES,
+    MP3_QUALITIES,
+    PRESETS,
+    Config,
+)
 
 TEXT_FIELDS = (
     "download_dir",
+    "duplicates",
     "default_preset",
     "container",
     "mp3_quality",
@@ -39,6 +48,7 @@ SWITCH_FIELDS = (
     "preflight",
 )
 SELECT_OPTIONS = {
+    "duplicates": list(DUPLICATES),
     "default_preset": list(PRESETS),
     "container": list(CONTAINERS),
     "mp3_quality": list(MP3_QUALITIES),

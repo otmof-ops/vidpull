@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 
-from textual.widgets import DataTable, Input, RichLog
+from textual.widgets import Checkbox, DataTable, Input, RichLog
 
 from tests.helpers import FakeEngine, FakeSongEngine, wait_until
+from vidpull.config import Config
+from vidpull.formats import preset_selection
 from vidpull.models import GroupStatus, Job, JobStatus, Selection, SelectionKind
-from vidpull.tui.app import PostExit, VidpullApp
+from vidpull.tui.app import ClipboardUrl, PostExit, UpdateAvailable, VidpullApp
 from vidpull.tui.screens.confirm import ConfirmScreen
+from vidpull.tui.screens.duplicate import DuplicateScreen
 from vidpull.tui.screens.group import GroupScreen
 from vidpull.tui.screens.picker import FormatPicker
 from vidpull.tui.screens.settings import SettingsScreen
@@ -20,8 +24,11 @@ from vidpull.tui.screens.update import UpdateScreen
 URL = "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
 
 
-def make_app(config, paths, store, engine, **kwargs):
+def make_app(config, paths, store, engine, *, duplicates="download", **kwargs):
+    """The fake engine answers every probe with the same video, so every second link
+    would be a duplicate: the tests that are about duplicates ask for ``duplicates="ask"``."""
     config.update_check = False
+    config.duplicates = duplicates
     return VidpullApp(config, paths, store, engine, clipboard_reader=lambda: URL, **kwargs)
 
 
@@ -535,6 +542,501 @@ def test_r_on_a_run_that_failed_to_list_fetches_the_list_again(config, paths, st
     run(flow())
 
 
+def had_before(store, paths, url, name="clip.mp4", song=None):
+    """A download of ``url`` made some time ago, its file still in the folder: a video,
+    or for a song the MP3 a Spotify link makes."""
+    target = paths.home / "dl" / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"x")
+    chosen = preset_selection("best" if song is None else "audio-mp3", Config())
+    job = Job(url=url, selection=chosen, song=song)
+    job.status, job.files = JobStatus.DONE, [str(target)]
+    job.title, job.finished_at = "Big Buck Bunny", "2026-09-28T07:55:47+00:00"
+    job.cleared_at = "2026-09-29T00:00:00+00:00"  # off the list, in the history
+    return store.add(job)
+
+
+def test_a_link_downloaded_before_asks_skip_or_again(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    had_before(store, paths, URL)
+    app = make_app(config, paths, store, engine, duplicates="ask")
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = "https://youtu.be/aqz-KE-bpKQ?si=shared"  # another spelling of it
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, FormatPicker))
+            await pilot.press("enter")  # a video, as the one that is there
+            assert await until(pilot, lambda: isinstance(app.screen, DuplicateScreen))
+            screen = app.screen
+            assert screen.found.why == "downloaded" and len(store.list()) == 1  # asked first
+            shown = str(screen.query_one("#duplicate").render())
+            assert "downloaded 2026-09-2" in shown and "as Best" in shown
+            assert str(paths.home / "dl" / "clip.mp4") in shown
+            tick = screen.query_one("#all", Checkbox)
+            assert tick.disabled and "nothing else is waiting" in str(tick.label)
+            await pilot.press("a")  # a box that cannot be ticked stays unticked
+            assert tick.value is False
+            await pilot.press("s")
+            assert await until(pilot, lambda: not app._modal_open())
+            await pilot.pause(0.1)
+            assert len(store.list()) == 1 and engine.downloads == []  # skipped: nothing queued
+
+            box.value = URL
+            box.focus()
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, FormatPicker))
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, DuplicateScreen))
+            await pilot.press("d")  # download again
+            assert await until(pilot, lambda: len(store.list()) == 2)
+            assert wait_until(lambda: store.list()[1].status == JobStatus.DONE)
+
+    run(flow())
+    app.manager.stop()
+
+
+def test_the_same_link_wanted_as_something_else_is_not_asked_about(
+    config, paths, store, video_info
+):
+    """The video is there; its MP3 is another download."""
+    engine = FakeEngine(info=video_info)
+    had_before(store, paths, URL)
+    app = make_app(config, paths, store, engine, duplicates="skip")
+    app.config.auto_pick = True
+    app.config.default_preset = "audio-mp3"
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = URL
+            await pilot.press("enter")
+            assert await until(pilot, lambda: len(store.list()) == 2)
+            assert store.list()[1].selection.audio_only and not app._modal_open()
+            app.config.default_preset = "1080p"  # a video again: skipped, as the setting says
+            box.value = URL
+            box.focus()
+            await pilot.press("enter")
+            assert await until(pilot, lambda: len(engine.probes) == 2)
+            await pilot.pause(0.2)
+            assert len(store.list()) == 2 and not app._modal_open()
+
+    run(flow())
+    app.manager.stop()
+
+
+def test_apply_to_all_holds_for_the_links_still_waiting(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    links = [f"https://www.youtube.com/watch?v=video-{n}-id" for n in (1, 2, 3)]
+    for n, link in enumerate(links):
+        had_before(store, paths, link, f"clip-{n}.mp4")
+    app = make_app(config, paths, store, engine, duplicates="ask")
+    app.config.auto_pick = True  # the format is settled; the question is what is looked at
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            _paste(app, "\n".join(links))
+            assert await until(pilot, lambda: isinstance(app.screen, DuplicateScreen))
+            tick = app.screen.query_one("#all", Checkbox)
+            assert not tick.disabled and "2 link(s) still waiting" in str(tick.label)
+            await pilot.press("a")
+            assert tick.value is True
+            await pilot.press("s")
+            assert await until(pilot, lambda: len(engine.probes) == 3 and not app._modal_open())
+            await pilot.pause(0.2)
+            assert app._url_queue == [] and len(store.list()) == 3  # three skipped, one question
+            assert app._batch_duplicates is None  # the answer was for that paste only
+
+            _paste(app, "\n".join(links[:2]))  # and the other answer, for all of them
+            assert await until(pilot, lambda: isinstance(app.screen, DuplicateScreen))
+            await pilot.press("a")
+            await pilot.press("d")
+            assert await until(pilot, lambda: len(store.list()) == 5)
+            assert not isinstance(app.screen, DuplicateScreen)
+
+    run(flow())
+    app.manager.stop()
+
+
+def test_a_paste_of_many_duplicates_is_skipped_without_a_word(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    links = [f"https://www.youtube.com/watch?v=video-{n:03}-id" for n in range(120)]
+    for n, link in enumerate(links):
+        had_before(store, paths, link, f"clip-{n}.mp4")
+    app = make_app(config, paths, store, engine, duplicates="skip")
+    app.config.auto_pick = True
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            _paste(app, "\n".join(links))
+            assert await until(pilot, lambda: len(engine.probes) == 120, tries=1500)
+            assert await until(pilot, lambda: app._url_queue == [])
+            await pilot.pause(0.2)
+            assert app.is_running and len(store.list()) == 120 and engine.downloads == []
+
+    run(flow())
+    app.manager.stop()
+
+
+def three_songs():
+    from tests.helpers import sample_song
+
+    songs = [sample_song(title=title, track_number=n) for n, title in enumerate(TITLES, 1)]
+    for song in songs:
+        song.list_name = "OK Computer"
+    return songs
+
+
+TITLES = ("Airbag", "Paranoid Android", "Karma Police")
+
+
+def test_a_run_asks_about_its_duplicates_with_one_tick_for_all(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    songs = three_songs()
+    had_before(store, paths, songs[0].url, "airbag.mp3", song=songs[0])
+    had_before(store, paths, songs[2].url, "karma.mp3", song=songs[2])
+    app = make_app(
+        config, paths, store, engine, duplicates="ask", song_engine=FakeSongEngine(songs=songs)
+    )
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = ALBUM
+            await pilot.press("enter")
+            table = app.query_one("#jobs", DataTable)
+            assert await until(pilot, lambda: isinstance(app.screen, DuplicateScreen))
+            assert app.screen.found.title == "Carly Rae Jepsen - Airbag"
+            tick = app.screen.query_one("#all", Checkbox)
+            assert str(tick.label) == "Apply to all 2 duplicates in OK Computer"
+            row = table.get_row("g1")
+            assert "OK Computer · 3 songs" in str(row[1])  # the list is here, the run waits
+            assert str(row[3]) == "waiting for your answer"
+            assert store.list(group_id=1) == [] and engine.downloads == []
+            await pilot.press("a")
+            await pilot.press("s")
+            assert await until(pilot, lambda: store.get_group(1).status == GroupStatus.DONE)
+            assert not isinstance(app.screen, DuplicateScreen)  # one question was enough
+            assert await until(pilot, lambda: "done 3/3, 2 skipped" in str(table.get_row("g1")[3]))
+            assert [j.skipped for j in store.list(group_id=1)] == [True, False, True]
+            assert len(engine.downloads) == 1
+            await pilot.press("escape")
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, GroupScreen))
+            rows = app.screen.query_one("#songs", DataTable)
+            assert await until(pilot, lambda: rows.row_count == 3)
+            first = store.list(group_id=1)[0]
+            assert str(rows.get_row(str(first.id))[2]) == "skipped: already downloaded"
+            await pilot.press("escape")
+            await pilot.press("h")  # and the history says so as well
+            history = app.query_one("#history", DataTable)
+            assert await until(pilot, lambda: history.row_count >= 1)
+            assert "done 3/3, 2 skipped" in str(history.get_row("g1")[3])
+
+    run(flow())
+    app.manager.stop()
+
+
+def test_a_run_asks_one_by_one_without_the_tick(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    songs = three_songs()
+    had_before(store, paths, songs[0].url, "airbag.mp3", song=songs[0])
+    had_before(store, paths, songs[2].url, "karma.mp3", song=songs[2])
+    app = make_app(
+        config, paths, store, engine, duplicates="ask", song_engine=FakeSongEngine(songs=songs)
+    )
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = ALBUM
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, DuplicateScreen))
+            first = app.screen
+            assert first.found.title.endswith("Airbag")
+            await pilot.press("d")  # this one again, and nothing said about the rest
+            assert await until(
+                pilot, lambda: isinstance(app.screen, DuplicateScreen) and app.screen is not first
+            )
+            assert app.screen.found.title.endswith("Karma Police")
+            tick = app.screen.query_one("#all", Checkbox)
+            assert tick.disabled and "the only one" in str(tick.label)
+            await pilot.press("escape")  # escape skips
+            assert await until(pilot, lambda: store.get_group(1).status == GroupStatus.DONE)
+            assert [j.skipped for j in store.list(group_id=1)] == [False, False, True]
+            assert len(engine.downloads) == 2
+
+    run(flow())
+    app.manager.stop()
+
+
+def test_a_list_named_like_markup_is_a_name(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    songs = three_songs()
+    for song in songs:
+        song.list_name = "Mix [Chill] [/b] [red]"
+    had_before(store, paths, songs[0].url, "airbag.mp3", song=songs[0])
+    had_before(store, paths, songs[1].url, "android [Official Video].mp3", song=songs[1])
+    songs[1].title = "Paranoid Android [Official Video]"
+    app = make_app(
+        config, paths, store, engine, duplicates="ask", song_engine=FakeSongEngine(songs=songs)
+    )
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = ALBUM
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, DuplicateScreen))
+            tick = app.screen.query_one("#all", Checkbox)
+            assert str(tick.label) == "Apply to all 2 duplicates in Mix [Chill] [/b] [red]"
+            await pilot.press("s")
+            assert await until(
+                pilot,
+                lambda: (
+                    isinstance(app.screen, DuplicateScreen)
+                    and "[Official Video]" in str(app.screen.query_one("#duplicate").render())
+                ),
+            )
+            await pilot.press("s")  # and the note that says so holds the brackets too
+            assert await until(pilot, lambda: store.get_group(1).status == GroupStatus.DONE)
+            assert app.is_running
+
+    run(flow())
+    app.manager.stop()
+
+
+def test_a_runs_question_waits_for_the_screen_in_front(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    songs = three_songs()
+    had_before(store, paths, songs[0].url, "airbag.mp3", song=songs[0])
+    block = threading.Event()
+    song_engine = FakeSongEngine(songs=songs, resolve_block=block)
+    app = make_app(config, paths, store, engine, duplicates="ask", song_engine=song_engine)
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = ALBUM
+            await pilot.press("enter")
+            assert await until(pilot, lambda: store.get_group(1) is not None)
+            await pilot.press("escape")
+            await pilot.press("s")  # the user is in the settings when the list arrives
+            assert await until(pilot, lambda: isinstance(app.screen, SettingsScreen))
+            block.set()
+            assert await until(pilot, lambda: "waiting" in store.get_group(1).error)
+            await pilot.pause(0.3)
+            assert isinstance(app.screen, SettingsScreen)  # not on top of it
+            app.screen.query_one("#cancel").press()
+            assert await until(pilot, lambda: isinstance(app.screen, DuplicateScreen), tries=400)
+            await pilot.press("s")
+            assert await until(pilot, lambda: store.get_group(1).status == GroupStatus.DONE)
+
+    try:
+        run(flow())
+    finally:
+        block.set()
+        app.manager.stop()
+
+
+def test_cancelling_a_run_takes_its_question_away(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    songs = three_songs()
+    had_before(store, paths, songs[0].url, "airbag.mp3", song=songs[0])
+    app = make_app(
+        config, paths, store, engine, duplicates="ask", song_engine=FakeSongEngine(songs=songs)
+    )
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = ALBUM
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, DuplicateScreen))
+            assert app.manager.cancel_group(1)
+            assert await until(pilot, lambda: not isinstance(app.screen, DuplicateScreen))
+            assert await until(pilot, lambda: store.get_group(1).status == GroupStatus.CANCELLED)
+            assert store.list(group_id=1) == [] and app._asking is None
+            table = app.query_one("#jobs", DataTable)
+            assert await until(pilot, lambda: "cancelled" in str(table.get_row("g1")[3]))
+
+    run(flow())
+    app.manager.stop()
+
+
+def threads_of(app) -> list[str]:
+    """The threads a closing app must not leave waiting: its workers, by what they run."""
+    return [t.name for t in threading.enumerate() if t.name.startswith(("asyncio_", "Thread-"))]
+
+
+def test_quitting_with_a_question_up_lets_go_of_the_run(config, paths, store, video_info):
+    """The run waits for the answer in a thread, and the app cannot close around a thread
+    that waits: quitting used to leave the terminal hanging."""
+    engine = FakeEngine(info=video_info)
+    songs = three_songs()
+    had_before(store, paths, songs[0].url, "airbag.mp3", song=songs[0])
+    app = make_app(
+        config, paths, store, engine, duplicates="ask", song_engine=FakeSongEngine(songs=songs)
+    )
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = ALBUM
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, DuplicateScreen))
+            await pilot.press("q")
+
+    started = time.monotonic()
+    asyncio.run(asyncio.wait_for(flow(), 20))  # the loop ends when its threads have ended
+    assert time.monotonic() - started < 10
+    assert wait_until(lambda: store.get_group(1).status == GroupStatus.CANCELLED)
+    assert store.list(group_id=1) == []
+    app.manager.stop()
+
+
+def test_quitting_while_a_track_list_is_waited_for(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    block = threading.Event()  # Spotify does not answer
+    song_engine = FakeSongEngine(songs=three_songs(), resolve_block=block)
+    app = make_app(config, paths, store, engine, song_engine=song_engine)
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = ALBUM
+            await pilot.press("enter")
+            assert await until(pilot, lambda: store.get_group(1) is not None)
+            assert await until(pilot, lambda: song_engine.resolved == [ALBUM])
+            await pilot.press("escape")
+            await pilot.press("q")
+
+    started = time.monotonic()
+    try:
+        asyncio.run(asyncio.wait_for(flow(), 20))
+        assert time.monotonic() - started < 10
+        assert wait_until(lambda: store.get_group(1).status == GroupStatus.CANCELLED)
+    finally:
+        block.set()
+        app.manager.stop()
+
+
+def test_an_event_that_arrives_while_the_app_closes_is_no_crash(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    app = make_app(config, paths, store, engine)
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.05)
+            for node in list(app.screen.children):
+                await node.remove()  # as far as the closing app has got
+            assert app._in_history() is False
+
+    run(flow())
+    app.manager.stop()
+
+
+def test_a_song_link_downloaded_before_asks_too(config, paths, store, video_info):
+    from tests.helpers import sample_song
+
+    engine = FakeEngine(info=video_info)
+    had_before(store, paths, SPOTIFY_TRACK, "cut.mp3", song=sample_song())
+    song_engine = FakeSongEngine()
+    app = make_app(config, paths, store, engine, duplicates="ask", song_engine=song_engine)
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = SPOTIFY_TRACK
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, DuplicateScreen))
+            assert app.screen.found.title == "Carly Rae Jepsen - Cut To The Feeling"
+            await pilot.press("s")
+            assert await until(pilot, lambda: not isinstance(app.screen, DuplicateScreen))
+            await pilot.pause(0.1)
+            assert len(store.list()) == 1 and song_engine.matched == []
+            box.value = SPOTIFY_TRACK
+            box.focus()
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, DuplicateScreen))
+            await pilot.press("d")
+            assert await until(pilot, lambda: len(store.list()) == 2)
+            assert wait_until(lambda: store.list()[1].status == JobStatus.DONE)
+
+    run(flow())
+    app.manager.stop()
+
+
+def test_a_copied_link_that_is_skipped_leaves_no_pending_job(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    had_before(store, paths, URL)
+    app = make_app(config, paths, store, engine, duplicates="ask")
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.post_message(ClipboardUrl(URL))  # as the clipboard watcher does
+            assert await until(pilot, lambda: len(store.list(cleared=False)) == 1)
+            pending = store.list(cleared=False)[0]
+            assert pending.status == JobStatus.PENDING
+            await pilot.press("escape")
+            await pilot.press("p")
+            assert await until(pilot, lambda: isinstance(app.screen, FormatPicker))
+            await pilot.press("enter")
+            # the pending job is the link itself: the question is about the earlier download
+            assert await until(pilot, lambda: isinstance(app.screen, DuplicateScreen))
+            assert app.screen.found.why == "downloaded"
+            await pilot.press("s")
+            assert await until(pilot, lambda: store.get(pending.id) is None)
+            assert engine.downloads == []
+
+            app.post_message(ClipboardUrl(URL))
+            assert await until(pilot, lambda: len(store.list(cleared=False)) == 1)
+            again = store.list(cleared=False)[0]
+            await pilot.press("p")
+            assert await until(pilot, lambda: isinstance(app.screen, FormatPicker))
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, DuplicateScreen))
+            await pilot.press("d")
+            assert wait_until(lambda: store.get(again.id).status == JobStatus.DONE)
+
+    run(flow())
+    app.manager.stop()
+
+
+def test_the_setting_decides_without_a_question(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    had_before(store, paths, URL)
+    app = make_app(config, paths, store, engine, duplicates="skip")
+    app.config.auto_pick = True
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = URL
+            await pilot.press("enter")
+            assert await until(pilot, lambda: len(engine.probes) == 1)
+            await pilot.pause(0.3)
+            assert not app._modal_open() and len(store.list()) == 1
+            await pilot.press("escape")
+            await pilot.press("s")
+            assert await until(pilot, lambda: isinstance(app.screen, SettingsScreen))
+            choice = app.screen.query_one("#f-duplicates")
+            assert choice.value == "skip"
+            choice.value = "ask"
+            app.screen.query_one("#save").press()
+            assert await until(pilot, lambda: not isinstance(app.screen, SettingsScreen))
+            assert app.config.duplicates == "ask"
+            box.value = URL
+            box.focus()
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, DuplicateScreen))
+            await pilot.press("s")
+
+    run(flow())
+    app.manager.stop()
+
+
 class FakePipeline:
     """Stands in for UpdatePipeline: one candidate release, an update that succeeds or is busy."""
 
@@ -718,6 +1220,44 @@ def test_a_background_update_that_blows_up_leaves_the_app_running(config, paths,
             assert app.is_running and not isinstance(app.screen, ConfirmScreen)
 
     run(flow())
+
+
+def test_a_release_that_waited_is_installed_when_the_run_ends(config, paths, store, video_info):
+    """The songs of a run do not pass the place a single download's end is noticed."""
+    block = threading.Event()
+    engine = FakeEngine(info=video_info, block=block)
+    pipeline = FakePipeline()
+    app = make_app(
+        config,
+        paths,
+        store,
+        engine,
+        pipeline=pipeline,
+        song_engine=FakeSongEngine(songs=three_songs()),
+    )
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = ALBUM
+            await pilot.press("enter")
+            assert await until(pilot, lambda: app.manager.active_count > 0)
+            app.config.auto_update = True
+            app.post_message(UpdateAvailable("v9.9.9"))  # found while the run downloads
+            assert await until(pilot, lambda: app._deferred_update == "v9.9.9")
+            assert pipeline.runs == 0
+            block.set()
+            assert await until(pilot, lambda: store.get_group(1).status == GroupStatus.DONE)
+            assert await until(pilot, lambda: pipeline.runs == 1, tries=400)
+            assert await until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
+            assert "Restart into it now" in app.screen.question
+            await pilot.press("n")
+
+    try:
+        run(flow())
+    finally:
+        block.set()
+        app.manager.stop()
 
 
 def history_text(app) -> str:

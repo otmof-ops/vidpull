@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from vidpull.config import Config
+from vidpull.duplicates import Decider, Duplicate, Finder, settle
 from vidpull.engine import DownloadResult, Engine, ProbeError, Progress
 from vidpull.models import (
     Group,
@@ -60,6 +61,7 @@ class GroupProgress:
     cancelled: int = 0
     pending: int = 0
     staged: int = 0
+    skipped: int = 0  # duplicates that were not downloaded again; counted in done as well
     active: Job | None = None
     bytes: int = 0
     stage_size: int = 0
@@ -67,16 +69,18 @@ class GroupProgress:
 
     @property
     def stages(self) -> int:
-        if not self.stage_size or not self.total:
+        wanted = self.total - self.skipped  # skipped duplicates are in no batch
+        if not self.stage_size or wanted <= 0:
             return 1
-        return -(-self.total // self.stage_size)
+        return -(-wanted // self.stage_size)
 
     @property
     def stage(self) -> int:
         """The batch currently released, 1-based."""
-        if not self.stage_size or not self.total:
+        wanted = self.total - self.skipped
+        if not self.stage_size or wanted <= 0:
             return 1
-        released = self.total - self.staged
+        released = wanted - self.staged
         return max(1, -(-released // self.stage_size))
 
     @property
@@ -100,6 +104,7 @@ class DownloadManager:
         download_dir: Path | None = None,
         song_engine: SongEngine | None = None,
         on_group_event: GroupEventHandler | None = None,
+        on_duplicates: Decider | None = None,
     ):
         self.store = store
         self.engine = engine
@@ -108,6 +113,7 @@ class DownloadManager:
         self.paths = paths
         self.on_event = on_event
         self.on_group_event = on_group_event
+        self.on_duplicates = on_duplicates  # asks the user; without it nothing can be asked
         self.download_dir = download_dir or config.resolved_download_dir(paths)
         self._worker_count = max(1, workers or config.concurrency)
         self._queue: queue.Queue[int | None] = queue.Queue()
@@ -117,16 +123,19 @@ class DownloadManager:
         self._delete_after: dict[int, bool] = {}
         self._resolving: dict[int, threading.Event] = {}
         self._retried: set[int] = set()  # runs whose failed songs had their second pass
+        self._called_off: set[int] = set()  # jobs the user cancelled, not the shutdown
         self._stage_timers: dict[int, threading.Timer] = {}
         self._stage_lock = threading.RLock()
         self._stopping = threading.Event()
         self._started = False
+        self._released = False  # the workers were told to end
 
     # ------------------------------------------------------------ lifecycle
     def start(self, *, resume: bool = True) -> None:
         if self._started:
             return
         self._started = True
+        self._released = False
         if resume:
             requeued = self.store.requeue_stale()
             if requeued:
@@ -144,7 +153,13 @@ class DownloadManager:
             thread.start()
             self._threads.append(thread)
 
-    def stop(self, *, wait: bool = True, timeout: float = 15.0) -> None:
+    def halt(self) -> None:
+        """Tell everything that runs or waits to let go, and return at once.
+
+        The app calls this the moment it is quit: a thread that waits for a track list,
+        for another attempt or for an answer would otherwise hold the closing app until
+        it is done. ``stop`` does the waiting.
+        """
         self._stopping.set()
         with self._lock:
             for event in self._cancel.values():
@@ -154,8 +169,13 @@ class DownloadManager:
             for timer in self._stage_timers.values():
                 timer.cancel()
             self._stage_timers.clear()
-        for _ in self._threads:
-            self._queue.put(None)
+            released, self._released = self._released, True
+        if not released:
+            for _ in self._threads:
+                self._queue.put(None)
+
+    def stop(self, *, wait: bool = True, timeout: float = 15.0) -> None:
+        self.halt()
         if wait:
             deadline = time.monotonic() + timeout
             for thread in self._threads:
@@ -259,29 +279,126 @@ class DownloadManager:
                 self._emit_group(noted)
 
         try:
-            songs = self.song_engine.resolve(group.url, cancel, waiting)
-        except ResolveCancelled:
-            return self._finish_group(group_id, GroupStatus.CANCELLED, "cancelled")
-        except ResolveError as exc:
-            return self._finish_group(group_id, GroupStatus.FAILED, str(exc))
+            try:
+                songs = self.song_engine.resolve(group.url, cancel, waiting)
+            except ResolveCancelled:
+                return self._finish_group(group_id, GroupStatus.CANCELLED, "cancelled")
+            except ResolveError as exc:
+                return self._finish_group(group_id, GroupStatus.FAILED, str(exc))
+            if cancel.is_set() or self._stopping.is_set():
+                return self._finish_group(group_id, GroupStatus.CANCELLED, "cancelled")
+            name = next((s.list_name for s in songs if s.list_name), "") or group.display_title
+            skip = self._screen_songs(group_id, name, songs, cancel)
+            if skip is None or cancel.is_set() or self._stopping.is_set():
+                return self._finish_group(group_id, GroupStatus.CANCELLED, "cancelled")
         finally:
             with self._lock:
                 self._resolving.pop(group_id, None)
-        if cancel.is_set() or self._stopping.is_set():
-            return self._finish_group(group_id, GroupStatus.CANCELLED, "cancelled")
-        name = next((s.list_name for s in songs if s.list_name), "") or group.display_title
         updated = self.store.update_group(
             group_id, name=name, entry_count=len(songs), status=GroupStatus.ACTIVE, error=""
         )
         if updated is not None:
             self._emit_group(updated)
+        wanted = len(songs) - len(skip)
         size = self.config.stage_size or len(songs)
-        batches = f", {size} at a time" if size < len(songs) else ""
+        batches = f", {size} at a time" if size < wanted else ""
         self.store.add_log("info", f"{name}: {len(songs)} songs{batches}", group_id=group_id)
+        released = 0
         for index, song in enumerate(songs):
-            status = JobStatus.QUEUED if index < size else JobStatus.STAGED
+            found = skip.get(index)
+            if found is not None:
+                self.skip_song(song, group.selection, found, group_id=group_id)
+                continue
+            status = JobStatus.QUEUED if released < size else JobStatus.STAGED
+            released += 1
             self.enqueue_song(song, group.selection, group_id=group_id, status=status)
+        if not wanted:
+            self._settle_group(group_id)  # nothing but duplicates: the run is over already
         return self.store.get_group(group_id)
+
+    def _screen_songs(
+        self, group_id: int, name: str, songs: list[Song], cancel: threading.Event
+    ) -> dict[int, Duplicate] | None:
+        """The songs of a track list that will not be downloaded, by their place in it.
+
+        Finds the duplicates, then lets the setting decide or asks; None when the asking
+        was cancelled.
+        """
+        group = self.store.get_group(group_id)
+        selection = group.selection if group is not None else None
+        finder = Finder(self.store, self.download_dir, self.config)
+        places = [
+            (n, found)
+            for n, song in enumerate(songs)
+            if (found := finder.song(song, selection)) is not None
+        ]
+        if not places:
+            return {}
+        found = [d for _, d in places]
+        decisions = self.decide(found, name, cancel, group_id=group_id, total=len(songs))
+        if decisions is None:
+            return None
+        skipped = {n: d for (n, d), again in zip(places, decisions, strict=True) if not again}
+        again = len(places) - len(skipped)
+        parts = [f"{len(skipped)} skipped"] if skipped else []
+        parts += [f"{again} downloaded again"] if again else []
+        self.store.add_log(
+            "info", f"{len(places)} duplicate(s): {', '.join(parts)}", group_id=group_id
+        )
+        return skipped
+
+    def decide(
+        self,
+        found: list[Duplicate],
+        context: str,
+        cancel: threading.Event | None = None,
+        *,
+        group_id: int | None = None,
+        total: int = 0,
+    ) -> list[bool] | None:
+        """For each duplicate, whether it is downloaded again: by the ``duplicates``
+        setting, or by whoever ``on_duplicates`` asks. None when the asking was cancelled."""
+        decisions = settle(self.config.duplicates, found)
+        if decisions is not None:
+            return decisions
+        if self.on_duplicates is None:
+            return [False] * len(found)  # nobody to ask: what is there is kept
+        if group_id is not None:
+            note = f"waiting for your answer: {len(found)} of {total} songs are duplicates"
+            self.store.add_log("info", note, group_id=group_id)
+            noted = self.store.update_group(group_id, name=context, entry_count=total, error=note)
+            if noted is not None:
+                self._emit_group(noted)
+        decisions = self.on_duplicates(found, context, cancel)
+        if decisions is None or len(decisions) != len(found):
+            return None
+        return [bool(d) for d in decisions]
+
+    def skip_song(
+        self, song: Song, selection: Selection, found: Duplicate, *, group_id: int | None = None
+    ) -> Job:
+        """Record a song that is a duplicate and was not downloaded again."""
+        job = self.store.add(
+            Job(
+                url=song.url,
+                selection=selection,
+                status=JobStatus.DONE,
+                title=song.display_title,
+                uploader=song.artist,
+                duration=song.duration,
+                song=song,
+                group_id=group_id,
+                progress=100.0,
+                phase=found.phase,
+                finished_at=utcnow(),
+            )
+        )
+        where = f": {', '.join(found.files[:2])}" if found.files else ""
+        self.store.add_log(
+            "info", f"{found.phase} ({found.detail}){where}", job_id=job.id, group_id=group_id
+        )
+        self._emit(job)
+        return job
 
     def cancel_group(self, group_id: int) -> bool:
         """Stop a run at any stage: the track-list fetch, queued songs and the active ones."""
@@ -304,6 +421,8 @@ class DownloadManager:
                     continue
                 with self._lock:
                     event = self._cancel.get(job.id)
+                    if event is not None:
+                        self._called_off.add(job.id)
                 if event is not None:
                     event.set()  # the worker records the cancel once yt-dlp or spotDL stopped
                 else:
@@ -399,6 +518,7 @@ class DownloadManager:
             progress.total += 1
             if job.status == JobStatus.DONE:
                 progress.done += 1
+                progress.skipped += 1 if job.skipped else 0
                 progress.bytes += job.total_bytes or job.downloaded_bytes or 0
             elif job.status == JobStatus.FAILED:
                 progress.failed += 1
@@ -453,11 +573,13 @@ class DownloadManager:
                 return
             failed = sum(1 for j in jobs if j.status == JobStatus.FAILED)
             pending = sum(1 for j in jobs if j.status == JobStatus.PENDING)
-            notes = [
-                n
-                for n, count in ((f"{failed} failed", failed), (f"{pending} not found", pending))
-                if count
-            ]
+            skipped = sum(1 for j in jobs if j.skipped)
+            counted = (
+                (f"{failed} failed", failed),
+                (f"{pending} not found", pending),
+                (f"{skipped} skipped", skipped),
+            )
+            notes = [n for n, count in counted if count]
             self._finish_group(group_id, GroupStatus.DONE, ", ".join(notes))
 
     def _second_pass(self, group_id: int, jobs: list[Job]) -> bool:
@@ -560,6 +682,8 @@ class DownloadManager:
     def cancel(self, job_id: int) -> bool:
         with self._lock:
             event = self._cancel.get(job_id)
+            if event is not None:
+                self._called_off.add(job_id)
         if event is not None:
             event.set()
             return True
@@ -590,7 +714,8 @@ class DownloadManager:
         if job is None:
             return None
         unmatched_song = job.song is not None and job.status == JobStatus.PENDING
-        if job.status not in {JobStatus.FAILED, JobStatus.CANCELLED} and not unmatched_song:
+        again = unmatched_song or job.skipped  # a skipped duplicate: download it after all
+        if job.status not in {JobStatus.FAILED, JobStatus.CANCELLED} and not again:
             return None
         job = self.store.update(
             job_id,
@@ -795,6 +920,8 @@ class DownloadManager:
             with self._lock:
                 self._cancel.pop(job_id, None)
                 delete_files = self._delete_after.pop(job_id, None)
+                called_off = job_id in self._called_off
+                self._called_off.discard(job_id)
 
         if unmatched:
             # back to pending: the user can retry later or hand the job a YouTube link
@@ -807,7 +934,9 @@ class DownloadManager:
                 "worker": "",
             }
             self._cleanup_temp(job_id)
-        elif result.cancelled and self._stopping.is_set() and delete_files is None:
+        elif (
+            result.cancelled and self._stopping.is_set() and delete_files is None and not called_off
+        ):
             # shutting down, not a user cancel: leave it queued so the next run resumes it
             fields = {
                 "status": JobStatus.QUEUED,

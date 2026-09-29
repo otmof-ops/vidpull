@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 CONTAINERS = ("auto", "mp4", "mkv", "webm")
 JS_RUNTIMES = ("auto", "deno", "node", "bun", "quickjs", "none")
 MP3_QUALITIES = ("320", "256", "192", "160", "128", "0")  # "0" = VBR best (LAME V0)
+DUPLICATES = ("ask", "skip", "download")  # what happens to a link that was downloaded before
 
 PRESETS: dict[str, str] = {
     "best": "bestvideo*+bestaudio/best",
@@ -46,6 +47,8 @@ FIELD_HELP: dict[str, str] = {
     "stage_size": "Songs of an album or playlist released to the queue at a time; the next batch "
     "starts when this one is done. 0 releases them all at once.",
     "stage_pause": "Seconds to wait between batches of a run.",
+    "duplicates": "A link that was downloaded before (its file is still there), is on the list "
+    "already or comes twice: ask (skip or download again, with 'apply to all'), skip, download.",
     "song_format": "Audio preset for songs from Spotify links: "
     + ", ".join(p for p in PRESETS if p.startswith("audio-"))
     + ".",
@@ -88,6 +91,7 @@ class Config:
     song_format: str = "audio-mp3"
     stage_size: int = 10
     stage_pause: int = 0
+    duplicates: str = "ask"
     default_preset: str = "best"
     container: str = "auto"
     codec_preference: list[str] = field(default_factory=lambda: ["avc1", "av01", "vp9"])
@@ -162,6 +166,9 @@ class Config:
                 "config: song_format %r is not an audio preset; using 'audio-mp3'", self.song_format
             )
             self.song_format = "audio-mp3"
+        if self.duplicates not in DUPLICATES:
+            log.warning("config: duplicates %r unknown; using 'ask'", self.duplicates)
+            self.duplicates = "ask"
         self.stage_size = max(0, min(int(self.stage_size), 1000))
         self.stage_pause = max(0, min(int(self.stage_pause), 3600))
         if self.container not in CONTAINERS:

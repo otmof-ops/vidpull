@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from collections.abc import Callable
@@ -28,6 +29,10 @@ def sample_song(**overrides) -> Song:
         "url": "https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl",
     }
     fields.update(overrides)
+    if "url" not in overrides and fields["title"] != "Cut To The Feeling":
+        # another song is another track on Spotify: its own 22-character id
+        digest = hashlib.sha256(str(fields["title"]).encode()).hexdigest()
+        fields["url"] = f"https://open.spotify.com/track/{digest[:22]}"
     return Song(**fields)
 
 

@@ -135,13 +135,16 @@ def last_error(stderr: str) -> str:
 
 
 def redact_url(url: str) -> str:
-    """A display form of ``url`` with credential-looking query values blanked."""
+    """A display form of ``url``: credential-looking query values blanked, and no
+    ``user:password@`` in front of the host."""
     try:
         parts = urlsplit(url)
+        if parts.username is not None or parts.password is not None:
+            parts = parts._replace(netloc=parts.netloc.rpartition("@")[2])
     except ValueError:
         return url
     if not parts.query:
-        return url
+        return urlunsplit(parts)
     query = [
         (k, "***" if k.lower() in SENSITIVE_QUERY_KEYS or k.lower().startswith("x-amz") else v)
         for k, v in parse_qsl(parts.query, keep_blank_values=True)
