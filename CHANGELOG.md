@@ -6,6 +6,8 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-29
+
 ### Added
 
 - A **Clear list** button (and `f`, now in the footer) that takes every finished, failed and
