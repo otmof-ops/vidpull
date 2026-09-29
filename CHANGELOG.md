@@ -6,6 +6,8 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-09-29
+
 ### Added
 
 - The update log, `~/.local/state/vidpull/updates.log`: every check, app update, engine
