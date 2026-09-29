@@ -6,6 +6,16 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Downloading the audio of a link deleted the video of that link.** yt-dlp was given the
+  download folder to work in, and takes a file there with the name it is about to write for
+  its own download: asked for a link's audio, it converted the video that was there and then
+  deleted it. It now works in a folder of the job's own, and vidpull moves what it made into
+  the download folder. A file of the same name is replaced, as before, and the log says so.
+- Audio "as it comes" (no conversion) is asked about when a file with the link's id and a
+  name it could get is in the folder, since it would replace that file.
+
 ## [1.4.1] - 2026-09-29
 
 ### Fixed

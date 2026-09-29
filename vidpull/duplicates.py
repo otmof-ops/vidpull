@@ -209,7 +209,9 @@ def _fits(path: str, kind: str) -> bool:
     if kind == VIDEO:
         return suffix in VIDEO_SUFFIXES
     if kind == AUDIO:
-        return suffix in AUDIO_SUFFIXES
+        # audio as it comes is in whatever the site serves, .webm and .mp4 among them:
+        # the names a video of the same link has, which the download would replace
+        return suffix in AUDIO_SUFFIXES or suffix in {".webm", ".mp4"}
     codec = kind.partition(":")[2]
     return suffix == CODEC_SUFFIXES.get(codec, f".{codec}")
 

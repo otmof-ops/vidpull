@@ -31,6 +31,7 @@ def fake_engine(tmp_path, config, paths):
     script.chmod(0o755)
     engine = YtDlpEngine(config, paths, python=str(script))
     engine.mode_file = script_dir / "mode"  # type: ignore[attr-defined]
+    engine.args_file = script_dir / "last-args.json"  # type: ignore[attr-defined]
     return engine
 
 
@@ -207,3 +208,59 @@ def test_files_outside_download_dir_are_ignored(fake_engine, paths, tmp_path):
     warnings = []
     kept = _files_inside([str(outside), str(inside)], inside_dir, lambda l, m: warnings.append(m))
     assert kept == [str(inside.resolve())] and warnings
+
+
+def test_yt_dlp_never_sees_the_download_folder(fake_engine, paths):
+    """Given the folder, yt-dlp takes a file there with the name it is about to write for its
+    own download: asked for a link's audio, it converted the video of that link, then
+    deleted it. It works in a folder of the job's own; vidpull moves what it made."""
+    folder = paths.home / "dl"
+    folder.mkdir(parents=True)
+    (folder / "clip.mp4").write_bytes(b"the download that was there")
+    (folder / "other [abc].webm").write_bytes(b"another one")
+    logs = []
+    result = fake_engine.download(
+        _job(),
+        folder,
+        paths.temp_dir / "7",
+        lambda e: None,
+        threading.Event(),
+        lambda lvl, m: logs.append((lvl, m)),
+    )
+    args = json.loads(fake_engine.args_file.read_text())
+    homes = [a for a in args if a.startswith("home:")]
+    assert homes == [f"home:{paths.temp_dir / '7' / 'out'}"]
+    assert result.ok and result.files == [str((folder / "clip.mp4").resolve())]
+    assert (folder / "clip.mp4").read_bytes() == b"fake"  # the same name: replaced, and said
+    assert ("warning", f'Replacing existing file "{(folder / "clip.mp4").resolve()}"') in logs
+    assert (folder / "other [abc].webm").read_bytes() == b"another one"
+    assert not list((paths.temp_dir / "7" / "out").iterdir())
+
+
+def test_moving_what_yt_dlp_made_into_the_download_folder(paths, tmp_path):
+    from vidpull.engine import _finished_files, _place
+
+    staging = paths.temp_dir / "9" / "out"
+    folder = paths.home / "dl"
+    (staging / "A list").mkdir(parents=True)
+    folder.mkdir(parents=True)
+    (staging / "A list" / "001 - one.mp4").write_bytes(b"1")
+    (staging / "one.jpg").write_bytes(b"cover")  # written next to it and not reported
+    (staging / "two.mp4.part").write_bytes(b"half")
+    (staging / "two.mp4.ytdl").write_bytes(b"{}")
+    logs = []
+    note = lambda lvl, m: logs.append((lvl, m))  # noqa: E731
+    placed = _place(staging / "A list" / "001 - one.mp4", staging, folder, note)
+    assert placed == str((folder / "A list" / "001 - one.mp4").resolve())
+    assert (folder / "A list" / "001 - one.mp4").read_bytes() == b"1"
+    assert _place(staging / "A list" / "001 - one.mp4", staging, folder, note) == placed  # twice
+    assert [p.name for p in _finished_files(staging)] == ["one.jpg"]  # what is whole
+    outside = tmp_path / "elsewhere.mp4"
+    outside.write_bytes(b"x")
+    assert _place(outside, staging, folder, note) is None
+    assert _place(staging / ".." / ".." / "escape.mp4", staging, folder, note) is None
+    assert [m for lvl, m in logs if lvl == "warning"] == [
+        f"ignoring a file written outside the download dir: {outside}",
+        f"ignoring a file written outside the download dir: {staging / '..' / '..' / 'escape.mp4'}",
+    ]
+    assert _finished_files(paths.temp_dir / "nowhere") == []
