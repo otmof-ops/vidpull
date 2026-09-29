@@ -112,7 +112,8 @@ vidpull get https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl --list   # the
 
 An album or playlist is **one row** in the queue (`G1`, `G2`, …). It appears the moment you paste
 the link, shows the track list being fetched, then counts its songs through (`downloading 4/12`).
-`c` on that row cancels the whole run at any stage, fetch included; `r` retries what failed;
+`c` on that row cancels the whole run at any stage, fetch included; `r` retries what failed, or
+fetches the track list again when that is what failed;
 `d` deletes it, files optional; Enter or `p` shows the songs behind it, each with its own status
 and match. A run releases its songs to the queue **ten at a time** (`stage_size`); the next batch
 starts when the current one is done, after `stage_pause` seconds if you set one, so a long playlist
@@ -123,6 +124,12 @@ A playlist Spotify does not show without a login (a private one, or one Spotify 
 On Repeat, Daily Mix, Your Top Songs) is refused straight away with the way round it: in Spotify,
 make it public, or add its songs to a playlist of your own and make that public, then paste that
 link. vidpull never asks for your Spotify login.
+
+Spotify and YouTube Music both stop answering for minutes at a time. vidpull waits and asks
+again: a track list is tried five times over about three minutes, a song's lookup four times
+over about a minute, and the row says so while it waits (`Spotify did not answer, try 3/5`).
+A song that still fails is tried once more when the rest of the run is through, and what is left
+after that says why in its log (Enter on the run, or the History tab).
 
 The first Spotify link offers to install spotDL into its own environment under
 `~/.local/share/vidpull/spotdl-venv` (about 200 MB, no sudo); nothing is installed without your

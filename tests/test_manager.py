@@ -500,3 +500,134 @@ def test_retry_brings_a_cleared_download_back_and_forget_deletes_the_rest(store,
         assert manager.forget_history() == 0
     finally:
         manager.stop()
+
+
+WAITING = (
+    "Spotify did not answer, trying again in 5 s (attempt 2 of 5): Could not get playlist "
+    "info: Status Code: 504, Response: upstream request timeout"
+)
+
+
+def test_a_run_waiting_for_spotify_says_so_until_the_list_arrives(store, config, paths):
+    block = threading.Event()
+    song_engine = FakeSongEngine(songs=two_songs(), resolve_notes=(WAITING,), resolve_block=block)
+    group_events = []
+    manager, _ = make_manager(store, config, paths, FakeEngine())
+    manager.song_engine = song_engine
+    manager.on_group_event = group_events.append
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        worker = threading.Thread(target=manager.resolve_group, args=(group.id,))
+        worker.start()
+        assert wait_until(lambda: store.get_group(group.id).error == WAITING)
+        assert store.get_group(group.id).status == GroupStatus.RESOLVING  # not failed: waiting
+        assert any(e.group.error == WAITING for e in group_events)
+        assert store.group_log(group.id)[-1].message == WAITING
+        assert store.group_log(group.id)[-1].level == "warning"
+        block.set()
+        worker.join(5)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert store.get_group(group.id).error == ""  # the list arrived, the note is gone
+        assert len(store.list(group_id=group.id)) == 2
+    finally:
+        block.set()
+        manager.stop()
+
+
+def test_a_lookup_that_fails_fails_the_song_with_the_reason(store, config, paths):
+    reason = "Spotify did not answer in 4 attempts over 70 s: Could not get track info"
+    note = WAITING.replace("of 5", "of 4")
+    manager, events = make_manager(store, config, paths, FakeEngine(), workers=1)
+    manager.song_engine = FakeSongEngine(match_error=reason, match_notes=(note,))
+    manager.start()
+    try:
+        job = manager.enqueue_song(sample_song(), selection())
+        assert wait_until(lambda: store.get(job.id).status == JobStatus.FAILED)
+        failed = store.get(job.id)
+        assert failed.error == reason  # it was never looked for, so it is not "no match"
+        assert failed.phase == "failed" and failed.matched_url == ""
+        assert any(e.job.phase == "Spotify did not answer, try 2/4" for e in events)
+        waiting = Job(url="u", selection=selection(), status=JobStatus.MATCHING, group_id=7)
+        waiting.phase = "Spotify did not answer, try 2/4"
+        busy = Job(url="u", selection=selection(), status=JobStatus.DOWNLOADING, group_id=7)
+        shown = store.add_group(Group(url=ALBUM, kind="album", selection=selection()))
+        busy.group_id = waiting.group_id = shown.id
+        store.add(busy)
+        store.add(waiting)
+        assert manager.group_progress(shown).active.phase == waiting.phase  # the one to show
+        logged = [(line.level, line.message) for line in store.job_log(job.id)]
+        assert ("warning", note) in logged and ("error", reason) in logged
+        manager.song_engine.match_error = None
+        assert manager.retry(job.id) is not None
+        assert wait_until(lambda: store.get(job.id).status == JobStatus.DONE)
+    finally:
+        manager.stop()
+
+
+def test_a_run_tries_its_failed_songs_once_more_before_it_ends(store, config, paths):
+    config.stage_size = 2
+    songs = [sample_song(title=f"Song {n}", track_number=n) for n in range(1, 6)]
+    engine = FakeEngine()
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    # the first three lookups fail, as they do while a service is down; then it is back
+    manager.song_engine = FakeSongEngine(
+        songs=songs, match_error="Spotify did not answer", match_errors=3
+    )
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert [j.status for j in store.list(group_id=group.id)] == [JobStatus.DONE] * 5
+        assert store.get_group(group.id).error == ""
+        messages = [line.message for line in store.group_log(group.id)]
+        assert "3 song(s) failed; trying them once more" in messages
+        assert messages.index("3 song(s) failed; trying them once more") < messages.index("done")
+        assert len(manager.song_engine.matched) == 8 and len(engine.downloads) == 5
+    finally:
+        manager.stop()
+
+
+def test_a_run_whose_track_list_never_arrived_can_be_sent_for_it_again(store, config, paths):
+    manager, _ = make_manager(store, config, paths, FakeEngine())
+    manager.song_engine = FakeSongEngine(songs=two_songs(), resolve_error="Spotify did not answer")
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        assert manager.resolve_group(group.id).status == GroupStatus.FAILED
+        store.update_group(group.id, cleared_at="2026-09-30T00:00:00+00:00")
+        assert manager.retry_group(group.id) == 0  # it has no songs to retry
+        manager.song_engine.resolve_error = None
+        reopened = manager.reopen_group(group.id)
+        assert reopened.status == GroupStatus.RESOLVING and reopened.error == ""
+        assert reopened.cleared_at is None  # back on the list
+        assert manager.reopen_group(group.id) is None  # it is live now
+        assert manager.resolve_group(group.id).status == GroupStatus.ACTIVE
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert len(store.list(group_id=group.id)) == 2
+        assert manager.reopen_group(group.id) is None  # it has songs: retry_group's business
+        assert manager.reopen_group(999) is None
+    finally:
+        manager.stop()
+
+
+def test_the_second_pass_is_one_pass(store, config, paths):
+    engine = FakeEngine(fail=True)
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.song_engine = FakeSongEngine(songs=two_songs())
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert store.get_group(group.id).error == "2 failed"
+        assert len(engine.downloads) == 4  # each song twice, then the run ends
+        assert [j.error for j in store.list(group_id=group.id)] == ["boom", "boom"]
+        # asking for more is the user's call
+        engine.fail = False
+        assert manager.retry_group(group.id) == 2
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert [j.status for j in store.list(group_id=group.id)] == [JobStatus.DONE] * 2
+    finally:
+        manager.stop()

@@ -6,6 +6,29 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A Spotify album or playlist failed outright ("Could not get playlist info") when one request
+  to Spotify got no answer, which happens for minutes at a time. The track list is now asked for
+  up to five times over about three minutes; the run's row shows why it is waiting
+  (`Spotify did not answer, try 3/5`) and `c` cancels during the wait as well.
+- A song whose lookup failed, because Spotify or YouTube Music did not answer, was reported as
+  "no confident match" and left pending. The lookup is now made up to four times, and a song
+  that still fails is marked failed with the reason.
+- The failure reasons say who did not answer and what came back (the HTTP status included),
+  where they used to be spotDL's bare message or "spotDL exited with code 1".
+- `vidpull get` with a Spotify link never returned when a song had no match.
+- The track list could not be fetched when vidpull's files were reached through a symlink
+  ("No module named 'vidpull'").
+
+### Changed
+
+- `r` on a run whose track list never arrived fetches the list again; it used to answer
+  "nothing in this run to retry", and the link had to be pasted again.
+- Before a run ends with failed songs it tries them once more, in batches like the rest.
+- The track list is given three minutes per attempt, down from ten: a 676-song playlist lists
+  in ten seconds.
+
 ## [1.3.0] - 2026-09-29
 
 ### Added

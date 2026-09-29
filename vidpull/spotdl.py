@@ -50,11 +50,26 @@ SPOTDL_SPECS: tuple[str, ...] = ("spotdl==4.5.2", "ytmusicapi==1.12.1")
 INSTALL_SIZE_HINT = "about 200 MB"
 
 VERSION_TIMEOUT = 60.0
-RESOLVE_TIMEOUT = 600.0
+RESOLVE_TIMEOUT = 180.0  # a 676-song playlist lists in 10 s
 MATCH_TIMEOUT = 180.0
 VENV_TIMEOUT = 120.0
 PIP_TIMEOUT = 1800.0
 KILL_GRACE_SECONDS = 5.0
+
+# Spotify's web endpoints drop out for minutes at a time (its own oEmbed answers 504 while
+# they do), and one failed request used to end a whole run. Seconds to wait before the
+# second, third, ... attempt: a track list is tried for about three minutes, a song for one.
+RESOLVE_RETRY_DELAYS: tuple[float, ...] = (5.0, 15.0, 45.0, 90.0)
+MATCH_RETRY_DELAYS: tuple[float, ...] = (5.0, 15.0, 45.0)
+# answers another attempt will not change
+FINAL_ANSWERS = (
+    "not available or not accessible",
+    "make sure it is public",
+    "invalid",
+    "unsupported",
+    "no songs at that link",
+)
+Reporter = Callable[[str], None]
 
 # run by spotDL's interpreter; lists a link's songs without spotDL's three lookups per song
 TRACKLIST_SCRIPT = Path(__file__).with_name("spotdl_tracklist.py")
@@ -97,8 +112,16 @@ class ResolveCancelled(SpotdlError):
     """The caller cancelled while spotDL was still working."""
 
 
+class MatchError(SpotdlError):
+    """A song's lookup failed, which is not the same as finding no match for it."""
+
+
 class InstallError(SpotdlError):
     pass
+
+
+class _TryAgain(Exception):
+    """One attempt failed in a way the next one may not."""
 
 
 @dataclass
@@ -239,9 +262,13 @@ class SongEngine(Protocol):
 
     def version(self) -> str: ...
 
-    def resolve(self, url: str, cancel: threading.Event | None = None) -> list[Song]: ...
+    def resolve(
+        self, url: str, cancel: threading.Event | None = None, report: Reporter | None = None
+    ) -> list[Song]: ...
 
-    def match(self, song: Song, cancel: threading.Event | None = None) -> Match | None: ...
+    def match(
+        self, song: Song, cancel: threading.Event | None = None, report: Reporter | None = None
+    ) -> Match | None: ...
 
 
 class SpotdlEngine:
@@ -253,6 +280,8 @@ class SpotdlEngine:
         python: str | None = None,
         engine_python: str | None = None,
         visibility: Callable[[str], bool | None] | None = None,
+        resolve_delays: tuple[float, ...] = RESOLVE_RETRY_DELAYS,
+        match_delays: tuple[float, ...] = MATCH_RETRY_DELAYS,
     ):
         self.config = config
         self.paths = paths
@@ -261,6 +290,8 @@ class SpotdlEngine:
         # deno and ffmpeg live next to the yt-dlp engine's interpreter; spotDL finds them on PATH
         self._prefer_bin = Path(engine_python).parent if engine_python else None
         self._version: tuple[float, str] | None = None
+        self._resolve_delays = tuple(resolve_delays)
+        self._match_delays = tuple(match_delays)
 
     @property
     def python(self) -> str:
@@ -302,12 +333,15 @@ class SpotdlEngine:
         self._version = (now, text)
         return text
 
-    def resolve(self, url: str, cancel: threading.Event | None = None) -> list[Song]:
+    def resolve(
+        self, url: str, cancel: threading.Event | None = None, report: Reporter | None = None
+    ) -> list[Song]:
         """Every song behind a Spotify track, album or playlist link.
 
         Seconds even for a long playlist: songs from a playlist can come back without
-        album, date or cover, which ``match`` fills in. Raises ``ResolveCancelled`` when
-        ``cancel`` is set while spotDL is still working.
+        album, date or cover, which ``match`` fills in. A request that fails is made
+        again, after a wait ``report`` is told about, before ``ResolveError`` is raised.
+        Raises ``ResolveCancelled`` when ``cancel`` is set while spotDL works or waits.
         """
         link = normalize_spotify_link(url)
         if self._visibility(link) is False:  # Spotify's own answer, in well under a second
@@ -321,22 +355,43 @@ class SpotdlEngine:
             "-",
             *self.common_args(),
         ]
+        started = time.monotonic()
+        tries = len(self._resolve_delays) + 1
+        number = 1
+        while True:
+            try:
+                return self._resolve_once(args, link, cancel)
+            except _TryAgain as exc:
+                reason = str(exc)
+            if number >= tries:
+                raise ResolveError(_gave_up(reason, tries, time.monotonic() - started))
+            delay = self._resolve_delays[number - 1]
+            number += 1
+            _tell(report, _retry_note(reason, delay, number, tries))
+            if _cancelled_during(delay, cancel):
+                raise ResolveCancelled("cancelled while waiting to fetch the track list")
+
+    def _resolve_once(
+        self, args: list[str], link: str, cancel: threading.Event | None
+    ) -> list[Song]:
         outcome = _run_cancellable(args, self.env(), cancel, RESOLVE_TIMEOUT)
         if outcome is None:
             raise ResolveCancelled("cancelled while fetching the track list")
         returncode, stdout, stderr = outcome
         if returncode is None:
-            raise ResolveError("spotDL did not answer within the resolve timeout")
+            raise _TryAgain(f"no answer within {RESOLVE_TIMEOUT:.0f} s")
         data = _json_array(stdout)
         if returncode != 0 or data is None:
-            detail = last_error(stderr)
+            detail = failure_text(stdout, stderr)
             if not detail:
                 detail = (
                     "spotDL returned no track list (it exits 0 when interrupted)"
                     if returncode == 0
                     else f"spotDL exited with code {returncode}"
                 )
-            raise ResolveError(detail)
+            if is_final(detail):
+                raise ResolveError(detail)
+            raise _TryAgain(detail)
         songs = [song_from_spotdl(d) for d in data if isinstance(d, dict) and d.get("name")]
         if not songs:
             raise ResolveError("spotDL found no songs at that link")
@@ -349,13 +404,20 @@ class SpotdlEngine:
             songs.sort(key=lambda s: (s.disc_number or 1, s.track_number or 0))
         return songs
 
-    def match(self, song: Song, cancel: threading.Event | None = None) -> Match | None:
-        """The upload spotDL picks for ``song`` and the song's full details, or None.
+    def match(
+        self, song: Song, cancel: threading.Event | None = None, report: Reporter | None = None
+    ) -> Match | None:
+        """The upload spotDL picks for ``song`` and the song's full details, or None when
+        it finds no confident match (or ``cancel`` was set).
 
         ``spotdl save --preload`` fetches the track, artist and album the way a
         plain ``spotdl save`` would, then searches YouTube Music; ``--lyrics`` with
         no provider skips the lyrics search. It exits 0 whether or not it found a
         match (the entry is then ``null``), so the answer is read from the JSON.
+
+        A lookup that fails, because Spotify or YouTube Music did not answer, is made
+        again after a wait ``report`` is told about. When it keeps failing the song has
+        failed, which ``MatchError`` says: it was not looked for and not found.
         """
         query = song.url or song.display_title
         argv = [
@@ -368,46 +430,202 @@ class SpotdlEngine:
             "--lyrics",
             *self.common_args(),
         ]
+        started = time.monotonic()
+        tries = len(self._match_delays) + 1
+        number = 1
+        while True:
+            try:
+                return self._match_once(argv, song, cancel)
+            except _TryAgain as exc:
+                reason = str(exc)
+            if cancel is not None and cancel.is_set():
+                return None
+            if number >= tries:
+                raise MatchError(_gave_up(reason, tries, time.monotonic() - started))
+            delay = self._match_delays[number - 1]
+            number += 1
+            _tell(report, _retry_note(reason, delay, number, tries))
+            if _cancelled_during(delay, cancel):
+                return None
+
+    def _match_once(
+        self, argv: list[str], song: Song, cancel: threading.Event | None
+    ) -> Match | None:
         try:
             outcome = _run_cancellable(argv, self.env(), cancel, MATCH_TIMEOUT)
-        except SpotdlError as exc:
-            log.warning("%s", exc)
-            return None
+        except ResolveError as exc:  # spotDL could not be started at all
+            raise MatchError(str(exc)) from exc
         if outcome is None:
             return None
         returncode, stdout, stderr = outcome
         if returncode is None:
-            log.warning("spotDL match timed out for %s", song.display_title)
-            return None
-        for data in _json_array(stdout) or []:
-            if not isinstance(data, dict):
+            raise _TryAgain(f"no answer within {MATCH_TIMEOUT:.0f} s")
+        logged, data = _split_json(stdout)
+        if returncode != 0 or data is None:
+            detail = failure_text(stdout, stderr)
+            if is_no_match(detail):
+                return None
+            raise _TryAgain(
+                detail
+                or (
+                    f"spotDL exited with code {returncode}"
+                    if returncode
+                    else "spotDL returned no answer"
+                )
+            )
+        for entry in data:
+            if not isinstance(entry, dict):
                 continue
-            candidate = str(data.get("download_url") or "").strip()
+            candidate = str(entry.get("download_url") or "").strip()
             if not is_youtube_url(candidate):
                 continue
-            details = song_from_spotdl(data) if data.get("name") else None
+            details = song_from_spotdl(entry) if entry.get("name") else None
             if details is not None:
                 # the song's place in its album or playlist is only known from the list
                 details.url = details.url or song.url
                 details.list_name = song.list_name or details.list_name
                 details.list_position = song.list_position or details.list_position
             return Match(candidate, details)
-        error = last_error(stderr)
-        if error:
-            log.info("spotDL: %s", error)
+        # a null entry is spotDL finding nothing, or its search raising: it logs which
+        trouble = search_failure(logged)
+        if trouble and not is_no_match(trouble):
+            raise _TryAgain(trouble)
         return None
+
+
+# --------------------------------------------------------------- answers
+def _split_json(text: str) -> tuple[str, list[Any] | None]:
+    """What spotDL logged on stdout, and the JSON array it printed after that.
+
+    The array starts a line of its own; log lines before it may hold brackets too.
+    """
+    decoder = json.JSONDecoder()
+    index = text.find("[")
+    while index >= 0:
+        if index == 0 or text[index - 1] == "\n":
+            try:
+                data, _ = decoder.raw_decode(text, index)
+            except ValueError:
+                data = None
+            if isinstance(data, list):
+                return text[:index], data
+        index = text.find("[", index + 1)
+    return text, None
 
 
 def _json_array(text: str) -> list[Any] | None:
     """The JSON array in spotDL's stdout, ignoring any progress lines printed before it."""
-    start = text.find("[")
-    if start < 0:
-        return None
-    try:
-        data = json.loads(text[start:])
-    except ValueError:
-        return None
-    return data if isinstance(data, list) else None
+    return _split_json(text)[1]
+
+
+def _one_line(text: str, limit: int = 300) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def failure_text(stdout: str, stderr: str) -> str:
+    """Why spotDL failed, in one line; empty when it did not say.
+
+    The track-list helper writes ``ERROR: ...`` to stderr. spotDL itself prints a boxed
+    traceback on stdout and the exception under the box, wrapped at 80 columns.
+    """
+    for line in reversed(stderr.splitlines()):
+        if line.strip().startswith("ERROR:"):
+            return _one_line(line.strip()[len("ERROR:") :])
+    for text in (stdout, stderr):
+        lines = text.splitlines()
+        ends = [n for n, line in enumerate(lines) if line.lstrip().startswith("╰")]
+        if ends:
+            under = _one_line(" ".join(lines[ends[-1] + 1 :]))
+            if under:
+                return under
+    return _one_line(last_error(stderr))
+
+
+def search_failure(logged: str) -> str:
+    """The exception spotDL logged when its search raised instead of finding nothing."""
+    flat = " ".join(logged.split())
+    marker = "generated an exception:"
+    found = flat.rfind(marker)
+    return _one_line(flat[found + len(marker) :]) if found >= 0 else ""
+
+
+def is_no_match(reason: str) -> bool:
+    """Whether spotDL's search ended without a result, which it raises like an error."""
+    return "no results found" in reason.lower()
+
+
+def is_final(reason: str) -> bool:
+    """Whether another attempt would get the same answer."""
+    low = reason.lower()
+    return any(hint in low for hint in FINAL_ANSWERS)
+
+
+# how the failures of spotDL's Spotify client read
+_SPOTIFY_SIGNS = (
+    "spotify",
+    "could not get",
+    "failed to complete request",
+    "request kept failing",
+    "status code",
+)
+
+
+def _who(reason: str) -> str:
+    low = reason.lower()
+    if low.startswith("no answer within"):
+        return "spotDL did not answer"
+    if "youtube" in low or "ytmusic" in low:
+        return "YouTube Music did not answer"
+    if any(sign in low for sign in _SPOTIFY_SIGNS):
+        return "Spotify did not answer"
+    return "spotDL failed"
+
+
+def _span(seconds: float) -> str:
+    return f"{seconds:.0f} s" if seconds < 90 else f"{seconds / 60:.0f} min"
+
+
+def _retry_note(reason: str, delay: float, number: int, tries: int) -> str:
+    wait = f"in {delay:.0f} s" if delay >= 1 else "now"
+    return f"{_who(reason)}, trying again {wait} (attempt {number} of {tries}): {reason}"
+
+
+def _gave_up(reason: str, tries: int, seconds: float) -> str:
+    return f"{_who(reason)} in {tries} attempts over {_span(seconds)}: {reason}"
+
+
+_NOTE = re.compile(r"^(?P<who>[^,:]+), trying again .*?\(attempt (?P<number>\d+) of (?P<of>\d+)\)")
+
+
+def is_retry_note(text: str) -> bool:
+    """Whether ``text`` is a ``brief_note``: something is waiting to be asked again."""
+    return re.search(r", try \d+/\d+$", text) is not None
+
+
+def brief_note(note: str) -> str:
+    """A retry note cut to fit a table cell: who did not answer and which attempt is next."""
+    found = _NOTE.match(note)
+    if found is None:
+        return note.split(":", 1)[0]
+    return f"{found['who']}, try {found['number']}/{found['of']}"
+
+
+def _tell(report: Reporter | None, message: str) -> None:
+    if report is None:
+        log.warning("%s", message)
+        return
+    with contextlib.suppress(Exception):  # a listener's trouble is not spotDL's
+        report(message)  # the listener logs it where it belongs: the run's log, the song's
+
+
+def _cancelled_during(delay: float, cancel: threading.Event | None) -> bool:
+    """Wait ``delay`` seconds; True when ``cancel`` was set before or during the wait."""
+    if cancel is None:
+        if delay > 0:
+            time.sleep(delay)
+        return False
+    return cancel.wait(delay) if delay > 0 else cancel.is_set()
 
 
 def _run_cancellable(

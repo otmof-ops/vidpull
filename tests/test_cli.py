@@ -212,6 +212,48 @@ def test_get_album_link_runs_as_a_group(monkeypatch, capsys, paths, video_info):
     )
 
 
+def test_get_does_not_wait_for_a_song_that_was_not_found(monkeypatch, capsys, paths, video_info):
+    """An unmatched song stays pending; the command used to wait for it for ever."""
+    from tests.helpers import sample_song
+
+    engine = FakeEngine(info=video_info)
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: engine)
+    monkeypatch.setattr(cli, "SpotdlEngine", lambda *a, **k: FakeSongEngine(match_url=None))
+    assert cli.main(["get", SPOTIFY_TRACK, "-a", "mp3"]) == 1
+    assert "no confident match on YouTube Music" in " ".join(capsys.readouterr().out.split())
+
+    songs = [sample_song(title="Airbag", track_number=1)]
+    monkeypatch.setattr(
+        cli, "SpotdlEngine", lambda *a, **k: FakeSongEngine(songs=songs, match_url=None)
+    )
+    album = "https://open.spotify.com/album/6dVIqQ8qmQ5GBnJ9shOYGE"
+    assert cli.main(["get", album, "-a", "mp3"]) == 1
+    assert "no confident match on YouTube Music" in " ".join(capsys.readouterr().out.split())
+
+
+def test_get_shows_why_a_track_list_is_late_and_retries_failed_songs(
+    monkeypatch, capsys, paths, video_info
+):
+    from tests.helpers import sample_song
+
+    engine = FakeEngine(info=video_info)
+    note = "Spotify did not answer, trying again in 5 s (attempt 2 of 5): [Errno 104] reset"
+    songs = [sample_song(title="Airbag", track_number=1)]
+    song_engine = FakeSongEngine(
+        songs=songs, resolve_notes=(note,), match_error="Spotify did not answer", match_errors=1
+    )
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: engine)
+    monkeypatch.setattr(cli, "SpotdlEngine", lambda *a, **k: song_engine)
+    album = "https://open.spotify.com/album/6dVIqQ8qmQ5GBnJ9shOYGE"
+    assert cli.main(["get", album, "-a", "mp3"]) == 0  # the failed song got its second pass
+    out = " ".join(capsys.readouterr().out.split())
+    assert f"note: {note}" in out and out.count("saved") == 1
+    assert len(song_engine.matched) == 2
+
+    assert cli.main(["get", SPOTIFY_TRACK, "--list"]) == 0
+    assert f"note: {note}" in " ".join(capsys.readouterr().out.split())
+
+
 def test_update_log_command(capsys, paths):
     from vidpull.updatelog import UpdateLog
 

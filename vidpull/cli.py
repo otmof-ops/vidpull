@@ -28,7 +28,7 @@ from vidpull.formats import (
 from vidpull.log import setup_logging
 from vidpull.manager import DownloadManager
 from vidpull.manifest import Manifest
-from vidpull.models import GroupStatus, Job, JobEvent, JobStatus, Selection
+from vidpull.models import GroupEvent, GroupStatus, JobEvent, JobStatus, Selection
 from vidpull.paths import Paths
 from vidpull.procs import redact_url
 from vidpull.semver import Version
@@ -318,7 +318,7 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
         for url in args.urls:
             if song_engine is not None and is_spotify_link(url):
                 try:
-                    songs = song_engine.resolve(url)
+                    songs = song_engine.resolve(url, report=_waiting(console))
                 except ResolveError as exc:
                     console.print(f"[red]error:[/] {exc}")
                     return EXIT_FAILURE
@@ -368,6 +368,10 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
                 extra=f"{job.status} · {job.phase} · {_speed(job.speed)}".strip(" ·"),
             )
 
+    def on_group_event(event: GroupEvent) -> None:
+        if event.group.status == GroupStatus.RESOLVING and event.group.error:
+            _waiting(console)(event.group.error)  # why the track list is not there yet
+
     import threading
 
     progress_lock = threading.Lock()
@@ -380,8 +384,21 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
         workers=args.jobs,
         download_dir=download_dir,
         song_engine=song_engine,
+        on_group_event=on_group_event,
     )
     ids: list[int] = []
+    runs: list[int] = []
+
+    def over(job_id: int) -> bool:
+        job = store.get(job_id)
+        if job is None or job.is_terminal:
+            return True
+        return job.song is not None and job.status == JobStatus.PENDING  # no match was found
+
+    def run_over(group_id: int) -> bool:
+        group = store.get_group(group_id)
+        return group is None or group.is_terminal
+
     with progress:
         manager.start(resume=False)
         try:
@@ -397,10 +414,10 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
                             )
                             continue
                         console.print(f"{group.display_title}: {group.entry_count} songs")
-                        ids.extend(j.id or 0 for j in store.list(group_id=group.id))
+                        runs.append(group.id or 0)
                         continue
                     try:
-                        songs = song_engine.resolve(url)
+                        songs = song_engine.resolve(url, report=_waiting(console))
                     except ResolveError as exc:
                         console.print(f"[red]error:[/] {redact_url(url)}: {exc}")
                         continue
@@ -424,15 +441,14 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
                     )
                 job = manager.enqueue(url, chosen, info)
                 ids.append(job.id or 0)
-            while any(
-                not (
-                    store.get(i) or Job(url="", selection=selection, status=JobStatus.FAILED)
-                ).is_terminal
-                for i in ids
-            ):
+            # a run is over when the manager says so: it releases batches and tries its
+            # failed songs once more, so its songs' own states do not tell
+            while not (all(run_over(g) for g in runs) and all(over(i) for i in ids)):
                 time.sleep(0.2)
         finally:
             manager.stop(wait=True)
+    for group_id in runs:
+        ids.extend(j.id or 0 for j in store.list(group_id=group_id))
     failures = 0
     for job_id in ids:
         job = store.get(job_id)
@@ -448,6 +464,15 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
             console.print(f"[red]{job.status}[/] {redact_url(job.url)}: {job.error}")
     store.close()
     return EXIT_FAILURE if failures or not ids else EXIT_OK
+
+
+def _waiting(console):
+    """A listener for spotDL's retry notes that prints them as they come."""
+
+    def report(message: str) -> None:
+        console.print(f"note: {message}", style="yellow", markup=False, highlight=False)
+
+    return report
 
 
 def _print_songs(console, table_cls, url, songs) -> None:
