@@ -1,6 +1,7 @@
 import threading
 
 from tests.helpers import MATCHED_URL, FakeEngine, FakeSongEngine, sample_song, wait_until
+from vidpull.engine import DownloadResult
 from vidpull.manager import NO_MATCH_PHASE, DownloadManager
 from vidpull.models import Group, GroupStatus, Job, JobStatus, Selection, SelectionKind
 
@@ -940,3 +941,168 @@ def test_a_download_the_shutdown_interrupts_waits_for_the_next_start(store, conf
     finally:
         block.set()
         manager.stop()
+
+
+def test_pause_stops_what_runs_and_nothing_starts_until_resume(store, config, paths):
+    block = threading.Event()
+    engine = FakeEngine(block=block)
+    manager, events = make_manager(store, config, paths, engine, workers=2)
+    manager.start()
+    try:
+        jobs = [manager.enqueue(f"https://e/{n}", selection()) for n in range(3)]
+        assert wait_until(lambda: manager.active_count == 2)
+        assert not manager.paused
+        assert manager.pause() == 2 and manager.paused
+        assert wait_until(lambda: manager.active_count == 0)
+        held = [store.get(j.id) for j in jobs]
+        assert [j.status for j in held] == [JobStatus.QUEUED] * 3
+        assert sorted(j.phase for j in held) == ["", "paused", "paused"]  # two were running
+        assert len(engine.downloads) == 2
+        assert any(e.job.phase == "paused" for e in events)
+        late = manager.enqueue("https://e/late", selection())  # added while it is paused
+        block.set()
+        assert not wait_until(lambda: len(engine.downloads) > 2, timeout=0.4)
+        assert store.get(late.id).status == JobStatus.QUEUED
+        assert manager.pause() == 0  # paused already: nothing more to stop
+
+        assert manager.resume() == 4 and not manager.paused
+        assert wait_until(lambda: all(store.get(j.id).status == JobStatus.DONE for j in jobs))
+        assert wait_until(lambda: store.get(late.id).status == JobStatus.DONE)
+        assert len(engine.downloads) == 6  # the two that were stopped ran a second time
+        assert all(store.get(j.id).phase == "done" for j in jobs)
+        assert manager.resume() == 0  # it was not paused
+    finally:
+        block.set()
+        manager.stop()
+
+
+def test_a_paused_run_releases_no_batch(store, config, paths):
+    config.stage_size = 2
+    songs = five_songs()
+    block = threading.Event()
+    engine = FakeEngine(block=block)
+    manager, _ = make_manager(store, config, paths, engine, workers=2)
+    manager.song_engine = FakeSongEngine(songs=songs)
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert wait_until(lambda: manager.active_count == 2)
+        manager.pause()
+        block.set()
+        assert wait_until(lambda: manager.active_count == 0)
+        statuses = [j.status for j in store.list(group_id=group.id)]
+        assert statuses == [JobStatus.QUEUED] * 2 + [JobStatus.STAGED] * 3
+        assert store.get_group(group.id).status == GroupStatus.ACTIVE
+        assert not wait_until(
+            lambda: any(j.status == JobStatus.DONE for j in store.list(group_id=group.id)),
+            timeout=0.4,
+        )
+        manager.resume()
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert [j.status for j in store.list(group_id=group.id)] == [JobStatus.DONE] * 5
+        messages = [line.message for line in store.group_log(group.id)]
+        assert messages.count("released the next 2 song(s)") == 1
+        assert "released the next 1 song(s)" in messages
+    finally:
+        block.set()
+        manager.stop()
+
+
+def test_a_run_whose_batch_ended_while_paused_goes_on_at_resume(store, config, paths):
+    config.stage_size = 1
+    songs = two_songs()
+    engine = FakeEngine()
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.song_engine = FakeSongEngine(songs=songs)
+    manager.pause()  # paused before anything was added
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        resolved = manager.resolve_group(group.id)  # the track list still arrives
+        assert resolved.status == GroupStatus.ACTIVE and resolved.entry_count == 2
+        assert not wait_until(lambda: engine.downloads, timeout=0.4)
+        assert manager.resume() == 1
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert len(engine.downloads) == 2
+    finally:
+        manager.stop()
+
+
+class SlowToLetGo(FakeEngine):
+    """An engine that takes a moment to stop, as yt-dlp does when it is interrupted."""
+
+    def download(self, job, download_dir, temp_dir, on_progress, cancel, on_log, *, info=None):
+        if len(self.downloads) == 0:
+            self.downloads.append(job.id)
+            self.started.set()
+            assert cancel.wait(5)
+            self.letting_go.wait(5)
+            return DownloadResult(ok=False, cancelled=True)
+        return super().download(job, download_dir, temp_dir, on_progress, cancel, on_log, info=info)
+
+
+def test_resumed_before_the_download_had_let_go(store, config, paths):
+    engine = SlowToLetGo()
+    engine.letting_go = threading.Event()
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.start()
+    try:
+        job = manager.enqueue("https://e/v", selection())
+        assert engine.started.wait(5)
+        assert manager.pause() == 1
+        manager.resume()  # a second later, while yt-dlp is still being stopped
+        assert store.get(job.id).status == JobStatus.DOWNLOADING
+        engine.letting_go.set()
+        assert wait_until(lambda: store.get(job.id).status == JobStatus.DONE)
+        assert len(engine.downloads) == 2 and store.get(job.id).phase == "done"
+    finally:
+        engine.letting_go.set()
+        manager.stop()
+
+
+def test_a_cancel_while_paused_is_a_cancel(store, config, paths):
+    block = threading.Event()
+    engine = SlowToLetGo()
+    engine.letting_go = block
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.start()
+    try:
+        running = manager.enqueue("https://e/1", selection())
+        waiting = manager.enqueue("https://e/2", selection())
+        assert engine.started.wait(5)
+        manager.pause()
+        assert manager.cancel(running.id)  # while it is being stopped for the pause
+        assert manager.cancel(waiting.id)
+        block.set()
+        assert wait_until(lambda: store.get(running.id).status == JobStatus.CANCELLED)
+        assert store.get(waiting.id).status == JobStatus.CANCELLED
+        assert manager.resume() == 0
+        assert not wait_until(lambda: len(engine.downloads) > 1, timeout=0.3)
+    finally:
+        block.set()
+        manager.stop()
+
+
+def test_closing_while_paused_keeps_what_waits(store, config, paths):
+    block = threading.Event()
+    engine = FakeEngine(block=block)
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.start()
+    job = manager.enqueue("https://e/v", selection())
+    assert engine.started.wait(5)
+    manager.pause()
+    assert wait_until(lambda: store.get(job.id).phase == "paused")
+    manager.stop()
+    assert store.get(job.id).status == JobStatus.QUEUED
+    # the next start is paused too, until it is resumed
+    again = FakeEngine()
+    second, _ = make_manager(store, config, paths, again, workers=1)
+    second.pause()
+    second.start()
+    try:
+        assert not wait_until(lambda: again.downloads, timeout=0.4)
+        assert second.resume() == 1
+        assert wait_until(lambda: store.get(job.id).status == JobStatus.DONE)
+    finally:
+        second.stop()

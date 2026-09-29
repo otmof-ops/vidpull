@@ -58,12 +58,25 @@ open the folder.
 | --- | --- |
 | `a` / `v` | focus the link box / paste from the clipboard (any terminal paste works too) |
 | `c` / `r` / `d` | cancel, retry, delete the selected download (delete can take the files with it) |
+| `space` | pause the queue, and resume it (there is a **Pause** button too) |
 | `o` | open the download folder |
 | `f` | clear the list: everything finished moves to History (there is a **Clear list** button too) |
 | `h` | the History tab, and back (`esc` returns to the list as well) |
 | `u` / `x` | update vidpull, or remove it |
 | `s` / `l` / `?` | settings, log, help |
 | `q` | quit; anything still downloading picks up where it left off next time |
+
+### Pausing
+
+**Pause** (the button above the list, or `space`) stops the queue: what is downloading stops
+within a second, nothing new starts, and an album or playlist releases no further batch.
+**Resume** (the same button, the same key) goes on: a download that was stopped continues from
+the part it had, it does not start over.
+
+The queue stays paused when you close vidpull and is still paused when you open it again,
+until you resume it. Links you add while it is paused wait with the rest. From another
+terminal, `vidpull queue pause` and `vidpull queue resume` do the same to an open vidpull;
+`vidpull get` is never paused, since it is a download you asked for there and then.
 
 ### The list and the history
 
@@ -85,7 +98,7 @@ result. The buttons above switch that half to the app's log file or the update l
 | **Forget history** | delete the records of everything that was cleared; files are not touched |
 
 From the command line: `vidpull queue clear`, `vidpull queue history`, `vidpull queue log ID`
-(`G3` for a run), and `vidpull queue clear --forget`.
+(`G3` for a run), `vidpull queue clear --forget`, `vidpull queue pause` and `vidpull queue resume`.
 
 ### Duplicates
 

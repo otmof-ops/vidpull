@@ -27,7 +27,7 @@ from vidpull.formats import (
     raw_selection,
 )
 from vidpull.log import setup_logging
-from vidpull.manager import DownloadManager
+from vidpull.manager import PAUSE_META, DownloadManager
 from vidpull.manifest import Manifest
 from vidpull.models import SKIPPED, GroupEvent, GroupStatus, JobEvent, JobStatus, Selection
 from vidpull.paths import Paths
@@ -221,6 +221,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="also delete the history of everything cleared (records and logs, never files)",
     )
     q_clear.set_defaults(func=cmd_queue_clear)
+    q_pause = queue_sub.add_parser(
+        "pause", help="pause the queue: nothing downloads until it is resumed"
+    )
+    q_pause.set_defaults(func=cmd_queue_pause, paused=True)
+    q_resume = queue_sub.add_parser("resume", help="resume a paused queue")
+    q_resume.set_defaults(func=cmd_queue_pause, paused=False)
     q_history = queue_sub.add_parser("history", help="every download that is over, newest first")
     q_history.add_argument("-n", "--limit", type=int, default=40, metavar="N")
     q_history.add_argument("--json", action="store_true")
@@ -862,6 +868,7 @@ def cmd_queue_list(args: argparse.Namespace, ctx: Context) -> int:
     jobs = store.list(cleared=False)
     groups = store.list_groups(cleared=False)
     counts = {g.id: store.group_counts(g.id or 0) for g in groups}
+    paused = store.get_meta(PAUSE_META) == "1"
     store.close()
     if not args.all:
         jobs = [j for j in jobs if not j.is_terminal or j.status == JobStatus.FAILED]
@@ -875,6 +882,8 @@ def cmd_queue_list(args: argparse.Namespace, ctx: Context) -> int:
             )
         )
         return EXIT_OK
+    if paused:
+        print("the queue is paused; `vidpull queue resume` or space in the app resumes it")
     if not jobs and not groups:
         print("no jobs")
         return EXIT_OK
@@ -891,9 +900,37 @@ def cmd_queue_list(args: argparse.Namespace, ctx: Context) -> int:
         if job.group_id is not None:
             title = _short(f"[G{job.group_id}] {job.display_title}", 50)
         status = "skipped" if job.skipped else str(job.status)
+        if paused and job.status in {JobStatus.QUEUED, JobStatus.STAGED}:
+            status = "paused"
         print(
             f"{job.id:>4}  {status:<11} {job.progress:>5.1f}%  {title:<50}  {job.selection.label}"
         )
+    return EXIT_OK
+
+
+def cmd_queue_pause(args: argparse.Namespace, ctx: Context) -> int:
+    """Pause or resume the app's queue from a terminal; the app follows within a second."""
+    ctx.paths.ensure_runtime_dirs()
+    store = Store(ctx.paths.db_file)
+    was = store.get_meta(PAUSE_META) == "1"
+    store.set_meta(PAUSE_META, "1" if args.paused else "0")
+    waiting = store.counts().get("queued", 0) + store.counts().get("staged", 0)
+    store.close()
+    if args.paused:
+        print(
+            "the queue was paused already"
+            if was
+            else "the queue is paused: nothing downloads "
+            "until `vidpull queue resume`, or space in the app"
+        )
+    else:
+        print(
+            f"the queue is resumed; {waiting} download(s) waiting"
+            if was
+            else "the queue was not paused"
+        )
+    if (not was and args.paused) or (was and not args.paused):
+        print("an open vidpull follows within a second; `vidpull get` is never paused")
     return EXIT_OK
 
 
