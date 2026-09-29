@@ -516,19 +516,6 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
             manager.stop(wait=True)
     for group_id in runs:
         ids.extend(j.id or 0 for j in store.list(group_id=group_id))
-        group = store.get_group(group_id)
-        if group is not None:
-            progress = manager.group_progress(group)
-            console.print(
-                f"{group.display_title}: {progress.tally()}", markup=False, highlight=False
-            )
-            if progress.unresolved:
-                console.print(
-                    f"{progress.unresolved} left to resolve: vidpull queue failed",
-                    style="yellow",
-                    markup=False,
-                    highlight=False,
-                )
     failures = 0
     for job_id in ids:
         job = store.get(job_id)
@@ -544,6 +531,19 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
         else:
             failures += 1
             console.print(f"[red]{job.status}[/] {redact_url(job.url)}: {job.error}")
+    for group_id in runs:  # last, where it is still in sight after a long list
+        group = store.get_group(group_id)
+        if group is None:
+            continue
+        progress = manager.group_progress(group)
+        console.print(f"{group.display_title}: {progress.tally()}", markup=False, highlight=False)
+        if progress.unresolved:
+            console.print(
+                f"{progress.unresolved} left to resolve: vidpull queue failed",
+                style="yellow",
+                markup=False,
+                highlight=False,
+            )
     store.close()
     if failures:
         return EXIT_FAILURE
@@ -958,9 +958,12 @@ def cmd_queue_pause(args: argparse.Namespace, ctx: Context) -> int:
     return EXIT_OK
 
 
+HANDED = "an open vidpull takes it up within a second, otherwise it runs when vidpull is opened"
+
+
 def cmd_queue_failed(args: argparse.Namespace, ctx: Context) -> int:
     if not ctx.paths.db_file.exists():
-        print("nothing has failed")
+        print("[]" if args.json else "nothing has failed")
         return EXIT_OK
     store = Store(ctx.paths.db_file)
     found = history.failures(store)
@@ -971,7 +974,7 @@ def cmd_queue_failed(args: argparse.Namespace, ctx: Context) -> int:
                 "id": one.job.id,
                 "title": one.job.display_title,
                 "run": one.group.id if one.group is not None else None,
-                "from": one.job.url,
+                "from": redact_url(one.job.url),
                 "why": one.brief,
                 "error": one.why,
             }
@@ -997,15 +1000,13 @@ def cmd_queue_link(args: argparse.Namespace, ctx: Context) -> int:
     manager = DownloadManager(store, YtDlpEngine(ctx.config, ctx.paths), ctx.config, ctx.paths)
     try:
         job = manager.relink(args.id, args.url)
+        store.hand_over(args.id)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_FAILURE
     finally:
         store.close()
-    print(
-        f"job {job.id} ({_short(job.display_title, 50)}) is queued with the link; "
-        "it runs the next time the TUI starts"
-    )
+    print(f"job {job.id} ({_short(job.display_title, 50)}) is queued with the link; {HANDED}")
     return EXIT_OK
 
 
@@ -1032,11 +1033,13 @@ def cmd_queue_retry(args: argparse.Namespace, ctx: Context) -> int:
     store = Store(ctx.paths.db_file)
     manager = DownloadManager(store, YtDlpEngine(ctx.config, ctx.paths), ctx.config, ctx.paths)
     queued = manager.retry(args.id)  # a song's run is opened again with it
+    if queued is not None:
+        store.hand_over(args.id)
     store.close()
     if queued is None:
         print("only failed, cancelled or unmatched jobs can be retried", file=sys.stderr)
         return EXIT_FAILURE
-    print(f"job {args.id} queued; it runs the next time the TUI starts")
+    print(f"job {args.id} queued; {HANDED}")
     return EXIT_OK
 
 
@@ -1058,7 +1061,7 @@ def cmd_queue_clear(args: argparse.Namespace, ctx: Context) -> int:
 
 def cmd_queue_history(args: argparse.Namespace, ctx: Context) -> int:
     if not ctx.paths.db_file.exists():
-        print("nothing has finished yet")
+        print("[]" if args.json else "nothing has finished yet")
         return EXIT_OK
     store = Store(ctx.paths.db_file)
     found = history.entries(store, limit=max(1, args.limit))

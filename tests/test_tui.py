@@ -1952,13 +1952,14 @@ def test_the_songs_of_a_run_show_their_speed_and_take_a_link(config, paths, stor
                 lambda: "4/6 downloaded · 2 not found" in str(title.content),
                 tries=300,
             )
-            rows.move_cursor(row=0)  # a song that came: it takes no other link
+            rows.move_cursor(row=0)  # a song that came takes no other link, and is not asked
+            before = len(app._notifications)
             await pilot.press("l")
-            assert await until(pilot, lambda: isinstance(app.screen, LinkScreen))
-            app.screen.query_one("#link", Input).value = GIVEN
-            await pilot.press("enter")
-            problem = app.screen.query_one("#link-problem", Static)
-            assert await until(pilot, lambda: "only a download that failed" in str(problem.content))
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, GroupScreen)
+            assert len(app._notifications) == before + 1
+            said = list(app._notifications)[-1]
+            assert said.message.startswith("only a song that failed") and not said.markup
 
     try:
         run(flow())
@@ -2025,4 +2026,340 @@ def test_a_row_that_did_not_change_is_not_written_again(config, paths, store, vi
         run(flow())
     finally:
         engine.let(50)
+        app.manager.stop()
+
+
+# ------------------------------------------------ what the review of the Failed tab found
+def test_nothing_in_the_failed_tab_is_cancelled(config, paths, store, video_info):
+    """Cancelled, a song that was not found would be on no list at all."""
+    app = make_app(config, paths, store, FakeEngine(info=video_info), song_engine=trouble())
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            song = await a_run_that_is_over(app, pilot, store)
+            failed = app.query_one("#failed", DataTable)
+            assert await until(pilot, lambda: failed.row_count == 3)
+            await pilot.press("2")
+            await pilot.press("down")  # Song 4, which was not found
+            before = len(app._notifications)
+            await pilot.press("c")
+            await pilot.pause(0.1)
+            assert store.get(song["Song 4"].id).status == JobStatus.PENDING
+            assert failed.row_count == 3 and len(app._notifications) == before + 1
+            assert "d deletes the selected one" in list(app._notifications)[-1].message
+
+    try:
+        run(flow())
+    finally:
+        app.manager.stop()
+
+
+def test_a_run_is_announced_when_it_is_over_and_not_for_every_song_after(
+    config, paths, store, video_info, monkeypatch
+):
+    from vidpull.models import utcnow
+
+    app = make_app(config, paths, store, FakeEngine(info=video_info), song_engine=trouble())
+    announced = []
+    monkeypatch.setattr(app, "_desktop_notify", lambda title, body: announced.append(body))
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            song = await a_run_that_is_over(app, pilot, store)
+            assert await until(pilot, lambda: len(announced) == 1)
+            assert announced == [f"{LISTED}: 3/6 downloaded · 1 failed · 2 not found"]
+            long = [n for n in app._notifications if "Failed tab" in n.message]
+            assert len(long) == 1 and long[0].severity == "warning" and not long[0].markup
+            # it was over a while ago; a song of it is given a link
+            store.update_group(1, ended_at="2026-09-29T00:00:00+00:00")
+            assert utcnow() > "2026-09-29T00:00:02"
+            app.manager.relink(song["Song 4"].id, GIVEN)
+            assert await until(
+                pilot, lambda: store.get(song["Song 4"].id).status == JobStatus.DONE, tries=500
+            )
+            assert await until(
+                pilot, lambda: store.get_group(1).status == GroupStatus.DONE, tries=500
+            )
+            tally = "4/6 downloaded · 1 failed · 1 not found"
+            assert await until(
+                pilot, lambda: any(n.message == tally for n in app._notifications), tries=300
+            )
+            assert len(announced) == 1  # nothing on the desktop for one song
+            assert len([n for n in app._notifications if "Failed tab" in n.message]) == 1
+
+    try:
+        run(flow())
+    finally:
+        app.manager.stop()
+
+
+def test_enter_does_not_delete_everything(config, paths, store, video_info):
+    app = make_app(config, paths, store, FakeEngine(info=video_info), song_engine=trouble())
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            await a_run_that_is_over(app, pilot, store)
+            failed = app.query_one("#failed", DataTable)
+            assert await until(pilot, lambda: failed.row_count == 3)
+            await pilot.press("2")
+            await pilot.click("#fail-delete-all")
+            assert await until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
+            assert app.focused is app.screen.query_one("#no", Button)
+            assert "deleted for good, from the history as well" in app.screen.question
+            await pilot.press("enter")
+            assert await until(pilot, lambda: not isinstance(app.screen, ConfirmScreen))
+            assert failed.row_count == 3 and len(store.list(group_id=1)) == 6
+            # the last of a run's songs deleted: the run goes with it
+            songs = trouble()
+            songs.fails, songs.unfound = (), tuple(f"Song {n}" for n in range(1, 7))
+            app.manager.song_engine = songs
+            app.query_one(
+                "#url", Input
+            ).value = "https://open.spotify.com/album/1A2B3C4D5E6F7G8H9I0J1K"
+            app.query_one("#url", Input).focus()
+            await pilot.press("enter")
+            assert await until(pilot, lambda: len(store.list_groups()) == 2)
+            assert await until(
+                pilot, lambda: store.get_group(2).status == GroupStatus.DONE, tries=500
+            )
+            assert await until(pilot, lambda: failed.row_count == 9)
+            await pilot.press("escape")
+            await pilot.press("2")
+            await pilot.click("#fail-delete-all")
+            assert await until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
+            await pilot.press("y")
+            assert await until(pilot, lambda: failed.row_count == 0)
+            assert store.get_group(2) is None and store.get_group(1) is not None
+            jobs = app.query_one("#jobs", DataTable)
+            assert await until(pilot, lambda: [r.value for r in jobs.rows] == ["g1"])
+            assert cells(jobs, "g1")[1] == f"{LISTED} · 3/3 done"
+
+    try:
+        run(flow())
+    finally:
+        app.manager.stop()
+
+
+def test_a_title_is_a_title_in_what_the_failed_tab_says(config, paths, store, video_info):
+    """``[/oops]`` closes a tag that was never opened: read as markup it ends the app."""
+    from tests.helpers import sample_song
+
+    titles = ("Live [/oops]", "[@click=app.quit]QUIT[/]", "Plain [Explicit]")
+    songs = [sample_song(title=title, track_number=n) for n, title in enumerate(titles, 1)]
+    for song in songs:
+        song.list_name = "[bold]Mix[/bold]"
+    engine = FakeEngine(info=video_info)
+    app = make_app(
+        config, paths, store, engine, song_engine=PickySongEngine(songs=songs, unfound=titles)
+    )
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            await a_run_that_is_over(app, pilot, store)
+            failed = app.query_one("#failed", DataTable)
+            assert await until(pilot, lambda: failed.row_count == 3)
+            assert [row[1] for row in listed(failed)] == [f"Carly Rae Jepsen - {t}" for t in titles]
+            assert listed(failed)[0][2] == "G1 [bold]Mix[/bold]"
+            await pilot.press("2")
+            await pilot.press("r")  # "trying … again"
+            await pilot.press("enter")  # the dialog, with the title in it
+            assert await until(pilot, lambda: isinstance(app.screen, LinkScreen))
+            assert titles[1] in str(app.screen.query_one("#link-what", Static).content)
+            app.screen.query_one("#link", Input).value = GIVEN
+            await pilot.press("enter")  # "downloading … from the link you gave"
+            assert await until(pilot, lambda: not isinstance(app.screen, LinkScreen))
+            await pilot.pause(0.3)
+            assert await until(pilot, lambda: failed.row_count >= 1, tries=500)
+            await pilot.press("d")  # "deleted …"
+            await pilot.pause(0.3)
+            said = [n for n in app._notifications if any(t in n.message for t in titles)]
+            assert len(said) >= 3 and not any(n.markup for n in app._notifications)
+            assert app.is_running
+
+    try:
+        run(flow())
+    finally:
+        app.manager.stop()
+
+
+def test_the_speed_and_the_eta_are_in_sight(config, paths, store, video_info):
+    from vidpull.models import Group
+    from vidpull.tui.app import failed_widths, list_widths
+    from vidpull.tui.screens.group import song_widths
+
+    assert list_widths(132) == (38, 12, 31) and sum(list_widths(132)) == 132 - 51
+    assert list_widths(160) == (52, 17, 40) and list_widths(240) == (56, 34, 40)
+    assert list_widths(80) == (38, 12, 31)  # what each needs to say something: scrolled to
+    assert song_widths(132) == (36, 39) and song_widths(240) == (48, 40)
+    assert failed_widths(132, ["a" * 60], ["G9 Hevs199099"]) == (46, 13, 58)
+    assert failed_widths(100, ["a" * 60], ["G9 Hevs199099"]) == (32, 13, 40)
+    assert failed_widths(132, [], []) == (12, 0, 80)
+
+    chosen = Selection(SelectionKind.VIDEO, "299+140/best", "2160p60 · av01 · mp4 · 1679.4 MB")
+    # a download as the manager reports it; it is not in the store, so nothing runs it
+    long = Job(id=4242, url=URL, selection=chosen, title="A title that goes on and on " * 4)
+    long.status, long.phase = JobStatus.DOWNLOADING, "YouTube Music did not answer, try 2/4"
+    long.speed, long.eta, long.progress, long.total_bytes = 987654321.0, 86399.0, 45.0, 10**12
+    run_of_it = store.add_group(
+        Group(
+            url=ALBUM,
+            kind="playlist",
+            selection=Selection(SelectionKind.PRESET, "audio", "Audio as MP3 320 kbps"),
+            name="A playlist with a name that does not end " * 2,
+            status=GroupStatus.DONE,
+        )
+    )
+    for n in range(1200):
+        status = JobStatus.DONE if n % 5 else JobStatus.FAILED
+        store.add(Job(url=URL, selection=chosen, status=status, group_id=run_of_it.id))
+    app = make_app(config, paths, store, FakeEngine(info=video_info))
+
+    def in_sight(table, upto):
+        wide = 0
+        for column in table.ordered_columns:
+            wide += column.get_render_width(table)
+            if str(column.label) == upto:
+                return wide <= table.size.width
+        raise AssertionError(upto)
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            await pilot.press("escape")
+            table = app.query_one("#jobs", DataTable)
+            assert await until(pilot, lambda: table.row_count == 1)
+            app._upsert(long)
+            await pilot.pause(0.2)
+            assert in_sight(table, "ETA")
+            row = cells(table, "g1")
+            # the count is what is read: a long name gives way to it
+            assert row[1] == "A playli… · 960/1200 done · 240 failed" and len(row[1]) == 38
+            assert row[2] == "MP3 320 kbps" and row[3] == "done · 240 failed: press 2"
+            row = cells(table, "4242")
+            assert row[1] == "A title that goes on and on A title t…"
+            assert row[2] == "2160p60" and row[3] == "YouTube Music did not answer, …"
+            assert row[5] == "941.9 MB/s" and row[6] == "23h59m"
+            await pilot.resize_terminal(200, 40)
+            await pilot.pause(0.3)
+            assert await until(pilot, lambda: cells(table, "g1")[2] == "Audio as MP3 320 kbps")
+            app._upsert(long)
+            assert cells(table, "4242")[2] == "2160p60 · av01 · mp4 · 1679.4 MB"
+            assert cells(table, "4242")[3] == "YouTube Music did not answer, try 2/4"
+            await pilot.pause(0.2)
+            assert in_sight(table, "Size")
+            await pilot.resize_terminal(132, 40)
+            await pilot.pause(0.3)
+            assert await until(pilot, lambda: cells(table, "g1")[2] == "MP3 320 kbps")
+            app._upsert(long)
+            assert await until(pilot, lambda: in_sight(table, "ETA"))
+            # what failed: the reason is in sight
+            await pilot.press("2")
+            failed = app.query_one("#failed", DataTable)
+            assert await until(pilot, lambda: failed.row_count == 240)
+            assert in_sight(failed, "Why")
+
+    try:
+        run(flow())
+    finally:
+        app.manager.stop()
+
+
+def test_a_link_copied_for_the_dialog_is_no_download_of_its_own(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    app = make_app(config, paths, store, engine, song_engine=trouble())
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            song = await a_run_that_is_over(app, pilot, store)
+            failed = app.query_one("#failed", DataTable)
+            assert await until(pilot, lambda: failed.row_count == 3)
+            # copied in the browser with the watcher on: it is on the list, waiting for a format
+            app.post_message(ClipboardUrl(GIVEN))
+            assert await until(pilot, lambda: store.copied_links() == 1)
+            copied = next(j for j in store.list([JobStatus.PENDING]) if j.song is None)
+            await pilot.press("2")
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, LinkScreen))
+            app.post_message(ClipboardUrl("https://youtu.be/lmnopqrstuv"))  # with the dialog up
+            await pilot.pause(0.2)
+            assert store.copied_links() == 1
+            app.screen.query_one("#link", Input).value = GIVEN
+            await pilot.press("enter")
+            assert await until(pilot, lambda: not isinstance(app.screen, LinkScreen))
+            assert await until(pilot, lambda: store.get(copied.id) is None)  # it was for the song
+            assert await until(
+                pilot, lambda: store.get(song["Song 2"].id).status == JobStatus.DONE, tries=500
+            )
+            assert store.copied_links() == 0 and engine.json_probes.count(GIVEN) == 1
+
+    try:
+        run(flow())
+    finally:
+        app.manager.stop()
+
+
+def test_a_link_given_in_a_terminal_is_taken_up_by_the_open_app(config, paths, store, video_info):
+    from tests.helpers import sample_song
+    from vidpull.manager import DownloadManager
+
+    engine = FakeEngine(info=video_info)
+    app = make_app(config, paths, store, engine, song_engine=trouble())
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            song = await a_run_that_is_over(app, pilot, store)
+            failed = app.query_one("#failed", DataTable)
+            jobs = app.query_one("#jobs", DataTable)
+            assert await until(pilot, lambda: failed.row_count == 3)
+            # `vidpull queue link 4 URL`: another vidpull, on the same database
+            other = DownloadManager(store, FakeEngine(), config, paths)
+            other.relink(song["Song 4"].id, GIVEN)
+            store.hand_over(song["Song 4"].id)
+            assert await until(
+                pilot, lambda: store.get(song["Song 4"].id).status == JobStatus.DONE, tries=500
+            )
+            assert await until(
+                pilot, lambda: store.get_group(1).status == GroupStatus.DONE, tries=500
+            )
+            assert await until(pilot, lambda: failed.row_count == 2)
+            assert await until(
+                pilot, lambda: cells(jobs, "g1")[1] == f"{LISTED} · 4/6 done · 2 failed"
+            )
+            assert engine.downloads.count(song["Song 4"].id) == 1
+            assert sample_song().title  # (the helper is used by the songs above)
+
+    try:
+        run(flow())
+    finally:
+        app.manager.stop()
+
+
+def test_one_that_failed_again_is_back_where_it_was(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    songs = trouble()
+    app = make_app(config, paths, store, engine, song_engine=songs)
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            song = await a_run_that_is_over(app, pilot, store)
+            failed = app.query_one("#failed", DataTable)
+            assert await until(pilot, lambda: failed.row_count == 3)
+            await pilot.press("2")
+            await pilot.press("down")
+            await pilot.press("down")  # on Song 6, the last
+            engine.lists.add("https://www.youtube.com/playlist?list=PL1")
+            app.manager.relink(song["Song 2"].id, "https://www.youtube.com/playlist?list=PL1")
+            assert await until(
+                pilot, lambda: store.get(song["Song 2"].id).status == JobStatus.FAILED, tries=500
+            )
+            assert await until(pilot, lambda: failed.row_count == 3, tries=500)
+            rows = listed(failed)
+            assert [row[1][-6:] for row in rows] == ["Song 2", "Song 4", "Song 6"]
+            assert rows[0][3] == (
+                "that link is a list, not one upload: give the link of the song itself"
+            )
+            assert app._failed_id() == song["Song 6"].id  # the cursor is on what it was on
+
+    try:
+        run(flow())
+    finally:
         app.manager.stop()

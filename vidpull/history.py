@@ -106,7 +106,9 @@ def entries(store: Store, *, limit: int = MAX_ENTRIES) -> list[Entry]:
         found.append(
             Entry(
                 key=f"g{group.id}",
-                when=group.updated_at,
+                # when it was through its songs; a song of it tried again later does not
+                # move it up the list
+                when=group.ended_at or group.updated_at,
                 title=f"{group.display_title} · {total} songs" if total else group.display_title,
                 format=group.selection.label,
                 result=group_result(group, counts, skipped),
@@ -124,23 +126,28 @@ def entries(store: Store, *, limit: int = MAX_ENTRIES) -> list[Entry]:
 _REASON_LEAD = re.compile(r"^(?:ERROR:\s*)?(?:https?://\S+?:\s+)?(?:\[[^\]\s]+\]\s+\S+:\s+)?")
 _REASON_LINK = re.compile(r"\s*[-:]\s*https?://\S+\s*$")
 _SENTENCE_END = re.compile(r"(?<=[^\s.])\.\s+(?=[A-Z])")
+REASON_READ = 600  # a reason is in the first lines of what was said, however much was said
+SENTENCE_MIN = 12
 # said in the words of yt-dlp and spotDL, which are about their own options and workings
 _PLAIN_WORDS = (
     ("sign in to confirm your age", "age-restricted: needs a YouTube sign-in"),
-    ("yt-dlp download error", "YouTube refused the upload (age-restricted, private, removed?)"),
+    ("yt-dlp download error", "YouTube refused the upload (age-restricted or removed?)"),
 )
 
 
 def brief_reason(text: str) -> str:
     """Why a download did not come, in the few words a list has room for: the first
     sentence of it, without the link and the extractor's name in front."""
-    whole = " ".join(text.split())
+    whole = " ".join(text[:REASON_READ].split())
     lowered = whole.lower()
     for sign, words in _PLAIN_WORDS:
         if sign in lowered:
             return words
     brief = _REASON_LEAD.sub("", whole, count=1)
-    brief = _SENTENCE_END.split(brief, maxsplit=1)[0]
+    for end in _SENTENCE_END.finditer(brief):
+        if end.start() >= SENTENCE_MIN:  # "Mr. Brightside" ends no sentence
+            brief = brief[: end.start()]
+            break
     brief = _REASON_LINK.sub("", brief).strip()
     return brief or whole
 

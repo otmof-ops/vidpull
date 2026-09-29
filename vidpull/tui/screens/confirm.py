@@ -27,12 +27,14 @@ class ConfirmScreen(ModalScreen[tuple[bool, bool]]):
         checkbox: str | None = None,
         danger: bool = False,
         yes_label: str = "Yes",
+        focus_no: bool = False,
     ):
         super().__init__()
         self.question = question
         self.checkbox_label = checkbox
         self.danger = danger
         self.yes_label = yes_label
+        self.focus_no = focus_no  # enter is a no: for what deletes many things at once
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
@@ -44,6 +46,10 @@ class ConfirmScreen(ModalScreen[tuple[bool, bool]]):
                     self.yes_label, id="yes", variant="error" if self.danger else "primary"
                 )
                 yield Button("No", id="no")
+
+    def on_mount(self) -> None:
+        if self.focus_no:
+            self.query_one("#no", Button).focus()
 
     def _checked(self) -> bool:
         if not self.checkbox_label:

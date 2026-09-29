@@ -1569,3 +1569,285 @@ def test_a_run_shows_the_speed_of_its_last_transfer_between_transfers(
         manager.resume()
     finally:
         manager.stop()
+
+
+# ------------------------------------------------ what the review of the Failed tab found
+def thin_songs():
+    """The track list of a playlist: the name of a song, its artists, and no more."""
+    songs = [
+        sample_song(
+            title=f"Song {n}", track_number=1, album="", album_artist="", date="", cover_url=""
+        )
+        for n in range(1, 4)
+    ]
+    for position, song in enumerate(songs, 1):
+        song.list_name, song.list_position = "Mix", position
+    return songs
+
+
+def in_full(song):
+    """What Spotify says of that song when it is asked for alone."""
+    return sample_song(
+        title=song.title,
+        url=song.url,
+        album="The Album",
+        album_artist="Carly Rae Jepsen",
+        track_number=7,
+        date="2019-02-11",
+        cover_url="https://i.scdn.co/image/cover",
+    )
+
+
+def test_deleting_a_run_does_not_count_it_again_for_every_song(store, config, paths, monkeypatch):
+    manager, engine, group, _ = a_run_with_trouble(store, config, paths)
+    try:
+        counted = []
+        recount = manager._count_again
+        monkeypatch.setattr(manager, "_count_again", lambda g: counted.append(g) or recount(g))
+        assert manager.delete_group(group.id)
+        assert counted == [] and store.get_group(group.id) is None
+        assert store.list(group_id=group.id) == []
+    finally:
+        manager.stop()
+
+
+def test_a_song_queued_again_waits_for_a_run_that_settles(store, config, paths):
+    """Queued while its run settled, it was queued in a run that then said it was done."""
+    manager, engine, group, _ = a_run_with_trouble(store, config, paths)
+    try:
+        failed = next(j for j in store.list(group_id=group.id) if j.status == JobStatus.FAILED)
+        manager.pause()  # what is queued stays queued: the states can be looked at
+        queued = []
+        with manager._stage_lock:  # a run is settling
+            other = threading.Thread(target=lambda: queued.append(manager.retry(failed.id)))
+            other.start()
+            other.join(0.3)
+            assert other.is_alive() and store.get(failed.id).status == JobStatus.FAILED
+            assert store.get_group(group.id).status == GroupStatus.DONE
+        other.join(5)
+        assert not other.is_alive() and queued[0] is not None
+        assert store.get(failed.id).status == JobStatus.QUEUED
+        assert store.get_group(group.id).status == GroupStatus.ACTIVE
+        # it is looked at again under the lock: staged for a second pass, it is not over
+        staged = store.list(group_id=group.id)[0]
+        store.update(staged.id, status=JobStatus.STAGED)
+        assert manager.retry(staged.id) is None
+        import pytest
+
+        with pytest.raises(ValueError, match="only a download that failed"):
+            manager.relink(staged.id, "https://youtu.be/abcdefghijk")
+    finally:
+        manager.stop()
+
+
+def test_another_link_starts_from_nothing_and_a_retry_from_the_part(store, config, paths):
+    """The part that is there is of the upload that failed. yt-dlp would go on from it
+    with what the other link sends: the song's file has the same name."""
+    manager, engine, group, _ = a_run_with_trouble(store, config, paths)
+    try:
+        manager.pause()
+        songs = {j.song.title: j for j in store.list(group_id=group.id)}
+        for job in (songs["Song 2"], songs["Song 4"]):
+            folder = paths.temp_dir / str(job.id)
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "Carly Rae Jepsen - Song.webm.part").write_bytes(b"half of the other upload")
+        assert manager.retry(songs["Song 2"].id) is not None
+        assert (paths.temp_dir / str(songs["Song 2"].id)).exists()
+        manager.relink(songs["Song 4"].id, "https://youtu.be/abcdefghijk")
+        assert not (paths.temp_dir / str(songs["Song 4"].id)).exists()
+    finally:
+        manager.stop()
+
+
+def test_a_cancelled_run_keeps_what_was_not_found_and_stays_while_a_song_is_tried(
+    store, config, paths
+):
+    from vidpull import history
+
+    block = threading.Event()
+    engine = FakeEngine(block=block)
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.song_engine = PickySongEngine(songs=five_songs(), unfound=("Song 1",))
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert wait_until(engine.started.is_set)  # Song 1 was not found, Song 2 runs
+        assert manager.cancel_group(group.id)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.CANCELLED)
+        songs = {j.song.title: j for j in store.list(group_id=group.id)}
+        assert wait_until(lambda: store.get(songs["Song 2"].id).status == JobStatus.CANCELLED)
+        # looked for and not found: that is what it stays, and it is left to resolve
+        assert store.get(songs["Song 1"].id).status == JobStatus.PENDING
+        assert [one.job.id for one in history.failures(store)] == [songs["Song 1"].id]
+
+        manager.pause()
+        manager.relink(songs["Song 1"].id, "https://youtu.be/abcdefghijk")
+        folder = paths.temp_dir / str(songs["Song 1"].id)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "song.part").write_bytes(b"x")
+        assert manager.clear_finished() == 0  # a song of it is on its way: it stays
+        assert store.get_group(group.id).cleared_at is None and folder.exists()
+        block.set()
+        manager.resume()
+        assert wait_until(lambda: store.get(songs["Song 1"].id).status == JobStatus.DONE)
+        assert store.get_group(group.id).status == GroupStatus.CANCELLED  # it was cancelled
+        assert manager.group_progress(store.get_group(group.id)).tally() == (
+            "1/5 downloaded · 4 cancelled"
+        )
+        assert manager.clear_finished() == 1
+    finally:
+        block.set()
+        manager.stop()
+
+
+def test_a_run_settles_when_its_last_live_song_is_cancelled_or_deleted(store, config, paths):
+    manager, engine, group, _ = a_run_with_trouble(store, config, paths)
+    try:
+        manager.pause()
+        songs = {j.song.title: j for j in store.list(group_id=group.id)}
+        assert manager.retry(songs["Song 2"].id) is not None
+        assert store.get_group(group.id).status == GroupStatus.ACTIVE
+        assert manager.cancel(songs["Song 2"].id)
+        assert store.get_group(group.id).status == GroupStatus.DONE  # nothing of it is live
+        assert store.get_group(group.id).error == "1 not found"
+        assert manager.retry(songs["Song 4"].id) is not None
+        assert store.get_group(group.id).status == GroupStatus.ACTIVE
+        assert manager.delete(songs["Song 4"].id)
+        assert store.get_group(group.id).status == GroupStatus.DONE
+        assert store.get_group(group.id).error == ""
+    finally:
+        manager.stop()
+
+
+def test_a_run_goes_with_its_last_song(store, config, paths):
+    manager, _ = make_manager(store, config, paths, FakeEngine(), workers=1)
+    manager.song_engine = PickySongEngine(songs=five_songs()[:2], unfound=("Song 1", "Song 2"))
+    manager.start()
+    events = []
+    manager.on_group_event = events.append
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        first, second = store.list(group_id=group.id)
+        assert manager.delete(first.id) and store.get_group(group.id) is not None
+        assert manager.delete(second.id) and store.get_group(group.id) is None
+        assert [e.kind for e in events][-1] == "removed"
+    finally:
+        manager.stop()
+
+
+def test_a_song_of_a_playlist_given_a_link_gets_its_album_and_cover(store, config, paths):
+    """The match brings them, and a song whose link came from the user gets no match."""
+    songs = thin_songs()
+    engine = FakeEngine()
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.song_engine = PickySongEngine(
+        songs=songs, unfound=("Song 2", "Song 3"), details={songs[1].url: in_full(songs[1])}
+    )
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "playlist", selection())
+        manager.resolve_group(group.id)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        jobs = {j.song.title: j for j in store.list(group_id=group.id)}
+        asked = list(manager.song_engine.resolved)
+
+        manager.relink(jobs["Song 2"].id, "https://youtu.be/abcdefghijk")
+        assert wait_until(lambda: store.get(jobs["Song 2"].id).status == JobStatus.DONE)
+        assert manager.song_engine.resolved == [*asked, songs[1].url]
+        song = store.get(jobs["Song 2"].id).song
+        assert (song.album, song.date, song.track_number) == ("The Album", "2019-02-11", 7)
+        assert song.cover_url == "https://i.scdn.co/image/cover"
+        assert (song.list_name, song.list_position) == ("Mix", 2)  # where it is in the list
+        assert engine.infos[-1]["album"] == "The Album"
+        logged = [line.message for line in store.job_log(jobs["Song 2"].id)]
+        assert "reading what Spotify says of Carly Rae Jepsen - Song 2" in logged
+
+        # Spotify does not answer: the song comes all the same, with what is known of it
+        manager.song_engine.details_error = "Spotify did not answer in 5 attempts"
+        manager.relink(jobs["Song 3"].id, "https://youtu.be/lmnopqrstuv")
+        assert wait_until(lambda: store.get(jobs["Song 3"].id).status == JobStatus.DONE)
+        assert store.get(jobs["Song 3"].id).song.album == ""
+        logged = [line.message for line in store.job_log(jobs["Song 3"].id)]
+        assert "Spotify did not say more of it: Spotify did not answer in 5 attempts" in logged
+        assert engine.infos[-1]["track"] == "Song 3"
+    finally:
+        manager.stop()
+
+
+def test_a_song_is_not_downloaded_from_a_list(store, config, paths):
+    from vidpull.manager import NOT_ONE_UPLOAD
+
+    manager, engine, group, _ = a_run_with_trouble(store, config, paths)
+    try:
+        songs = {j.song.title: j for j in store.list(group_id=group.id)}
+        link = "https://www.youtube.com/playlist?list=PL1"
+        engine.lists.add(link)
+        before = len(engine.downloads)
+        manager.relink(songs["Song 4"].id, link)
+        assert wait_until(lambda: store.get(songs["Song 4"].id).status == JobStatus.FAILED)
+        assert store.get(songs["Song 4"].id).error == f"{link}: {NOT_ONE_UPLOAD}"
+        assert len(engine.downloads) == before  # not one of its entries was downloaded
+    finally:
+        manager.stop()
+
+
+def test_a_song_that_was_over_at_once_says_nothing_of_the_others(store, config, paths):
+    manager, engine, group, _ = a_run_with_trouble(store, config, paths)
+    try:
+        # five songs ended, each in a few milliseconds: nothing to estimate from
+        assert manager._ended.get(group.id) is None
+        manager._song_ended(group.id, 0.2)
+        assert manager._ended.get(group.id) is None
+        for _ in range(3):
+            manager._song_ended(group.id, 12.0)
+        assert len(manager._ended[group.id]) == 3
+        manager._speeds[group.id] = (5000.0, time.monotonic())
+        songs = {j.song.title: j for j in store.list(group_id=group.id)}
+        manager.pause()
+        manager.resume()
+        manager._song_ended(group.id, 12.0)
+        manager._speeds[group.id] = (5000.0, time.monotonic())
+        manager.pause()
+        manager._ended[group.id] = [1.0, 2.0, 3.0]
+        manager._speeds[group.id] = (5000.0, time.monotonic())
+        # live again for one song: how fast it went hours ago says nothing of that song
+        manager.relink(songs["Song 4"].id, "https://youtu.be/abcdefghijk")
+        assert group.id not in manager._ended and group.id not in manager._speeds
+    finally:
+        manager.stop()
+
+
+def test_what_a_terminal_queued_is_taken_up_by_the_app_that_is_open(store, config, paths):
+    manager, engine, group, _ = a_run_with_trouble(store, config, paths)
+    try:
+        songs = {j.song.title: j for j in store.list(group_id=group.id)}
+        assert manager.take_handed() == 0
+        # `vidpull queue link` in a terminal: another vidpull, on the same database
+        other, _ = make_manager(store, config, paths, FakeEngine(), workers=1)
+        other.relink(songs["Song 4"].id, "https://youtu.be/abcdefghijk")
+        store.hand_over(songs["Song 4"].id)
+        store.hand_over(songs["Song 4"].id)  # said twice, taken once
+        store.hand_over(9999)  # deleted since
+        time.sleep(0.1)
+        assert store.get(songs["Song 4"].id).status == JobStatus.QUEUED  # nobody runs it
+        assert manager.take_handed() == 1 and manager.take_handed() == 0
+        assert wait_until(lambda: store.get(songs["Song 4"].id).status == JobStatus.DONE)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert engine.downloads.count(songs["Song 4"].id) == 1
+    finally:
+        manager.stop()
+    # an app that is started takes up all that is queued, and what was handed is among it
+    store.update(songs["Song 2"].id, status=JobStatus.QUEUED)
+    store.hand_over(songs["Song 2"].id)
+    later, _ = make_manager(store, config, paths, engine, workers=1)
+    later.song_engine = PickySongEngine(songs=five_songs())
+    later.start()
+    try:
+        assert store.take_handed() == []
+        assert wait_until(lambda: store.get(songs["Song 2"].id).status == JobStatus.DONE)
+        assert engine.downloads.count(songs["Song 2"].id) == 1
+    finally:
+        later.stop()

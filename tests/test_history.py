@@ -218,7 +218,7 @@ def test_a_reason_in_few_words():
     assert brief_reason("ERROR: [vimeo] 76979871: Unable to download JSON") == (
         "Unable to download JSON"
     )
-    refused = "YouTube refused the upload (age-restricted, private, removed?)"
+    refused = "YouTube refused the upload (age-restricted or removed?)"
     for said in (  # by 1.3.1, and since 1.4.1
         "YouTube Music did not answer in 4 attempts over 3 min: YT-DLP download error - "
         "https://www.youtube.com/watch?v=w_fFXdS2mDo",
@@ -242,3 +242,12 @@ def test_a_reason_in_few_words():
     assert brief_reason("  two\n lines ") == "two lines"
     assert brief_reason("https://e/only-a-link") == "https://e/only-a-link"
     assert brief_reason("") == ""
+    named = "Mr. Brightside by The Killers: Not available in your country. Try a VPN"
+    assert brief_reason(named) == "Mr. Brightside by The Killers: Not available in your country"
+    assert brief_reason("x" * 5000 + ". Then") == "x" * 600  # what is read of it is bounded
+    hostile = "-http://" * 20000
+    import time
+
+    began = time.perf_counter()
+    brief_reason(hostile)
+    assert time.perf_counter() - began < 0.5

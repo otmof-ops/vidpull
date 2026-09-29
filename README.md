@@ -85,26 +85,31 @@ An album or playlist counts its songs through on its row as it goes, what came o
 them and what did not: `Hevs199099 · 534/676 done · 9 failed`. The **Speed** column is what its
 songs download at (a song is looked for for twenty seconds and transferred in one, so between
 two transfers it is the speed of the last), and **ETA** is when the run will be through, from
-how fast its last thirty songs went.
+how fast its last thirty songs went. From 132 columns on both are in sight whatever the titles
+are; in a narrower terminal the arrow keys scroll to them.
 
 When the run is over, what failed or was not found is in the **Failed** tab (`2`), apart from
-everything that came. A download that is no song of a run is there as soon as it has failed.
+everything that came, in the order of the playlist. A download that is no song of a run is
+there as soon as it has failed. They stay there until they are resolved, also when the list
+is cleared.
 
 | In Failed | Does |
 | --- | --- |
-| `enter`, **Another link** | asks for a link to download that one from instead: any link to the audio or video itself, a YouTube link for instance. A song keeps what it is: the file gets its title, artists, album, track number and cover |
+| `enter`, **Another link** | asks for a link to download that one from instead: any link to one upload of the audio or video itself, a YouTube link for instance. A song keeps what it is: the file gets its title, artists, album, track number and cover, which vidpull asks Spotify for when the playlist said only the name |
 | `r`, **Retry** | tries it again as it is |
-| `d`, **Delete** | takes it off the list for good; its run keeps a line about it in its log |
-| **Retry all**, **Delete all** | the same for everything on the list (**Delete all** asks first) |
+| `d`, **Delete** | deletes it for good, from the history as well; its run keeps a line about it in its log, and a run goes with its last song |
+| **Retry all**, **Delete all** | the same for everything on the list (**Delete all** asks first, and Enter is the no) |
 
 The rest of the list stays where it is while one of them downloads again, and one that fails
-again comes back with the new reason. The tab says how many are left (`Failed (24)`), and so does
-the line at the bottom. In the songs of a run (Enter on its row), `l` gives the selected song
-another link.
+again is back in its place with the new reason. The tab says how many are left (`Failed (24)`),
+and so does the line at the bottom. A run is announced once, when it is over, not again for
+every song of it that is resolved. In the songs of a run (Enter on its row), `l` gives the
+selected song another link.
 
 From the command line: `vidpull queue failed` lists them, `vidpull queue link ID URL` gives one
-another link, `vidpull queue retry ID` tries one again and `vidpull queue rm ID` deletes it.
-`vidpull get` ends a run with the count: `Hevs199099: 652/676 downloaded · 8 failed · 16 not found`.
+another link, `vidpull queue retry ID` tries one again and `vidpull queue rm ID` deletes it. An
+open vidpull takes up what was queued that way within a second. `vidpull get` ends a run with
+the count: `Hevs199099: 652/676 downloaded · 8 failed · 16 not found`.
 
 ### The list and the history
 

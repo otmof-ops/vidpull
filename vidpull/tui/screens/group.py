@@ -9,17 +9,26 @@ from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Static
 
-from vidpull.history import brief_reason
+from vidpull.history import brief_reason, is_unresolved
 from vidpull.manager import DownloadManager
 from vidpull.models import GroupStatus, Job, JobStatus
+from vidpull.procs import redact_url
 from vidpull.store import Store
 from vidpull.tui.screens.link import LinkScreen
 from vidpull.tui.widgets import write_row
 
 COLUMNS = ("#", "Song", "Status", "Progress", "Speed", "ETA", "Match")
-# at 132 columns everything but the match, which is the last for that reason, is in sight
-SONG_WIDTH = 37
-STATUS_WIDTH = 39
+
+
+def song_widths(width: int) -> tuple[int, int]:
+    """How wide a song's name and its status may be in a terminal ``width`` columns wide
+    for everything but the match, which is the last for that reason, to be in sight."""
+    inside = width * 98 // 100 - 6 - 2  # the dialog, its border and padding, the scroll bar
+    rest = inside - (4 + 15 + 10 + 5) - 2 * 6
+    song = max(30, min(48, rest * 49 // 100))
+    return song, max(31, min(40, rest - song))
+
+
 STATUS_STYLE = {
     JobStatus.PENDING: "yellow",
     JobStatus.QUEUED: "dim",
@@ -108,17 +117,18 @@ class GroupScreen(ModalScreen[None]):
             percent = max(0.0, min(100.0, job.progress))
             bar = f"{'█' * int(percent / 10)}{'░' * (10 - int(percent / 10))} {percent:3.0f}%"
         title = job.display_title
+        song_width, status_width = song_widths(self.app.size.width)
         return [
             str(job.song.track_number if job.song and job.song.track_number else index),
-            Text(title if len(title) <= SONG_WIDTH else title[: SONG_WIDTH - 1] + "…"),
+            Text(title if len(title) <= song_width else title[: song_width - 1] + "…"),
             Text(
-                status if len(status) <= STATUS_WIDTH else status[: STATUS_WIDTH - 1] + "…",
+                status if len(status) <= status_width else status[: status_width - 1] + "…",
                 style=STATUS_STYLE.get(job.status, ""),
             ),
             Text(bar),
             Text(_speed(job.speed) if job.status == JobStatus.DOWNLOADING else ""),
             Text(_left(job.eta) if job.status == JobStatus.DOWNLOADING and job.eta else ""),
-            Text(job.matched_url.removeprefix("https://") if job.matched_url else ""),
+            Text(redact_url(job.matched_url).removeprefix("https://") if job.matched_url else ""),
         ]
 
     def _selected_id(self) -> int | None:
@@ -147,6 +157,12 @@ class GroupScreen(ModalScreen[None]):
         job_id = self._selected_id()
         job = self.store.get(job_id) if job_id is not None else None
         if job is None or job.id is None:
+            return
+        if not is_unresolved(job) and job.status != JobStatus.CANCELLED:
+            self.notify(
+                "only a song that failed, was cancelled or was not found takes another link",
+                severity="warning",
+            )
             return
 
         def take(link: str) -> str | None:

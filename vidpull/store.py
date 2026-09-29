@@ -29,6 +29,7 @@ from vidpull.models import (
 
 SCHEMA_VERSION = 5
 LOG_LINES_PER_JOB = 300  # a download's own log is kept with it; this bounds a noisy one
+HANDED_META = "handed_jobs"  # what another vidpull queued for the app, as a JSON list of ids
 
 _GROUPS_TABLE = """
 CREATE TABLE IF NOT EXISTS groups (
@@ -237,6 +238,38 @@ class Store:
                 (key, value),
             )
 
+    def hand_over(self, job_id: int) -> None:
+        """Leave a download for the app: one that is open takes it up within a second,
+        and one that is started takes up everything that is queued anyway."""
+        self._handed(lambda ids: [*ids, job_id] if job_id not in ids else ids)
+
+    def take_handed(self) -> list[int]:
+        """What was left for the app, taken: another app that asks finds nothing."""
+        if not self.get_meta(HANDED_META):
+            return []  # the usual answer, and it costs no write
+        return self._handed(lambda ids: [])
+
+    def _handed(self, change) -> list[int]:  # type: ignore[no-untyped-def]
+        """Read the list and write what ``change`` makes of it, as one step: two
+        vidpulls at it at once do not lose an entry. Returns the list as it was."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT value FROM meta WHERE key = ?", (HANDED_META,)
+                ).fetchone()
+                ids = _ids(row["value"]) if row is not None else []
+                self._conn.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (HANDED_META, json.dumps(change(list(ids)))),
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        return ids
+
     # ------------------------------------------------------------- jobs
     def add(self, job: Job) -> Job:
         job.created_at = job.created_at or utcnow()
@@ -389,6 +422,35 @@ class Store:
             ).fetchall()
         return {str(r["status"]): int(r["n"]) for r in rows}
 
+    def copied_links(self) -> int:
+        """How many links wait on the list for a format to be picked. A song that was not
+        found is pending as well, and is none of them."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM jobs "
+                "WHERE status = ? AND song = '' AND cleared_at IS NULL",
+                (str(JobStatus.PENDING),),
+            ).fetchone()
+        return int(row["n"])
+
+    def unresolved_mark(self) -> tuple[object, ...]:
+        """Changes whenever what failed or was not found may have: how many there are,
+        which, what they say, and how every run stands. Times are not enough to go by:
+        they are written to the second, and a run is over in the second its last song is.
+        """
+        with self._lock:
+            jobs = self._conn.execute(
+                "SELECT COUNT(*) AS n, TOTAL(id) AS ids, MAX(updated_at) AS at, "
+                "TOTAL(LENGTH(error) + LENGTH(phase) + LENGTH(title)) AS said FROM jobs "
+                "WHERE status IN (?, ?)",
+                (str(JobStatus.FAILED), str(JobStatus.PENDING)),
+            ).fetchone()
+            runs = self._conn.execute(
+                "SELECT GROUP_CONCAT(id || ':' || status || ':' || COALESCE(ended_at, '') "
+                "|| ':' || LENGTH(name), ' ') AS stand FROM groups"
+            ).fetchone()
+        return (jobs["n"], jobs["ids"], jobs["at"], jobs["said"], runs["stand"])
+
     # ------------------------------------------------------------ groups
     def add_group(self, group: Group) -> Group:
         group.created_at = group.created_at or utcnow()
@@ -523,6 +585,17 @@ def _encode(column: str, value: object) -> object:
     if column == "is_playlist":
         return 1 if value else 0
     return value
+
+
+def _ids(text: str) -> list[int]:
+    """The ids in a JSON list; whatever else is in it, or in its place, is left out."""
+    try:
+        found = json.loads(text)
+    except ValueError:
+        return []
+    if not isinstance(found, list):
+        return []
+    return [one for one in found if isinstance(one, int) and not isinstance(one, bool)]
 
 
 def _encode_group(column: str, value: object) -> object:

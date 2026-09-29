@@ -137,6 +137,7 @@ class FakeEngine:
         self.files = files
         self.probes: list[tuple[str, bool]] = []
         self.json_probes: list[str] = []
+        self.lists: set[str] = set()  # links that are a playlist, not one upload
         self.downloads: list[int | None] = []
         self.infos: list[dict | None] = []
         self.started = threading.Event()
@@ -156,6 +157,8 @@ class FakeEngine:
         self.json_probes.append(url)
         if self.probe_error:
             raise ProbeError(self.probe_error)
+        if url in self.lists:
+            return {"_type": "playlist", "id": "PL1", "title": "A list", "entries": [{}, {}]}
         return {
             "id": "fake",
             "title": f"Fake {url}",
@@ -224,10 +227,37 @@ class PickySongEngine(FakeSongEngine):
 
     REFUSED = "YouTube refused the upload found for it"
 
-    def __init__(self, *, fails: tuple[str, ...] = (), unfound: tuple[str, ...] = (), **kwargs):
+    def __init__(
+        self,
+        *,
+        fails: tuple[str, ...] = (),
+        unfound: tuple[str, ...] = (),
+        details: dict[str, Song] | None = None,
+        details_error: str | None = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.fails = tuple(fails)
         self.unfound = tuple(unfound)
+        self.details = details or {}  # what Spotify says of a track link asked for alone
+        self.details_error = details_error
+
+    def resolve(
+        self,
+        url: str,
+        cancel: threading.Event | None = None,
+        report: Callable[[str], None] | None = None,
+    ) -> list[Song]:
+        from vidpull.spotdl import ResolveError
+
+        if "/track/" not in url:
+            return super().resolve(url, cancel, report)
+        self.resolved.append(url)
+        if self.details_error:
+            raise ResolveError(self.details_error)
+        if url in self.details:
+            return [Song.from_json(self.details[url].to_json())]
+        return [Song.from_json(s.to_json()) for s in self.songs if s.url == url]
 
     def match(
         self,

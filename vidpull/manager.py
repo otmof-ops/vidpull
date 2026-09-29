@@ -41,6 +41,7 @@ from vidpull.spotdl import (
     SongEngine,
     brief_note,
     is_retry_note,
+    is_spotify_address,
     is_spotify_link,
     tagged_info,
 )
@@ -51,11 +52,16 @@ log = logging.getLogger(__name__)
 
 PROGRESS_THROTTLE_SECONDS = 0.2
 NO_MATCH_PHASE = "no confident match on YouTube Music"
+DETAILS_PHASE = "reading its album and cover"
+NOT_ONE_UPLOAD = "that link is a list, not one upload: give the link of the song itself"
 PAUSED_PHASE = "paused"  # a download the pause interrupted; it goes on from its part
 PAUSE_META = "queue_paused"  # "1" in the job database's meta table while the queue is paused
 ACTIVE = (JobStatus.MATCHING, JobStatus.DOWNLOADING, JobStatus.PROCESSING)
 ETA_SONGS = 30  # a run's estimate goes by its last so many songs
 ETA_MIN_SONGS = 3
+# A song that was over at once, refused or cancelled before anything was done for it,
+# says nothing of how long the others take: three of them made a run's estimate 0:00.
+ETA_WORKED = 1.0
 # A song is looked for for twenty seconds and transferred in one: between the transfers
 # a run's row shows the speed of the last of them, for this long.
 SPEED_KEPT = 60.0
@@ -135,12 +141,32 @@ def _summary(jobs: list[Job]) -> str:
     failed = sum(1 for j in jobs if j.status == JobStatus.FAILED)
     pending = sum(1 for j in jobs if j.status == JobStatus.PENDING)
     skipped = sum(1 for j in jobs if j.skipped)
+    return _summary_of(failed, pending, skipped)
+
+
+def _summary_of(failed: int, pending: int, skipped: int) -> str:
     counted = (
         (f"{failed} failed", failed),
         (f"{pending} not found", pending),
         (f"{skipped} skipped", skipped),
     )
     return ", ".join(note for note, count in counted if count)
+
+
+def _is_over(job: Job) -> bool:
+    """Failed, cancelled, or a song that was looked for and not found."""
+    if job.status in {JobStatus.FAILED, JobStatus.CANCELLED}:
+        return True
+    return job.song is not None and job.status == JobStatus.PENDING
+
+
+def _is_live(job: Job) -> bool:
+    return job.status in {JobStatus.QUEUED, JobStatus.STAGED} or job.status.is_active
+
+
+def _is_thin(song: Song) -> bool:
+    """Whether only the name of it is known, as of a song in a playlist's track list."""
+    return not song.album and not song.cover_url
 
 
 class DownloadManager:
@@ -201,6 +227,7 @@ class DownloadManager:
             requeued = self.store.requeue_stale()
             if requeued:
                 log.info("requeued %d job(s) interrupted by the previous run", requeued)
+            self.store.take_handed()  # what was left for the app is among what is queued
             for job in self.store.list([JobStatus.QUEUED]):
                 if job.id is not None:
                     self._queue.put(job.id)
@@ -213,6 +240,26 @@ class DownloadManager:
             )
             thread.start()
             self._threads.append(thread)
+
+    def take_handed(self) -> int:
+        """Take up what another vidpull queued for this one while it is open: ``vidpull
+        queue link`` and ``vidpull queue retry`` in a terminal. Returns how many."""
+        taken = 0
+        for job_id in self.store.take_handed():
+            job = self.store.get(job_id)
+            if job is None or job.status != JobStatus.QUEUED:
+                continue
+            with self._lock:
+                if job_id in self._cancel or job_id in self._parked:
+                    continue  # it is this manager's already
+            if job.group_id is not None:
+                group = self.store.get_group(job.group_id)
+                if group is not None:
+                    self._emit_group(group)  # the other vidpull made its run live again
+            self._emit(job)
+            self._queue.put(job_id)
+            taken += 1
+        return taken
 
     def halt(self) -> None:
         """Tell everything that runs or waits to let go, and return at once.
@@ -535,6 +582,8 @@ class DownloadManager:
             for job in self.store.list(group_id=group_id):
                 if job.id is None or job.is_terminal:
                     continue
+                if job.song is not None and job.status == JobStatus.PENDING:
+                    continue  # looked for and not found: that is what it stays
                 with self._lock:
                     event = self._cancel.get(job.id)
                     if event is not None:
@@ -621,7 +670,7 @@ class DownloadManager:
         self.cancel_group(group_id)
         for job in self.store.list(group_id=group_id):
             if job.id is not None:
-                self.delete(job.id, delete_files=delete_files)
+                self.delete(job.id, delete_files=delete_files, of_run=True)
         self.store.delete_group(group_id)
         self._emit_group(group, kind="removed")
         return True
@@ -678,7 +727,9 @@ class DownloadManager:
         since = time.monotonic() - marks[-1]  # the song on its way has been at it that long
         return max(0.0, each * left - min(since, each))
 
-    def _song_ended(self, group_id: int) -> None:
+    def _song_ended(self, group_id: int, took: float) -> None:
+        if took < ETA_WORKED:
+            return
         with self._lock:
             self._ended.setdefault(group_id, deque(maxlen=ETA_SONGS)).append(time.monotonic())
 
@@ -726,8 +777,9 @@ class DownloadManager:
         """Before a run ends with failed songs, try those once more, in batches.
 
         Most failures are a service not answering for a few minutes, and by the end of
-        a run that is over. Once per run and session (a restarted app gives a run that
-        was interrupted one more); ``retry_group`` is there for more.
+        a run that is over. Once per run: a run that was through its songs before gets
+        none, what failed in it is the user's to resolve (``retry_group``, ``retry``,
+        ``relink``). A run the app was closed on gets its pass when it is through.
         """
         failed = [j for j in jobs if j.status == JobStatus.FAILED and j.id is not None]
         group = self.store.get_group(group_id)
@@ -842,9 +894,12 @@ class DownloadManager:
         job = self.store.update(job_id, status=JobStatus.CANCELLED, phase="cancelled")
         if job is not None:
             self._emit(job)
+            if job.group_id is not None:
+                self._settle_group(job.group_id)  # it may have been the last one live
         return True
 
-    def delete(self, job_id: int, *, delete_files: bool = False) -> bool:
+    def delete(self, job_id: int, *, delete_files: bool = False, of_run: bool = False) -> bool:
+        """Delete a download. ``of_run``: its whole run is being deleted with it."""
         job = self.store.get(job_id)
         if job is None:
             return False
@@ -855,18 +910,14 @@ class DownloadManager:
         if event is not None:
             event.set()  # the worker finishes the deletion once yt-dlp has stopped
             return True
-        self._finish_delete(job, delete_files)
+        self._finish_delete(job, delete_files, of_run=of_run)
         return True
 
     def retry(self, job_id: int) -> Job | None:
-        job = self.store.get(job_id)
-        if job is None:
-            return None
-        unmatched_song = job.song is not None and job.status == JobStatus.PENDING
-        again = unmatched_song or job.skipped  # a skipped duplicate: download it after all
-        if job.status not in {JobStatus.FAILED, JobStatus.CANCELLED} and not again:
-            return None
-        return self._queue_again(job, "queued again")
+        def again(job: Job) -> bool:
+            return _is_over(job) or job.skipped  # a skipped duplicate: download it after all
+
+        return self._queue_again(job_id, "queued again", again)
 
     def relink(self, job_id: int, link: str) -> Job:
         """Give a download that failed, or a song that was not found, another link to be
@@ -876,16 +927,14 @@ class DownloadManager:
         into the file that comes from the link. Raises ``ValueError``, with words for the
         user, when the download or the link will not do.
         """
+        not_over = "only a download that failed, was cancelled or was not found takes another link"
         job = self.store.get(job_id)
         if job is None or job.id is None:
             raise ValueError("that download is gone")
-        unmatched_song = job.song is not None and job.status == JobStatus.PENDING
-        if job.status not in {JobStatus.FAILED, JobStatus.CANCELLED} and not unmatched_song:
-            raise ValueError(
-                "only a download that failed, was cancelled or was not found takes another link"
-            )
+        if not _is_over(job):
+            raise ValueError(not_over)
         text = link.strip()
-        if is_spotify_link(text):  # first: "spotify:track:…" is one, and does not look like a URL
+        if is_spotify_address(text):  # first: "spotify:track:…" does not look like a URL
             raise ValueError(
                 "Spotify has the song's name, not its sound: give a link to the audio or "
                 "video itself, such as a YouTube link"
@@ -894,30 +943,54 @@ class DownloadManager:
             raise ValueError("that is not a link")
         url = normalize_url(text)
         changes: dict[str, object] = {"matched_url": url} if job.song is not None else {"url": url}
-        queued = self._queue_again(job, f"given another link: {redact_url(url)}", **changes)
-        if queued is None:
-            raise ValueError("that download is gone")
+        queued = self._queue_again(
+            job_id, f"given another link: {redact_url(url)}", _is_over, fresh=True, **changes
+        )
+        if queued is None:  # it changed while the link was looked at
+            raise ValueError(
+                "that download is gone" if self.store.get(job_id) is None else not_over
+            )
         return queued
 
-    def _queue_again(self, job: Job, note: str, **changes: object) -> Job | None:
-        assert job.id is not None
-        updated = self.store.update(
-            job.id,
-            status=JobStatus.QUEUED,
-            error="",
-            phase="",
-            progress=0.0,
-            speed=None,
-            eta=None,
-            worker="",
-            cleared_at=None,  # back on the list
-            **changes,
-        )
-        if updated is None:
-            return None
+    def _queue_again(
+        self,
+        job_id: int,
+        note: str,
+        allowed: Callable[[Job], bool],
+        *,
+        fresh: bool = False,
+        **changes: object,
+    ) -> Job | None:
+        """Queue a download that was over once more; None when it is gone, or not over.
+
+        Under the lock a settling run holds. A song that was queued while its run settled
+        was queued in a run that then said it was done, and the run never said so again.
+        ``fresh``: it comes from somewhere else, so the part of it that is there is of no
+        use: yt-dlp would go on from it with what the other link sends.
+        """
+        with self._stage_lock:
+            job = self.store.get(job_id)
+            if job is None or job.id is None or not allowed(job):
+                return None
+            if fresh:
+                self._cleanup_temp(job.id)
+            updated = self.store.update(
+                job.id,
+                status=JobStatus.QUEUED,
+                error="",
+                phase="",
+                progress=0.0,
+                speed=None,
+                eta=None,
+                worker="",
+                cleared_at=None,  # back on the list
+                **changes,
+            )
+            if updated is None:
+                return None
+            if job.group_id is not None:
+                self._reopen_run(job.group_id)
         self.store.add_log("info", note, job_id=job.id, group_id=job.group_id)
-        if job.group_id is not None:
-            self._reopen_run(job.group_id)
         self._emit(updated)
         self._queue.put(job.id)
         return updated
@@ -930,6 +1003,8 @@ class DownloadManager:
             return
         with self._lock:
             self._retried.add(group_id)  # what failed is the user's to resolve from here on
+            self._ended.pop(group_id, None)  # how fast it went then says nothing of now
+            self._speeds.pop(group_id, None)
         for song in self.store.list(group_id=group_id, cleared=True):
             if song.id is not None:
                 self.store.update(song.id, cleared_at=None)
@@ -954,7 +1029,10 @@ class DownloadManager:
         for group in self.store.list_groups(cleared=False):
             if group.id is None or not group.is_terminal:
                 continue
-            for job in self.store.list(group_id=group.id):
+            songs = self.store.list(group_id=group.id)
+            if any(_is_live(song) for song in songs):
+                continue  # a song of it is tried again: it stays until that one is over
+            for job in songs:
                 if job.id is not None:
                     self._cleanup_temp(job.id)
                     self.store.update(job.id, cleared_at=now)
@@ -1055,6 +1133,7 @@ class DownloadManager:
     def _run(self, job: Job, worker_name: str, cancel: threading.Event) -> None:
         assert job.id is not None
         job_id = job.id
+        started = time.monotonic()
         temp_dir = self.paths.temp_dir / str(job_id)
         temp_dir.mkdir(parents=True, exist_ok=True)
         matching = job.song is not None and not job.matched_url
@@ -1250,7 +1329,7 @@ class DownloadManager:
                 updated = self.store.update(job_id, phase="") or updated
                 self._queue.put(job_id)
         if job.group_id is not None and not waits:
-            self._song_ended(job.group_id)
+            self._song_ended(job.group_id, time.monotonic() - started)
         if updated is not None:
             self._emit(updated)
         if job.group_id is not None:
@@ -1279,16 +1358,52 @@ class DownloadManager:
                 False,
             )
         matched = job.matched_url
+        job_id = job.id
+
+        def waiting(message: str) -> None:
+            on_log("warning", message)
+            noted = self.store.update(job_id, phase=brief_note(message))
+            if noted is not None:
+                self._emit(noted)
+
+        if matched and _is_thin(song) and is_spotify_link(song.url):
+            # The track list of a playlist says a song's name and no more. The match
+            # brings the rest, and this song gets none: its link came from the user.
+            on_log("info", f"reading what Spotify says of {song.display_title}")
+            noted = self.store.update(job_id, status=JobStatus.MATCHING, phase=DETAILS_PHASE)
+            if noted is not None:
+                self._emit(noted)
+            try:
+                said = self.song_engine.resolve(song.url, cancel, waiting)
+            except ResolveCancelled:
+                return job, None, DownloadResult(ok=False, cancelled=True), False
+            except ResolveError as exc:
+                said = []
+                on_log("warning", f"Spotify did not say more of it: {exc}")
+            if cancel.is_set():
+                return job, None, DownloadResult(ok=False, cancelled=True), False
+            full = next((one for one in said if one.url == song.url), None)
+            if full is None and len(said) == 1:
+                full = said[0]
+            if full is None:
+                on_log("warning", "the file gets the title and the artists: no more is known")
+            else:
+                full.list_name, full.list_position = song.list_name, song.list_position
+                song = full
+            updated = self.store.update(
+                job_id,
+                song=song,
+                title=song.display_title,
+                uploader=song.artist,
+                duration=song.duration or job.duration,
+                status=JobStatus.DOWNLOADING,
+                phase="starting",
+            )
+            if updated is not None:
+                job = updated
+                self._emit(job)
         if not matched:
             on_log("info", f"looking for {song.display_title} on YouTube Music")
-            job_id = job.id
-
-            def waiting(message: str) -> None:
-                on_log("warning", message)
-                noted = self.store.update(job_id, phase=brief_note(message))
-                if noted is not None:
-                    self._emit(noted)
-
             try:
                 found = self.song_engine.match(song, cancel, waiting)
             except MatchError as exc:
@@ -1325,29 +1440,60 @@ class DownloadManager:
             raw = self.engine.probe_json(matched)
         except ProbeError as exc:
             return job, None, DownloadResult(ok=False, error=f"{matched}: {exc}"), False
+        if raw.get("_type") == "playlist" or isinstance(raw.get("entries"), list):
+            # every entry would be downloaded, one over the other, under the song's name
+            return job, None, DownloadResult(ok=False, error=f"{matched}: {NOT_ONE_UPLOAD}"), False
         return job, tagged_info(raw, song), None, False
 
     # -------------------------------------------------------------- helpers
-    def _finish_delete(self, job: Job, delete_files: bool) -> None:
+    def _finish_delete(self, job: Job, delete_files: bool, *, of_run: bool = False) -> None:
         assert job.id is not None
         if delete_files:
             self._remove_files(job)
         self._cleanup_temp(job.id)
         self.store.delete(job.id)
         self._emit(job, kind="removed")
-        if job.group_id is not None:
+        if job.group_id is not None and not of_run:
+            if self._emptied(job.group_id):
+                return
             self._count_again(job.group_id)
+            self._settle_group(job.group_id)  # it may have been the last one live
+
+    def _emptied(self, group_id: int) -> bool:
+        """The last song of a run was deleted: a run of no songs goes with it."""
+        with self._stage_lock:
+            group = self.store.get_group(group_id)
+            if group is None or group.status == GroupStatus.RESOLVING:
+                return False
+            counts, _, _ = self.store.group_summary(group_id)
+            if sum(counts.values()):
+                return False
+            timer = self._stage_timers.pop(group_id, None)
+            if timer is not None:
+                timer.cancel()
+            self.store.delete_group(group_id)
+        self._emit_group(group, kind="removed")
+        return True
 
     def _count_again(self, group_id: int) -> None:
-        """A song of a run that is over was deleted: the run says how it ended without it."""
-        group = self.store.get_group(group_id)
-        if group is None or group.status != GroupStatus.DONE:
-            return
-        summary = _summary(self.store.list(group_id=group_id))
-        if summary != group.error:
+        """A song of a run that is over was deleted: the run says how it ended without it.
+
+        From one query, not from its songs: deleting what failed in a long playlist
+        read all of its songs once for each of them.
+        """
+        with self._stage_lock:
+            group = self.store.get_group(group_id)
+            if group is None or group.status != GroupStatus.DONE:
+                return
+            counts, skipped, _ = self.store.group_summary(group_id)
+            summary = _summary_of(
+                counts.get(str(JobStatus.FAILED), 0), counts.get(str(JobStatus.PENDING), 0), skipped
+            )
+            if summary == group.error:
+                return
             updated = self.store.update_group(group_id, error=summary)
-            if updated is not None:
-                self._emit_group(updated)
+        if updated is not None:
+            self._emit_group(updated)
 
     def _remove_files(self, job: Job) -> list[str]:
         """Delete exactly the files this job recorded, then any empty folders they leave."""

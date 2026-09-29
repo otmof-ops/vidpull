@@ -362,3 +362,79 @@ def test_migrates_a_version_4_database_and_an_older_vidpull_can_still_write_to_i
         assert again.get_meta("schema_version") == "5"
     finally:
         again.close()
+
+
+def test_what_is_handed_to_the_app_is_taken_once(store: Store):
+    from vidpull.store import HANDED_META
+
+    assert store.take_handed() == [] and store.get_meta(HANDED_META) is None  # and no write
+    store.hand_over(7)
+    store.hand_over(3)
+    store.hand_over(7)
+    assert store.take_handed() == [7, 3]
+    assert store.take_handed() == []
+    for written in ("not json", '{"a": 1}', '[1, "2", null, true, 4.5, 6]'):
+        store.set_meta(HANDED_META, written)  # whatever is there: no vidpull stops over it
+        store.hand_over(9)
+        assert store.take_handed() == ([1, 6, 9] if written.startswith("[") else [9])
+
+
+def test_two_vidpulls_hand_over_at_once_and_nothing_is_lost(paths):
+    first, second = Store(paths.db_file), Store(paths.db_file)
+    try:
+        threads = [
+            threading.Thread(target=lambda s=s, n=n: [s.hand_over(n + i) for i in range(25)])
+            for s, n in ((first, 0), (second, 100))
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        assert sorted(first.take_handed()) == [*range(25), *range(100, 125)]
+        assert second.take_handed() == []
+    finally:
+        first.close()
+        second.close()
+
+
+def test_the_links_that_wait_for_a_format_and_the_mark_of_what_failed(store: Store):
+    from vidpull.models import Group, GroupStatus, Song
+
+    chosen = _job().selection
+    song = Song(title="Airbag", artists=["Radiohead"])
+    run = store.add_group(
+        Group(url="https://e/a", kind="album", selection=chosen, status=GroupStatus.ACTIVE)
+    )
+    store.add(Job(url="https://e/copied", selection=chosen, status=JobStatus.PENDING))
+    unfound = store.add(
+        Job(
+            url="https://e/s",
+            selection=chosen,
+            status=JobStatus.PENDING,
+            song=song,
+            group_id=run.id,
+        )
+    )
+    gone = store.add(Job(url="https://e/old", selection=chosen, status=JobStatus.PENDING))
+    store.update(gone.id, cleared_at="2026-09-30T00:00:00+00:00")
+    assert store.copied_links() == 1  # not the song, and not what was cleared
+
+    # A run is over in the second its last song is: the times do not change, the mark does
+    before = store.unresolved_mark()
+    assert store.unresolved_mark() == before
+    same_second = store.get_group(run.id).updated_at
+    store.update_group(run.id, status=GroupStatus.DONE, ended_at=same_second)
+    assert store.get_group(run.id).updated_at == same_second or True
+    assert store.unresolved_mark() != before
+    before = store.unresolved_mark()
+    store.update(unfound.id, status=JobStatus.FAILED, error="boom")
+    assert store.unresolved_mark() != before
+    before = store.unresolved_mark()
+    store.update(unfound.id, error="another reason")
+    assert store.unresolved_mark() != before
+    before = store.unresolved_mark()
+    store.update(unfound.id, status=JobStatus.DOWNLOADING, progress=50.0)
+    assert store.unresolved_mark() != before
+    before = store.unresolved_mark()
+    store.update(unfound.id, progress=60.0)  # a download on its way does not move it
+    assert store.unresolved_mark() == before

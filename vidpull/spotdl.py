@@ -148,6 +148,23 @@ def is_spotify_link(text: str) -> bool:
     return spotify_kind(text) is not None
 
 
+_SPOTIFY_HOSTS = ("spotify.com", "spotify.link", "spotify.app.link")
+
+
+def is_spotify_address(text: str) -> bool:
+    """Whether ``text`` points at Spotify at all: a song, an artist, an episode, a short
+    link. None of them is a place a song can be downloaded from."""
+    token = text.strip()
+    if is_spotify_link(token) or token.lower().startswith("spotify:"):
+        return True
+    try:
+        parts = urllib.parse.urlsplit(token if "://" in token else f"https://{token}")
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == name or host.endswith(f".{name}") for name in _SPOTIFY_HOSTS)
+
+
 def normalize_spotify_link(text: str) -> str:
     """The canonical ``https://open.spotify.com/<kind>/<id>`` form, tracking parameters dropped."""
     token = text.strip()

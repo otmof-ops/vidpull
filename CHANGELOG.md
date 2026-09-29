@@ -17,6 +17,11 @@ All notable changes to vidpull are recorded here. The format follows
   cover; **Retry** (`r`) tries it again; **Delete** (`d`) takes it off the list. **Retry all**
   and **Delete all** do it for the whole list. `l` does the same for a song in the songs of a
   run. From a terminal: `vidpull queue failed` and `vidpull queue link ID URL`.
+- A song of a playlist that is given a link gets its album, date and cover from Spotify: the
+  track list of a playlist says only the name, and the match that brings the rest is not made
+  for a link that came from you.
+- What `vidpull queue link` and `vidpull queue retry` queue in a terminal is taken up by an
+  open vidpull within a second. It used to wait for the next start.
 - `1`, `2` and `3` switch between the Downloads, the Failed and the History tab.
 
 ### Fixed
@@ -36,6 +41,15 @@ All notable changes to vidpull are recorded here. The format follows
   were a copied link waiting for a format.
 - `vidpull queue retry` on a song of a run that was over left the run as it was; the run is
   now live again with the song and says how it ended anew.
+- A run whose last live song was cancelled or deleted stayed "active" until vidpull was
+  started again.
+- Cancelling a run made its songs that were not found "cancelled"; they stay what they are.
+- **Clear list** took a cancelled run off the list while a song of it was downloading again,
+  and the folder that download worked in with it.
+- A link with a line break in it was taken for one link; `…/Song_(album)` lost its bracket.
+- In a terminal of 132 columns a long title pushed the speed and the ETA out of sight. The
+  title, the format and the status share what room there is.
+- `vidpull queue history --json` answered with a sentence when there was no database yet.
 
 ### Changed
 
