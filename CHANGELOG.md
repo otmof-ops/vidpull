@@ -6,6 +6,8 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-09-29
+
 ### Fixed
 
 - A song whose upload YouTube will not let be read (age-restricted, private, removed) was
