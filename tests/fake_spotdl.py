@@ -6,7 +6,8 @@ entries are ignored, and so is the ``spotdl_tracklist.py`` path vidpull runs for
 track list (recorded as ``script`` in last-args.json). A ``mode`` file next to this
 script selects the behaviour: ``ok`` (default), ``nomatch`` (``save --preload``
 prints a null entry and exits 0), ``error`` (``save`` fails), ``noresults`` (no match the
-way spotDL 4.5 reports it: a logged exception, then the null entry), ``hidden`` (``save`` fails with an
+way spotDL 4.5 reports it: a logged exception, then the null entry), ``refused`` (an
+upload was found that yt-dlp could not read), ``hidden`` (``save`` fails with an
 answer no retry changes), ``boxed`` (``save`` fails the
 way spotDL itself does: a boxed traceback on stdout), ``searchfail`` (``save --preload``
 logs that its search raised and prints a null entry), ``hang``, or ``flaky:N`` (the first
@@ -107,6 +108,12 @@ def main(argv: list[str]) -> int:
             # how spotDL 4.5 reports a search that every result was filtered out of
             print("Carly Rae Jepsen - Cut To The Feeling generated an exception: No results")
             print("found for song: Carly Rae Jepsen - Cut To The Feeling")
+            print(json.dumps([None], indent=4))
+            return 0
+        if mode() == "refused":
+            # an upload was found, and yt-dlp could not read it (age-restricted, removed)
+            print("Carly Rae Jepsen - Cut To The Feeling generated an exception: YT-DLP")
+            print("download error - https://www.youtube.com/watch?v=Jg4bxoyywyA")
             print(json.dumps([None], indent=4))
             return 0
         if mode() == "searchfail":

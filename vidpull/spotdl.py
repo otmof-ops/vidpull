@@ -61,6 +61,7 @@ KILL_GRACE_SECONDS = 5.0
 # second, third, ... attempt: a track list is tried for about three minutes, a song for one.
 RESOLVE_RETRY_DELAYS: tuple[float, ...] = (5.0, 15.0, 45.0, 90.0)
 MATCH_RETRY_DELAYS: tuple[float, ...] = (5.0, 15.0, 45.0)
+REFUSED_ATTEMPTS = 2  # for an upload YouTube will not let be read: waiting changes little
 # no new attempt starts later than this after the first: attempts that hang until their
 # timeout would otherwise stretch five of them over a quarter of an hour
 RETRY_DEADLINE = 360.0
@@ -447,7 +448,9 @@ class SpotdlEngine:
             if cancel is not None and cancel.is_set():
                 return None
             spent = time.monotonic() - started
-            if number >= tries or spent + self._match_delays[number - 1] > RETRY_DEADLINE:
+            # an upload YouTube refuses is asked for once more, in case it was the network
+            last = min(tries, REFUSED_ATTEMPTS) if is_refused(reason) else tries
+            if number >= last or spent + self._match_delays[number - 1] > RETRY_DEADLINE:
                 raise MatchError(_gave_up(reason, number, spent))
             delay = self._match_delays[number - 1]
             number += 1
@@ -564,6 +567,12 @@ def is_no_match(reason: str) -> bool:
     return "no results found" in reason.lower()
 
 
+def is_refused(reason: str) -> bool:
+    """Whether spotDL found an upload and YouTube would not let it be read: age-restricted,
+    private, removed. spotDL says the same when the network failed, so it is not final."""
+    return "yt-dlp download error" in reason.lower()
+
+
 def is_final(reason: str) -> bool:
     """Whether another attempt would get the same answer."""
     low = reason.lower()
@@ -584,6 +593,8 @@ def _who(reason: str) -> str:
     low = reason.lower()
     if low.startswith("no answer within"):
         return "spotDL did not answer"
+    if is_refused(reason):
+        return "YouTube refused the upload found for it"
     if "youtube" in low or "ytmusic" in low:
         return "YouTube Music did not answer"
     if any(sign in low for sign in _SPOTIFY_SIGNS):
@@ -602,7 +613,8 @@ def _retry_note(reason: str, delay: float, number: int, tries: int) -> str:
 
 def _gave_up(reason: str, tries: int, seconds: float) -> str:
     count = f"{tries} attempts" if tries != 1 else "1 attempt"
-    return f"{_who(reason)} in {count} over {_span(seconds)}: {reason}"
+    hint = " (age-restricted, private or removed?)" if is_refused(reason) else ""
+    return f"{_who(reason)} in {count} over {_span(seconds)}: {reason}{hint}"
 
 
 _NOTE = re.compile(r"^(?P<who>[^,:]+), trying again .*?\(attempt (?P<number>\d+) of (?P<of>\d+)\)")
