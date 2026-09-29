@@ -1087,17 +1087,23 @@ def test_pause_and_resume_with_the_button_and_the_key(config, paths, store, vide
         app.manager.stop()
 
 
-def test_a_space_typed_into_the_link_box_is_a_space(config, paths, store, video_info):
+def test_space_in_the_link_box(config, paths, store, video_info):
+    """The box has the focus when vidpull opens. Empty, space is the pause there too; once
+    something is typed, a space is a space."""
     app = make_app(config, paths, store, FakeEngine(info=video_info))
 
     async def flow():
         async with app.run_test(size=(132, 40)) as pilot:
             box = app.query_one("#url", Input)
-            box.focus()
+            assert app.focused is box and box.value == ""
+            await pilot.press("space")
+            assert app.manager.paused and box.value == ""
+            assert store.get_meta("queue_paused") == "1"
+            await pilot.press("space")
+            assert not app.manager.paused and box.value == ""
             for key in ("a", "space", "b"):
                 await pilot.press(key)
             assert box.value == "a b" and not app.manager.paused
-            assert store.get_meta("queue_paused") is None
 
     run(flow())
     app.manager.stop()

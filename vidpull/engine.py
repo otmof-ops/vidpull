@@ -554,11 +554,13 @@ class YtDlpEngine:
         for thread in threads:
             thread.join(timeout=5)
 
-        if returncode == 0 and not cancel.is_set():
+        if returncode == 0:
             for left in _finished_files(staging):
                 place(str(left))  # what yt-dlp wrote next to the download and did not report
         safe_files = _files_inside(files, download_dir, on_log)
-        if cancel.is_set():
+        # a cancel or a pause that came as yt-dlp ended with everything done changes nothing:
+        # taken for a cancel, the download would be made a second time
+        if cancel.is_set() and returncode != 0:
             return DownloadResult(ok=False, cancelled=True, files=safe_files, returncode=returncode)
         if returncode == 0:
             return DownloadResult(

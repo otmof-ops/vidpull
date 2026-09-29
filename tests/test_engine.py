@@ -264,3 +264,25 @@ def test_moving_what_yt_dlp_made_into_the_download_folder(paths, tmp_path):
         f"ignoring a file written outside the download dir: {staging / '..' / '..' / 'escape.mp4'}",
     ]
     assert _finished_files(paths.temp_dir / "nowhere") == []
+
+
+def test_a_cancel_that_comes_as_the_download_ends_changes_nothing(fake_engine, paths):
+    """yt-dlp ended with everything done; taken for cancelled, the download would be made a
+    second time when the queue is resumed."""
+    cancel = threading.Event()
+    seen = []
+
+    def on_progress(event):
+        seen.append(event.status)
+        if event.status == "processing":
+            cancel.set()  # as late as that: the fake ends with 0 right after
+
+    result = fake_engine.download(
+        _job(), paths.home / "dl", paths.temp_dir / "7", on_progress, cancel, lambda l, m: None
+    )
+    assert cancel.is_set() and "processing" in seen
+    if result.returncode == 0:
+        assert result.ok and not result.cancelled
+        assert result.files == [str((paths.home / "dl" / "clip.mp4").resolve())]
+    else:  # the interrupt got there first: then it is a cancel
+        assert result.cancelled

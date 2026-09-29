@@ -1009,7 +1009,7 @@ def test_a_paused_run_releases_no_batch(store, config, paths):
         manager.stop()
 
 
-def test_a_run_whose_batch_ended_while_paused_goes_on_at_resume(store, config, paths):
+def test_a_run_added_while_paused_waits_and_goes_on_at_resume(store, config, paths):
     config.stage_size = 1
     songs = two_songs()
     engine = FakeEngine()
@@ -1025,6 +1025,127 @@ def test_a_run_whose_batch_ended_while_paused_goes_on_at_resume(store, config, p
         assert manager.resume() == 1
         assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
         assert len(engine.downloads) == 2
+    finally:
+        manager.stop()
+
+
+class Unstoppable(FakeEngine):
+    """An engine whose download, once it runs, comes to its end whatever is asked of it."""
+
+    def download(self, job, download_dir, temp_dir, on_progress, cancel, on_log, *, info=None):
+        self.downloads.append(job.id)
+        self.started.set()
+        assert self.block.wait(5)
+        download_dir.mkdir(parents=True, exist_ok=True)
+        (download_dir / f"{job.id}.mp3").write_bytes(b"x")
+        return DownloadResult(ok=True, files=[str(download_dir / f"{job.id}.mp3")], returncode=0)
+
+
+def test_a_batch_that_ends_while_paused_is_followed_by_the_next_at_resume(store, config, paths):
+    config.stage_size = 1
+    block = threading.Event()
+    engine = Unstoppable(block=block)
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.song_engine = FakeSongEngine(songs=two_songs())
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert engine.started.wait(5)
+        manager.pause()
+        block.set()  # the song in flight finishes all the same: its batch is over
+        first, second = store.list(group_id=group.id)
+        assert wait_until(lambda: store.get(first.id).status == JobStatus.DONE)
+        assert not wait_until(
+            lambda: store.get(second.id).status != JobStatus.STAGED, timeout=0.4
+        )  # and the next one is not released
+        assert store.get_group(group.id).status == GroupStatus.ACTIVE
+        assert manager.resume() == 0  # nothing was handed out; a batch was held back
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert len(engine.downloads) == 2
+        messages = [line.message for line in store.group_log(group.id)]
+        assert messages.count("released the next 1 song(s)") == 1
+    finally:
+        block.set()
+        manager.stop()
+
+
+def test_a_pause_during_the_rest_between_batches(store, config, paths):
+    config.stage_size = 1
+    config.stage_pause = 30  # far longer than the test: the timer must not be what releases
+    engine = FakeEngine()
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.song_engine = FakeSongEngine(songs=two_songs())
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        first, second = store.list(group_id=group.id)
+        assert wait_until(lambda: store.get(first.id).status == JobStatus.DONE)
+        assert wait_until(lambda: manager.group_progress(store.get_group(group.id)).resting)
+        manager.pause()
+        assert not manager.group_progress(store.get_group(group.id)).resting  # no timer runs
+        config.stage_pause = 0
+        manager.resume()
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert store.get(second.id).status == JobStatus.DONE
+    finally:
+        manager.stop()
+
+
+def test_resume_hands_out_only_what_this_manager_was_handed(store, config, paths):
+    """Another vidpull's queued downloads are its own: a `vidpull get` running in a terminal."""
+    engine = FakeEngine()
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.pause()
+    manager.start()
+    try:
+        mine = manager.enqueue("https://e/mine", selection())
+        assert wait_until(lambda: mine.id in manager._parked)
+        theirs = store.add(Job(url="https://e/theirs", selection=selection()))  # not handed over
+        assert manager.resume() == 1
+        assert wait_until(lambda: store.get(mine.id).status == JobStatus.DONE)
+        assert not wait_until(lambda: len(engine.downloads) > 1, timeout=0.3)
+        assert store.get(theirs.id).status == JobStatus.QUEUED
+    finally:
+        manager.stop()
+
+
+def test_a_manager_for_one_command_leaves_the_queue_alone(store, config, paths):
+    queued = store.add(Job(url="https://e/the-apps", selection=selection()))
+    engine = FakeEngine()
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.start(resume=False)  # as `vidpull get` does
+    try:
+        own = manager.enqueue("https://e/own", selection())
+        assert wait_until(lambda: store.get(own.id).status == JobStatus.DONE)
+        assert engine.downloads == [own.id] and store.get(queued.id).status == JobStatus.QUEUED
+    finally:
+        manager.stop()
+
+
+def test_a_claim_is_let_go_of_when_the_job_cannot_be_read(store, config, paths, monkeypatch):
+    engine = FakeEngine()
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    job = store.add(Job(url="https://e/v", selection=selection()))
+    real = store.get
+    failing = {"left": 1}
+
+    def get(job_id):
+        if failing["left"]:
+            failing["left"] -= 1
+            raise OSError("database is locked")
+        return real(job_id)
+
+    monkeypatch.setattr(store, "get", get)
+    manager.start(resume=False)
+    try:
+        manager._queue.put(job.id)
+        assert wait_until(lambda: failing["left"] == 0)
+        assert wait_until(lambda: manager.active_count == 0)  # the claim did not stay behind
+        assert manager.retry(job.id) is None  # it is queued, not failed
+        manager._queue.put(job.id)  # and it can be handed out again
+        assert wait_until(lambda: real(job.id).status == JobStatus.DONE)
     finally:
         manager.stop()
 

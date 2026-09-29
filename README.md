@@ -58,7 +58,7 @@ open the folder.
 | --- | --- |
 | `a` / `v` | focus the link box / paste from the clipboard (any terminal paste works too) |
 | `c` / `r` / `d` | cancel, retry, delete the selected download (delete can take the files with it) |
-| `space` | pause the queue, and resume it (there is a **Pause** button too) |
+| `space` | pause the queue, and resume it (there is a **Pause** button too; in the link box it is the pause while the box is empty) |
 | `o` | open the download folder |
 | `f` | clear the list: everything finished moves to History (there is a **Clear list** button too) |
 | `h` | the History tab, and back (`esc` returns to the list as well) |

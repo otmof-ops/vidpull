@@ -444,13 +444,24 @@ def test_queue_pause_and_resume(capsys, paths):
     assert "paused" not in listed and "queued" in listed and "staged" in listed
 
 
-def test_get_is_never_paused(monkeypatch, capsys, paths, video_info):
-    """The pause is the app's queue; a download asked for on the command line runs."""
+def test_get_is_never_paused_and_leaves_the_apps_queue_alone(
+    monkeypatch, capsys, paths, video_info
+):
+    """The pause is the app's queue; a download asked for on the command line runs, and
+    runs alone: what waits in the app's queue is the app's."""
     engine = FakeEngine(info=video_info)
     monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: engine)
+    store = Store(paths.db_file)
+    chosen = Selection(SelectionKind.PRESET, "best", "Best")
+    waiting = store.add(Job(url="https://vimeo.com/1", selection=chosen, title="The app's"))
+    store.close()
     assert cli.main(["queue", "pause"]) == 0
     assert cli.main(["get", "https://www.youtube.com/watch?v=aqz-KE-bpKQ", "-q", "720p"]) == 0
     assert "saved" in capsys.readouterr().out and len(engine.downloads) == 1
+    store = Store(paths.db_file)
+    assert store.get(waiting.id).status == cli.JobStatus.QUEUED
+    assert engine.downloads != [waiting.id]
+    store.close()
 
 
 def test_update_log_command(capsys, paths):
