@@ -47,6 +47,8 @@ log = logging.getLogger(__name__)
 
 PROGRESS_THROTTLE_SECONDS = 0.2
 NO_MATCH_PHASE = "no confident match on YouTube Music"
+PAUSED_PHASE = "paused"  # a download the pause interrupted; it goes on from its part
+PAUSE_META = "queue_paused"  # "1" in the job database's meta table while the queue is paused
 EventHandler = Callable[[JobEvent], None]
 GroupEventHandler = Callable[[GroupEvent], None]
 
@@ -124,9 +126,13 @@ class DownloadManager:
         self._resolving: dict[int, threading.Event] = {}
         self._retried: set[int] = set()  # runs whose failed songs had their second pass
         self._called_off: set[int] = set()  # jobs the user cancelled, not the shutdown
+        self._held: set[int] = set()  # jobs the pause interrupted
+        self._parked: set[int] = set()  # jobs this manager was handed while paused
+        self._waiting_runs: set[int] = set()  # runs whose next batch the pause held back
         self._stage_timers: dict[int, threading.Timer] = {}
         self._stage_lock = threading.RLock()
         self._stopping = threading.Event()
+        self._paused = threading.Event()  # nothing starts; what ran went back to the queue
         self._started = False
         self._released = False  # the workers were told to end
 
@@ -137,15 +143,18 @@ class DownloadManager:
         self._started = True
         self._released = False
         if resume:
+            # the app's manager takes up what the database holds. One that was started for
+            # a command's own downloads (`vidpull get`) leaves the app's queue alone: it
+            # may be paused, or the app may be running it this minute
             requeued = self.store.requeue_stale()
             if requeued:
                 log.info("requeued %d job(s) interrupted by the previous run", requeued)
-        for job in self.store.list([JobStatus.QUEUED]):
-            if job.id is not None:
-                self._queue.put(job.id)
-        for group in self.store.list_groups():
-            if group.status == GroupStatus.ACTIVE and group.id is not None:
-                self._settle_group(group.id)  # releases the next batch after a restart
+            for job in self.store.list([JobStatus.QUEUED]):
+                if job.id is not None:
+                    self._queue.put(job.id)
+            for group in self.store.list_groups():
+                if group.status == GroupStatus.ACTIVE and group.id is not None:
+                    self._settle_group(group.id)  # releases the next batch after a restart
         for index in range(self._worker_count):
             thread = threading.Thread(
                 target=self._worker, name=f"vidpull-worker-{index + 1}", daemon=True
@@ -182,6 +191,59 @@ class DownloadManager:
                 thread.join(max(0.0, deadline - time.monotonic()))
         self._threads.clear()
         self._started = False
+
+    # ---------------------------------------------------------------- pause
+    @property
+    def paused(self) -> bool:
+        return self._paused.is_set()
+
+    def pause(self) -> int:
+        """Stop downloading until ``resume``; returns how many downloads were interrupted.
+
+        Nothing new starts, no batch is released, and what is running is put back in the
+        queue: a download goes on from the part it had when the queue is resumed. A track
+        list being fetched is left to arrive; its songs wait like the rest.
+        """
+        self._paused.set()
+        with self._lock:
+            running = [(n, event) for n, event in self._cancel.items() if not event.is_set()]
+            for job_id, event in running:
+                self._held.add(job_id)
+                event.set()
+        with self._stage_lock:
+            for group_id, timer in self._stage_timers.items():
+                timer.cancel()
+                self._waiting_runs.add(group_id)
+            self._stage_timers.clear()
+        return len(running)
+
+    def resume(self) -> int:
+        """Go on after ``pause``; returns how many downloads are queued again."""
+        with self._lock:
+            if not self._paused.is_set():
+                return 0
+            self._paused.clear()
+            parked, self._parked = self._parked, set()
+        with self._stage_lock:
+            runs, self._waiting_runs = self._waiting_runs, set()
+        if self._stopping.is_set():
+            return 0
+        queued = 0
+        # only what this manager was handed: another vidpull's queued downloads are its own
+        for job_id in sorted(parked):
+            job = self.store.get(job_id)
+            if job is None or job.status != JobStatus.QUEUED:
+                continue  # cancelled or deleted while it waited
+            if job.phase == PAUSED_PHASE:
+                job = self.store.update(job_id, phase="") or job
+                self._emit(job)
+            if job.group_id is not None:
+                runs.add(job.group_id)
+            self._queue.put(job_id)
+            queued += 1
+        for group_id in sorted(runs):
+            self._settle_group(group_id)  # releases the batch that was held back
+        return queued
 
     # ------------------------------------------------------------- queries
     @property
@@ -616,6 +678,10 @@ class DownloadManager:
 
     def _schedule_stage(self, group_id: int) -> None:
         """Release the next batch now, or after ``stage_pause`` seconds."""
+        if self._paused.is_set():
+            with self._stage_lock:
+                self._waiting_runs.add(group_id)
+            return  # resume settles the run again, and the batch is released then
         pause = self.config.stage_pause
         if pause <= 0 or self._stopping.is_set():
             self._release_stage(group_id)
@@ -634,7 +700,9 @@ class DownloadManager:
     def _release_stage(self, group_id: int) -> None:
         with self._stage_lock:
             self._stage_timers.pop(group_id, None)
-            if self._stopping.is_set():
+            if self._paused.is_set():
+                self._waiting_runs.add(group_id)
+            if self._stopping.is_set() or self._paused.is_set():
                 return
             group = self.store.get_group(group_id)
             if group is None or group.status != GroupStatus.ACTIVE:
@@ -785,14 +853,38 @@ class DownloadManager:
             item = self._queue.get()
             if item is None:
                 break
-            job = self.store.get(item)
-            if job is None or job.status != JobStatus.QUEUED or job.id is None:
-                continue
+            cancel = threading.Event()
+            with self._lock:
+                if self._paused.is_set():
+                    self._parked.add(item)  # it stays queued; resume hands it out again
+                    continue
+                if item in self._cancel:
+                    continue  # handed out twice: it is running
+                self._cancel[item] = cancel  # claimed, under the lock
+            job = None
             try:
-                self._run(job, name)
+                job = self.store.get(item)
+                if job is None or job.status != JobStatus.QUEUED or job.id is None:
+                    self._unclaim(item, job)
+                    continue
+                self._run(job, name, cancel)
             except Exception:  # a worker must never die
-                log.exception("job %s crashed the worker", job.id)
-                self._crashed(job)
+                log.exception("job %s crashed the worker", item)
+                if job is not None and job.id is not None:
+                    self._crashed(job)
+                else:
+                    self._unclaim(item, None)
+
+    def _unclaim(self, job_id: int, job: Job | None) -> None:
+        """Let go of a job that was claimed and is not run after all: it was cancelled or
+        deleted in between. A delete that found the claim is carried out here."""
+        with self._lock:
+            self._cancel.pop(job_id, None)
+            delete_files = self._delete_after.pop(job_id, None)
+            self._called_off.discard(job_id)
+            self._held.discard(job_id)
+        if delete_files is not None and job is not None:
+            self._finish_delete(job, delete_files)
 
     def _crashed(self, job: Job) -> None:
         """Record a job whose run raised, and let its run move on: a run waits for every
@@ -801,6 +893,8 @@ class DownloadManager:
         with self._lock:
             self._cancel.pop(job.id, None)
             self._delete_after.pop(job.id, None)
+            self._called_off.discard(job.id)
+            self._held.discard(job.id)
         try:
             failed = self.store.update(
                 job.id,
@@ -817,12 +911,9 @@ class DownloadManager:
         except Exception:
             log.exception("job %s could not be recorded as failed", job.id)
 
-    def _run(self, job: Job, worker_name: str) -> None:
+    def _run(self, job: Job, worker_name: str, cancel: threading.Event) -> None:
         assert job.id is not None
         job_id = job.id
-        cancel = threading.Event()
-        with self._lock:
-            self._cancel[job_id] = cancel
         temp_dir = self.paths.temp_dir / str(job_id)
         temp_dir.mkdir(parents=True, exist_ok=True)
         matching = job.song is not None and not job.matched_url
@@ -922,6 +1013,9 @@ class DownloadManager:
                 delete_files = self._delete_after.pop(job_id, None)
                 called_off = job_id in self._called_off
                 self._called_off.discard(job_id)
+                held = job_id in self._held
+                self._held.discard(job_id)
+        waits = False  # the pause stopped it: it goes back to the queue
 
         if unmatched:
             # back to pending: the user can retry later or hand the job a YouTube link
@@ -935,12 +1029,17 @@ class DownloadManager:
             }
             self._cleanup_temp(job_id)
         elif (
-            result.cancelled and self._stopping.is_set() and delete_files is None and not called_off
+            result.cancelled
+            and delete_files is None
+            and not called_off
+            and (self._stopping.is_set() or held)
         ):
-            # shutting down, not a user cancel: leave it queued so the next run resumes it
+            # shutting down or paused, not a user cancel: it stays queued, and goes on from
+            # the part it has
+            waits = not self._stopping.is_set()
             fields = {
                 "status": JobStatus.QUEUED,
-                "phase": "interrupted",
+                "phase": "interrupted" if self._stopping.is_set() else PAUSED_PHASE,
                 "speed": None,
                 "eta": None,
                 "worker": "",
@@ -978,6 +1077,16 @@ class DownloadManager:
         if delete_files is not None and updated is not None:
             self._finish_delete(updated, delete_files)
             return
+        if waits:
+            # Written first, looked at second: a resume that came while this download was
+            # letting go has either taken it from the parked ones, or finds it here.
+            with self._lock:
+                resumed = not self._paused.is_set()
+                if not resumed:
+                    self._parked.add(job_id)
+            if resumed:
+                updated = self.store.update(job_id, phase="") or updated
+                self._queue.put(job_id)
         if updated is not None:
             self._emit(updated)
         if job.group_id is not None:

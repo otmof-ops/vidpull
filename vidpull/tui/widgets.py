@@ -22,6 +22,15 @@ class UrlInput(Input):
             event.prevent_default()
             event.stop()
 
+    def _on_key(self, event: events.Key) -> None:
+        # A link has no space in it, least of all in front: in the empty box space is the
+        # key that pauses the queue, as it is everywhere else in the app.
+        toggle = getattr(self.app, "action_toggle_pause", None)
+        if event.key == "space" and not self.value and toggle is not None:
+            event.prevent_default()
+            event.stop()
+            toggle()
+
     def action_paste(self) -> None:
         paste = getattr(self.app, "paste_from_clipboard", None)
         if paste is not None:

@@ -40,7 +40,7 @@ from vidpull.duplicates import Duplicate, Finder, settle
 from vidpull.engine import Engine, ProbeError, YtDlpEngine
 from vidpull.formats import build_menu, human_size, preset_selection
 from vidpull.log import RingBufferHandler, setup_logging
-from vidpull.manager import DownloadManager
+from vidpull.manager import PAUSE_META, DownloadManager
 from vidpull.manifest import Manifest
 from vidpull.models import (
     Group,
@@ -93,6 +93,8 @@ from vidpull.urls import extract_urls
 log = logging.getLogger(__name__)
 
 COLUMNS = ("#", "Title", "Format", "Status", "Progress", "Speed", "ETA", "Size")
+BAR_HINT = "Pause (space) stops the downloads until you resume · Clear list (f): to History"
+BAR_PAUSED = "PAUSED: nothing downloads until you press Resume, or space"
 HISTORY_COLUMNS = ("Ended", "Title", "Format", "Result", "Size", "On list")
 HISTORY_VIEWS = {"log-download": "download", "log-app": "app", "log-updates": "updates"}
 STATUS_STYLE = {
@@ -123,6 +125,8 @@ p      pick a format for a pending job (clipboard watcher); look again for an un
        a link you downloaded before asks first: skip it or download it again, and the
        tick box applies the answer to every other duplicate (s: duplicates = ask, skip, download)
 c      cancel the selected download or run    r  retry a failed or cancelled job or run
+space  pause the queue, and resume it: what is downloading stops and goes on from where it
+       was; nothing starts while it is paused, and it stays paused when vidpull is closed
 d      delete the selected job or run (asks; can also delete its files)
 o      open the download folder              f  clear the list: what is finished moves to History
 h      History: every finished download with its own log, the app log, the update log
@@ -270,6 +274,7 @@ class VidpullApp(App[PostExit | None]):
         Binding("ctrl+v", "paste", "Paste", show=False),
         Binding("p", "pick", "Pick"),
         Binding("c", "cancel", "Cancel"),
+        Binding("space", "toggle_pause", "Pause", show=False),  # the button says it
         Binding("r", "retry", "Retry"),
         Binding("d", "delete", "Delete"),
         Binding("o", "open", "Open"),
@@ -428,12 +433,9 @@ class VidpullApp(App[PostExit | None]):
             with TabbedContent(initial="tab-downloads", id="views"):
                 with TabPane("Downloads", id="tab-downloads"):
                     with Horizontal(classes="bar"):
+                        yield Button("Pause", id="pause-queue", compact=True)
                         yield Button("Clear list", id="clear-list", compact=True)
-                        yield Static(
-                            "takes finished downloads off the list; they stay in History, "
-                            "files are not touched",
-                            classes="bar-hint",
-                        )
+                        yield Static(BAR_HINT, id="bar-hint", classes="bar-hint")
                     yield DataTable(id="jobs", cursor_type="row", zebra_stripes=True)
                 with TabPane("History", id="tab-history"):
                     with Horizontal(classes="bar"):
@@ -455,7 +457,10 @@ class VidpullApp(App[PostExit | None]):
         keys = table.add_columns(*COLUMNS)
         self._columns = dict(zip(COLUMNS, keys, strict=True))
         self.history_table.add_columns(*HISTORY_COLUMNS)
+        if self.store.get_meta(PAUSE_META) == "1":
+            self.manager.pause()  # it was paused when vidpull was closed: nothing starts
         self.manager.start()  # requeues interrupted jobs first, so the rows below are current
+        self._show_pause()
         for group in self.store.list_groups(cleared=False):
             self._upsert_group(group)
         for job in self.store.list(cleared=False):
@@ -1110,6 +1115,53 @@ class VidpullApp(App[PostExit | None]):
     def _clear_pressed(self) -> None:
         self.action_clear_finished()
 
+    @on(Button.Pressed, "#pause-queue")
+    def _pause_pressed(self) -> None:
+        self.action_toggle_pause()
+
+    # --------------------------------------------------------------- pause
+    def action_toggle_pause(self) -> None:
+        """space, or the button: pause the queue, or resume it."""
+        if self.manager.paused:
+            self.store.set_meta(PAUSE_META, "0")
+            queued = self.manager.resume()
+            self.notify(
+                f"resumed: {queued} download(s) in the queue" if queued else "resumed", timeout=4
+            )
+        else:
+            self.store.set_meta(PAUSE_META, "1")
+            stopped = self.manager.pause()
+            self.notify(
+                f"paused: {stopped} download(s) stopped; they go on from where they were"
+                if stopped
+                else "paused: nothing starts until you resume",
+                timeout=6,
+            )
+        self._show_pause()
+
+    def _follow_pause(self) -> None:
+        """`vidpull queue pause` in another terminal pauses this window too."""
+        wanted = self.store.get_meta(PAUSE_META) == "1"
+        if wanted == self.manager.paused:
+            return
+        if wanted:
+            self.manager.pause()
+        else:
+            self.manager.resume()
+        self._show_pause()
+
+    def _show_pause(self) -> None:
+        """The button, the line next to it and every row that waits say whether it is paused."""
+        paused = self.manager.paused
+        with contextlib.suppress(NoMatches):
+            self.query_one("#pause-queue", Button).label = "Resume" if paused else "Pause"
+            self.query_one("#bar-hint", Static).update(BAR_PAUSED if paused else BAR_HINT)
+        for group in self.store.list_groups(cleared=False):
+            self._upsert_group(group)
+        for job in self.store.list(cleared=False):
+            if job.group_id is None:
+                self._upsert(job)
+
     @on(Button.Pressed, "#log-download, #log-app, #log-updates")
     def _log_view_pressed(self, event: Button.Pressed) -> None:
         self._history_view = HISTORY_VIEWS.get(event.button.id or "", "download")
@@ -1482,7 +1534,9 @@ class VidpullApp(App[PostExit | None]):
         else:
             title = f"{group.display_title} · {group.entry_count} songs"
             if group.status == GroupStatus.ACTIVE:
-                if progress.resting:
+                if self.manager.paused and progress.active is None:
+                    stage = "paused"
+                elif progress.resting:
                     stage = f"resting {self.config.stage_pause}s"
                 elif progress.active is not None and is_retry_note(progress.active.phase):
                     stage = "retrying"  # a service did not answer; the song's row says which
@@ -1522,7 +1576,9 @@ class VidpullApp(App[PostExit | None]):
         cells = self._cells_group(group)
         if key in table.rows:
             for column, value in zip(COLUMNS, cells, strict=True):
-                table.update_cell(key, self._columns[column], value)  # type: ignore[arg-type]
+                table.update_cell(  # type: ignore[arg-type]
+                    key, self._columns[column], value, update_width=True
+                )
         else:
             table.add_row(*cells, key=key)
 
@@ -1540,6 +1596,8 @@ class VidpullApp(App[PostExit | None]):
             status_text = "done (with errors)"
         if job.skipped:
             status_text = job.phase
+        if self.manager.paused and job.status in {JobStatus.QUEUED, JobStatus.STAGED}:
+            status_text = "paused"
         cells: list[object] = [
             str(job.id),
             Text(_short(job.display_title, 48)),
@@ -1560,7 +1618,9 @@ class VidpullApp(App[PostExit | None]):
         cells = self._cells(job)
         if key in table.rows:
             for column, value in zip(COLUMNS, cells, strict=True):
-                table.update_cell(key, self._columns[column], value)  # type: ignore[arg-type]
+                table.update_cell(  # type: ignore[arg-type]
+                    key, self._columns[column], value, update_width=True
+                )
         else:
             table.add_row(*cells, key=key)
 
@@ -1575,6 +1635,7 @@ class VidpullApp(App[PostExit | None]):
 
     def _refresh_status(self) -> None:
         self._next_question()  # a run's question that waited for a screen to close
+        self._follow_pause()
         for group in self.store.list_groups():
             if group.status == GroupStatus.RESOLVING:
                 self._upsert_group(group)  # keeps the elapsed time moving while spotDL works
@@ -1582,6 +1643,7 @@ class VidpullApp(App[PostExit | None]):
         parts = [
             f"vidpull {__version__}",
             f"yt-dlp {self._engine_version}",
+            "PAUSED (space resumes)" if self.manager.paused else "",
             f"{self.manager.active_count} active",
             f"{counts.get('queued', 0)} queued",
         ]

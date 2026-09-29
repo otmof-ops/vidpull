@@ -416,6 +416,54 @@ def test_get_asks_about_a_song_link_downloaded_before(monkeypatch, capsys, paths
     assert len(engine.downloads) == 1 and len(song_engine.matched) == 1
 
 
+def test_queue_pause_and_resume(capsys, paths):
+    store = Store(paths.db_file)
+    chosen = Selection(SelectionKind.PRESET, "best", "Best")
+    store.add(Job(url="https://e/1", selection=chosen, title="One"))
+    staged = Job(url="https://e/2", selection=chosen, title="Two")
+    staged.status = cli.JobStatus.STAGED
+    store.add(staged)
+    store.close()
+    assert cli.main(["queue", "resume"]) == 0
+    assert "the queue was not paused" in capsys.readouterr().out
+    assert cli.main(["queue", "pause"]) == 0
+    out = flat(capsys.readouterr().out)
+    assert "the queue is paused" in out and "follows within a second" in out
+    assert Store(paths.db_file).get_meta("queue_paused") == "1"
+    assert cli.main(["queue", "pause"]) == 0
+    assert "paused already" in capsys.readouterr().out
+    assert cli.main(["queue", "list"]) == 0
+    listed = capsys.readouterr().out
+    assert listed.startswith("the queue is paused")
+    assert listed.count("paused  ") == 2 and "queued" not in listed
+    assert cli.main(["queue", "resume"]) == 0
+    assert "the queue is resumed; 2 download(s) waiting" in capsys.readouterr().out
+    assert Store(paths.db_file).get_meta("queue_paused") == "0"
+    assert cli.main(["queue", "list"]) == 0
+    listed = capsys.readouterr().out
+    assert "paused" not in listed and "queued" in listed and "staged" in listed
+
+
+def test_get_is_never_paused_and_leaves_the_apps_queue_alone(
+    monkeypatch, capsys, paths, video_info
+):
+    """The pause is the app's queue; a download asked for on the command line runs, and
+    runs alone: what waits in the app's queue is the app's."""
+    engine = FakeEngine(info=video_info)
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: engine)
+    store = Store(paths.db_file)
+    chosen = Selection(SelectionKind.PRESET, "best", "Best")
+    waiting = store.add(Job(url="https://vimeo.com/1", selection=chosen, title="The app's"))
+    store.close()
+    assert cli.main(["queue", "pause"]) == 0
+    assert cli.main(["get", "https://www.youtube.com/watch?v=aqz-KE-bpKQ", "-q", "720p"]) == 0
+    assert "saved" in capsys.readouterr().out and len(engine.downloads) == 1
+    store = Store(paths.db_file)
+    assert store.get(waiting.id).status == cli.JobStatus.QUEUED
+    assert engine.downloads != [waiting.id]
+    store.close()
+
+
 def test_update_log_command(capsys, paths):
     from vidpull.updatelog import UpdateLog
 

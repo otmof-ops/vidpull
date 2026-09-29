@@ -6,7 +6,7 @@ import asyncio
 import threading
 import time
 
-from textual.widgets import Checkbox, DataTable, Input, RichLog
+from textual.widgets import Button, Checkbox, DataTable, Input, RichLog
 
 from tests.helpers import FakeEngine, FakeSongEngine, wait_until
 from vidpull.config import Config
@@ -1035,6 +1035,166 @@ def test_the_setting_decides_without_a_question(config, paths, store, video_info
 
     run(flow())
     app.manager.stop()
+
+
+def status_line(app) -> str:
+    return str(app.query_one("#status").render())
+
+
+def test_pause_and_resume_with_the_button_and_the_key(config, paths, store, video_info):
+    block = threading.Event()
+    engine = FakeEngine(info=video_info, block=block)
+    app = make_app(config, paths, store, engine)
+    app.config.auto_pick = True
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            button = app.query_one("#pause-queue", Button)
+            hint = app.query_one("#bar-hint")
+            assert str(button.label) == "Pause" and "Pause (space) stops" in str(hint.render())
+            _paste(app, f"{URL}\nhttps://www.youtube.com/watch?v=another-one\nhttps://vimeo.com/1")
+            assert await until(pilot, lambda: len(store.list()) == 3)
+            assert await until(pilot, lambda: app.manager.active_count == 2)
+            table = app.query_one("#jobs", DataTable)
+            await pilot.press("escape")
+            await pilot.press("space")  # the key
+            assert app.manager.paused and store.get_meta("queue_paused") == "1"
+            assert str(button.label) == "Resume"
+            assert "PAUSED" in str(hint.render())
+            assert await until(pilot, lambda: app.manager.active_count == 0)
+            assert await until(
+                pilot, lambda: [str(table.get_row(str(n))[3]) for n in (1, 2, 3)] == ["paused"] * 3
+            )
+            assert await until(pilot, lambda: "PAUSED (space resumes)" in status_line(app))
+            assert "0 active" in status_line(app) and "3 queued" in status_line(app)
+            block.set()
+            await pilot.pause(0.3)
+            assert [j.status for j in store.list()] == [JobStatus.QUEUED] * 3  # nothing starts
+
+            await pilot.click("#pause-queue")  # the button
+            assert not app.manager.paused and store.get_meta("queue_paused") == "0"
+            assert str(button.label) == "Pause"
+            assert await until(
+                pilot, lambda: all(j.status == JobStatus.DONE for j in store.list()), tries=400
+            )
+            assert await until(pilot, lambda: "PAUSED" not in status_line(app))
+            assert "paused" not in [str(table.get_row(str(n))[3]) for n in (1, 2, 3)]
+
+    try:
+        run(flow())
+    finally:
+        block.set()
+        app.manager.stop()
+
+
+def test_space_in_the_link_box(config, paths, store, video_info):
+    """The box has the focus when vidpull opens. Empty, space is the pause there too; once
+    something is typed, a space is a space."""
+    app = make_app(config, paths, store, FakeEngine(info=video_info))
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            assert app.focused is box and box.value == ""
+            await pilot.press("space")
+            assert app.manager.paused and box.value == ""
+            assert store.get_meta("queue_paused") == "1"
+            await pilot.press("space")
+            assert not app.manager.paused and box.value == ""
+            for key in ("a", "space", "b"):
+                await pilot.press(key)
+            assert box.value == "a b" and not app.manager.paused
+
+    run(flow())
+    app.manager.stop()
+
+
+def test_a_paused_queue_is_paused_when_vidpull_opens_again(config, paths, store, video_info):
+    store.set_meta("queue_paused", "1")  # as it was left
+    job = store.add(Job(url=URL, selection=Selection(SelectionKind.PRESET, "best", "Best")))
+    engine = FakeEngine(info=video_info)
+    app = make_app(config, paths, store, engine)
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            assert app.manager.paused
+            assert str(app.query_one("#pause-queue", Button).label) == "Resume"
+            table = app.query_one("#jobs", DataTable)
+            assert str(table.get_row(str(job.id))[3]) == "paused"
+            await pilot.pause(0.4)
+            assert engine.downloads == [] and store.get(job.id).status == JobStatus.QUEUED
+            await pilot.press("escape")
+            await pilot.press("space")
+            assert wait_until(lambda: store.get(job.id).status == JobStatus.DONE)
+
+    run(flow())
+    app.manager.stop()
+
+
+def test_a_pause_from_another_terminal_is_followed(config, paths, store, video_info):
+    block = threading.Event()
+    engine = FakeEngine(info=video_info, block=block)
+    app = make_app(config, paths, store, engine)
+    app.config.auto_pick = True
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = URL
+            await pilot.press("enter")
+            assert await until(pilot, lambda: app.manager.active_count == 1)
+            store.set_meta("queue_paused", "1")  # `vidpull queue pause`
+            assert await until(pilot, lambda: app.manager.paused, tries=200)
+            assert await until(pilot, lambda: app.manager.active_count == 0)
+            assert str(app.query_one("#pause-queue", Button).label) == "Resume"
+            block.set()
+            store.set_meta("queue_paused", "0")  # `vidpull queue resume`
+            assert await until(pilot, lambda: not app.manager.paused, tries=200)
+            assert wait_until(lambda: store.list()[0].status == JobStatus.DONE)
+
+    try:
+        run(flow())
+    finally:
+        block.set()
+        app.manager.stop()
+
+
+def test_a_run_says_it_is_paused(config, paths, store, video_info):
+    block = threading.Event()
+    engine = FakeEngine(info=video_info, block=block)
+    config.stage_size = 1
+    app = make_app(config, paths, store, engine, song_engine=FakeSongEngine(songs=three_songs()))
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = ALBUM
+            await pilot.press("enter")
+            assert await until(pilot, lambda: app.manager.active_count == 1)
+            await pilot.press("escape")
+            await pilot.press("space")
+            table = app.query_one("#jobs", DataTable)
+            assert await until(pilot, lambda: str(table.get_row("g1")[3]).startswith("paused 0/3"))
+            await pilot.press("enter")  # the songs behind it
+            assert await until(pilot, lambda: isinstance(app.screen, GroupScreen))
+            rows = app.screen.query_one("#songs", DataTable)
+            assert await until(pilot, lambda: rows.row_count == 3)
+            songs = store.list(group_id=1)
+            assert await until(
+                pilot, lambda: [str(rows.get_row(str(s.id))[2]) for s in songs] == ["paused"] * 3
+            )
+            await pilot.press("escape")
+            block.set()
+            await pilot.press("space")
+            assert await until(
+                pilot, lambda: store.get_group(1).status == GroupStatus.DONE, tries=400
+            )
+
+    try:
+        run(flow())
+    finally:
+        block.set()
+        app.manager.stop()
 
 
 class FakePipeline:

@@ -80,7 +80,9 @@ class GroupScreen(ModalScreen[None]):
             key = str(job.id)
             if key in table.rows:
                 for column, value in zip(COLUMNS, cells, strict=True):
-                    table.update_cell(key, self._columns[column], value)  # type: ignore[arg-type]
+                    table.update_cell(  # type: ignore[arg-type]
+                        key, self._columns[column], value, update_width=True
+                    )
             else:
                 table.add_row(*cells, key=key)
 
@@ -92,6 +94,8 @@ class GroupScreen(ModalScreen[None]):
             status = f"failed: {job.error}"
         if job.skipped:
             status = job.phase
+        if self.manager.paused and job.status in {JobStatus.QUEUED, JobStatus.STAGED}:
+            status = "paused"
         bar = ""
         if job.status not in {JobStatus.PENDING, JobStatus.QUEUED}:
             percent = max(0.0, min(100.0, job.progress))

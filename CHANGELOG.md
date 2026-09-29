@@ -6,6 +6,22 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Pause.** A **Pause** button above the list, and `space`: what is downloading stops within
+  a second, nothing new starts and a run releases no further batch, until **Resume**. A
+  download that was stopped goes on from the part it had. The queue stays paused across a
+  restart of vidpull. `vidpull queue pause` and `vidpull queue resume` do the same from a
+  terminal, to an open vidpull as well; `vidpull get` is never paused.
+
+### Fixed
+
+- `vidpull get` took up the downloads that were waiting in the app's queue and ran them with
+  its own. A manager started for one command now runs that command's downloads only.
+- A download that a cancel reached just as yt-dlp had finished it was recorded as cancelled.
+- A status that grew longer than the one its row started with was cut to the width of the
+  first (`downloadi`, `paused 0/`): the column now grows with it.
+
 ## [1.4.2] - 2026-09-29
 
 ### Fixed
