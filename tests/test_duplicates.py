@@ -352,6 +352,11 @@ def test_a_file_with_the_video_id_at_the_end_of_its_name(store, paths):
     assert found.why == FILE and found.title == "Big Buck Bunny"
     assert found.files == (str(folder / "Big Buck Bunny [aqz-KE-bpKQ].mkv"),)
     assert finder(store, paths).media(VIDEO, info, MP3) is None  # a video is not the MP3
+    # audio as it comes can be a .webm of that very name: the download would replace this one
+    (folder / "Other [abcdefghijk].webm").write_bytes(b"x")
+    other = MediaInfo(url="https://e/o", id="abcdefghijk", title="Other")
+    assert finder(store, paths).media("https://e/o", other, AS_IT_COMES).why == FILE
+    assert finder(store, paths).media("https://e/o", other, FLAC) is None
     plain = Config()
     plain.output_template = "%(title)s.%(ext)s"
     assert finder(store, paths, plain).media(VIDEO, info, BEST) is None

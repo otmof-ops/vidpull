@@ -22,6 +22,7 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -52,6 +53,7 @@ PROBE_TIMEOUT = 180.0
 VERSION_TIMEOUT = 30.0
 KILL_GRACE_SECONDS = 8.0
 INFO_JSON_NAME = "info.json"
+STAGING_NAME = "out"  # inside a job's temp folder: where yt-dlp finishes that job's files
 
 PP_LABELS: dict[str, str] = {
     "ExtractAudio": "extracting audio",
@@ -418,6 +420,12 @@ class YtDlpEngine:
         playlist = job.selection.playlist
         download_dir.mkdir(parents=True, exist_ok=True)
         temp_dir.mkdir(parents=True, exist_ok=True)
+        # yt-dlp gets a folder of this job's own to finish its files in. Given the download
+        # folder, it takes any file there with the name it is about to write for its own
+        # download: the video of a link, when the audio of that link is asked for, which it
+        # then converts and deletes.
+        staging = temp_dir / STAGING_NAME
+        staging.mkdir(parents=True, exist_ok=True)
         info_path: Path | None = None
         if info is not None:
             info_path = temp_dir / INFO_JSON_NAME
@@ -429,7 +437,7 @@ class YtDlpEngine:
             *self.prefix(),
             *self.common_args(),
             *download_args(
-                job, self.config, download_dir, temp_dir, playlist=playlist, info_path=info_path
+                job, self.config, staging, temp_dir, playlist=playlist, info_path=info_path
             ),
         ]
         try:
@@ -451,6 +459,11 @@ class YtDlpEngine:
         files: list[str] = []
         errors: list[str] = []
         entry = {"index": None, "count": None}
+
+        def place(name: str) -> None:
+            placed = _place(Path(name), staging, download_dir, on_log)
+            if placed is not None:
+                files.append(placed)
 
         def handle(mark: str, fields: list[Any]) -> None:
             if mark == MARK_PROGRESS and len(fields) >= 11:
@@ -486,7 +499,7 @@ class YtDlpEngine:
                         )
                     )
             elif mark == MARK_FILE and fields and fields[0]:
-                files.append(str(fields[0]))
+                place(str(fields[0]))  # as each one is finished: a playlist fills up as it goes
             elif mark == MARK_INFO and len(fields) >= 2:
                 title = str(fields[1] or "")
                 index, count = (
@@ -541,6 +554,9 @@ class YtDlpEngine:
         for thread in threads:
             thread.join(timeout=5)
 
+        if returncode == 0 and not cancel.is_set():
+            for left in _finished_files(staging):
+                place(str(left))  # what yt-dlp wrote next to the download and did not report
         safe_files = _files_inside(files, download_dir, on_log)
         if cancel.is_set():
             return DownloadResult(ok=False, cancelled=True, files=safe_files, returncode=returncode)
@@ -581,6 +597,41 @@ def _terminate(proc: subprocess.Popen[str], on_log: Callable[[str, str], None]) 
     if proc.poll() is None:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(pgid, signal.SIGKILL)
+
+
+def _place(
+    source: Path, staging: Path, download_dir: Path, on_log: Callable[[str, str], None]
+) -> str | None:
+    """Move one finished file from the job's own folder to its place in the download
+    folder, and say so when it takes the place of one that was there."""
+    try:
+        relative = source.resolve().relative_to(staging.resolve())
+        target = (download_dir / relative).resolve()
+        if not target.is_relative_to(download_dir.resolve()):
+            raise ValueError(target)
+    except (OSError, ValueError):
+        on_log("warning", f"ignoring a file written outside the download dir: {source}")
+        return None
+    if not source.is_file():
+        return str(target) if target.is_file() else None  # reported twice: it is there
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            on_log("warning", f'Replacing existing file "{target}"')
+        shutil.move(str(source), str(target))
+    except OSError as exc:
+        on_log("error", f"cannot move {source.name} into {target.parent}: {exc}")
+        return None
+    return str(target)
+
+
+def _finished_files(staging: Path) -> list[Path]:
+    """The files left in the job's own folder that are whole: no ``.part``, no ``.ytdl``."""
+    try:
+        found = [p for p in sorted(staging.rglob("*")) if p.is_file()]
+    except OSError:
+        return []
+    return [p for p in found if p.suffix.lower() not in {".part", ".ytdl", ".temp"}]
 
 
 def _files_inside(
