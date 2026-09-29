@@ -7,6 +7,7 @@ from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.content import Content
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Static
 
@@ -33,7 +34,8 @@ class DuplicateScreen(ModalScreen[tuple[bool, bool]]):
         with Vertical(id="dialog"):
             yield Static(Text(self.found.phrase.capitalize()), classes="title")
             yield Static(Text("\n".join(describe(self.found))), id="duplicate")
-            yield Checkbox(self.apply_label, id="all", disabled=not self.apply_enabled)
+            # the label holds a list's name, and "Mix [Chill]" is a name, not markup
+            yield Checkbox(Content(self.apply_label), id="all", disabled=not self.apply_enabled)
             with Horizontal(classes="buttons"):
                 yield Button("Skip", id="skip", variant="primary")
                 yield Button("Download again", id="again")

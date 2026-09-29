@@ -287,6 +287,37 @@ def test_get_skips_what_was_downloaded_before_when_it_cannot_ask(
     assert Config.load(paths.config_file).duplicates == "ask"  # the flag is for the run
 
 
+def test_get_downloads_the_same_link_as_something_else(monkeypatch, capsys, paths, video_info):
+    """The video is there; its MP3 is another download, and nobody has to be asked."""
+    engine = FakeEngine(info=video_info)
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: engine)
+    url = "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+    assert cli.main(["get", url, "-q", "720p"]) == 0
+    assert cli.main(["get", url, "-a", "mp3", "--duplicates", "skip"]) == 0
+    assert len(engine.downloads) == 2 and "skipped" not in capsys.readouterr().out
+    assert cli.main(["get", url, "-a", "flac", "--duplicates", "skip"]) == 0
+    assert len(engine.downloads) == 3
+    assert cli.main(["get", url, "-a", "mp3", "--duplicates", "skip"]) == 0  # that one is there
+    assert len(engine.downloads) == 3 and "skipped" in capsys.readouterr().out
+    assert cli.main(["get", url, "-q", "1080p", "--duplicates", "skip"]) == 0  # a video is
+    assert len(engine.downloads) == 3
+
+
+def test_get_never_takes_a_whole_playlist_for_a_duplicate(
+    monkeypatch, capsys, paths, playlist_info
+):
+    engine = FakeEngine(info=playlist_info)
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: engine)
+    url = "https://www.youtube.com/playlist?list=PLtest"
+    for _ in range(2):  # what is in a playlist changes: it is downloaded whenever asked
+        assert cli.main(["get", url, "-q", "720p", "--duplicates", "skip"]) == 0
+    assert len(engine.downloads) == 2 and "skipped" not in capsys.readouterr().out
+    video = "https://www.youtube.com/watch?v=aqz-KE-bpKQ&list=PLtest"
+    for _ in range(2):
+        assert cli.main(["get", video, "--playlist", "--duplicates", "skip"]) == 0
+    assert len(engine.downloads) == 4
+
+
 def answers(monkeypatch, *replies):
     """A terminal whose user types ``replies`` in turn."""
     given = list(replies)

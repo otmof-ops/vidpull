@@ -737,6 +737,35 @@ def test_a_run_skips_its_duplicates_when_the_setting_says_so(store, config, path
         manager.stop()
 
 
+def test_songs_wanted_in_another_format_are_no_duplicates(store, config, paths):
+    from vidpull.formats import preset_selection
+
+    config.duplicates = "skip"
+    songs = two_songs()
+    target = paths.home / "dl" / "airbag.mp3"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"x")
+    had = Job(url=songs[0].url, selection=preset_selection("audio-mp3", config), song=songs[0])
+    had.status, had.files = JobStatus.DONE, [str(target)]
+    store.add(had)
+    engine = FakeEngine()
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.song_engine = FakeSongEngine(songs=songs)
+    manager.start()
+    try:
+        flac = manager.start_group(ALBUM, "album", preset_selection("audio-flac", config))
+        manager.resolve_group(flac.id)
+        assert wait_until(lambda: store.get_group(flac.id).status == GroupStatus.DONE)
+        assert not any(j.skipped for j in store.list(group_id=flac.id))
+        assert len(engine.downloads) == 2
+        mp3 = manager.start_group(ALBUM, "album", preset_selection("audio-mp3", config))
+        manager.resolve_group(mp3.id)
+        assert wait_until(lambda: store.get_group(mp3.id).status == GroupStatus.DONE)
+        assert [j.skipped for j in store.list(group_id=mp3.id)] == [True, False]
+    finally:
+        manager.stop()
+
+
 def test_a_run_downloads_its_duplicates_again_when_the_setting_says_so(store, config, paths):
     config.duplicates = "download"
     songs = five_songs()

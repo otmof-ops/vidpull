@@ -128,12 +128,14 @@ class DownloadManager:
         self._stage_lock = threading.RLock()
         self._stopping = threading.Event()
         self._started = False
+        self._released = False  # the workers were told to end
 
     # ------------------------------------------------------------ lifecycle
     def start(self, *, resume: bool = True) -> None:
         if self._started:
             return
         self._started = True
+        self._released = False
         if resume:
             requeued = self.store.requeue_stale()
             if requeued:
@@ -151,7 +153,13 @@ class DownloadManager:
             thread.start()
             self._threads.append(thread)
 
-    def stop(self, *, wait: bool = True, timeout: float = 15.0) -> None:
+    def halt(self) -> None:
+        """Tell everything that runs or waits to let go, and return at once.
+
+        The app calls this the moment it is quit: a thread that waits for a track list,
+        for another attempt or for an answer would otherwise hold the closing app until
+        it is done. ``stop`` does the waiting.
+        """
         self._stopping.set()
         with self._lock:
             for event in self._cancel.values():
@@ -161,8 +169,13 @@ class DownloadManager:
             for timer in self._stage_timers.values():
                 timer.cancel()
             self._stage_timers.clear()
-        for _ in self._threads:
-            self._queue.put(None)
+            released, self._released = self._released, True
+        if not released:
+            for _ in self._threads:
+                self._queue.put(None)
+
+    def stop(self, *, wait: bool = True, timeout: float = 15.0) -> None:
+        self.halt()
         if wait:
             deadline = time.monotonic() + timeout
             for thread in self._threads:
@@ -311,8 +324,14 @@ class DownloadManager:
         Finds the duplicates, then lets the setting decide or asks; None when the asking
         was cancelled.
         """
+        group = self.store.get_group(group_id)
+        selection = group.selection if group is not None else None
         finder = Finder(self.store, self.download_dir, self.config)
-        places = [(n, found) for n, s in enumerate(songs) if (found := finder.song(s)) is not None]
+        places = [
+            (n, found)
+            for n, song in enumerate(songs)
+            if (found := finder.song(song, selection)) is not None
+        ]
         if not places:
             return {}
         found = [d for _, d in places]

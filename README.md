@@ -89,7 +89,8 @@ From the command line: `vidpull queue clear`, `vidpull queue history`, `vidpull 
 
 ### Duplicates
 
-vidpull notices a link you have had before and asks before it downloads it a second time:
+vidpull notices when you ask for something you already have, and asks before it downloads it
+a second time:
 
 ```
  Already downloaded
@@ -107,14 +108,21 @@ duplicate asks again.
 
 | A link is a duplicate when | The question says |
 | --- | --- |
-| it was downloaded before and its file is still there | Already downloaded, when, as what, where |
+| it was downloaded before and every file of it is still there | Already downloaded: when, as what, where |
 | it is waiting or running on the list | Already on the list |
 | it comes a second time in the album or playlist being added | Twice in this list |
 | a file with its name (songs) or its id (videos) is in the download folder | The file is already there |
 
-A link counts as the same link however it is spelled: `youtu.be/ID`, `youtube.com/watch?v=ID`
-with a timestamp or a share code, a Spotify link with `?si=`. A file you deleted is no
-duplicate; the link downloads again without a question.
+What counts is the same source **and** the same kind of file. The MP3 of a video you have is
+another download and is not asked about, nor is the FLAC of a song you have as MP3; a video is
+asked about whatever its resolution. For a pasted link the question therefore comes once the
+format is chosen; for an album or playlist it comes when the track list is there, before
+anything is queued.
+
+- A link counts as the same link however it is spelled: `youtu.be/ID`,
+  `youtube.com/watch?v=ID` with a timestamp or a share code, a Spotify link with `?si=`.
+- A file you deleted is no duplicate, and neither is an empty or half-written one.
+- A whole YouTube playlist is never a duplicate: what is in it changes.
 
 In an album or playlist the skipped songs stay in the run, marked `skipped: already downloaded`
 (`done 676/676, 12 skipped`); `r` on one of them in the run's song list downloads it after all.

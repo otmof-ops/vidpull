@@ -457,21 +457,28 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
                         continue
                     known = finder()
                     for song in songs:
-                        if not wanted(known.song(song)):
+                        if not wanted(known.song(song, song_selection)):
                             continue
                         job = manager.enqueue_song(song, song_selection)
                         ids.append(job.id or 0)
                     continue
-                before = finder().media(url, remember=False)
-                if not wanted(before):  # asked before the probe: a skipped link costs nothing
-                    continue
+                # The format is known from the command line, so a duplicate is asked about
+                # before its probe and costs nothing when skipped. A whole playlist is never
+                # one: what is in it changes.
+                asked = selection if not args.playlist else None
+                before = None
+                if asked is not None:
+                    before = finder().media(url, None, asked, remember=False)
+                    if not wanted(before):
+                        continue
                 try:
                     info = engine.probe(url, playlist=args.playlist)
                 except ProbeError as exc:
                     console.print(f"[red]error:[/] {redact_url(url)}: {exc}")
                     continue
                 # and after it, when the page the link leads to and its id are known
-                if before is None and not wanted(finder().media(url, info, remember=False)):
+                after = asked is not None and before is None
+                if after and not wanted(finder().media(url, info, asked, remember=False)):
                     continue
                 chosen = selection
                 if (info.is_playlist or args.playlist) and not chosen.playlist:
