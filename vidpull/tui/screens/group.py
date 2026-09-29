@@ -14,6 +14,7 @@ from vidpull.manager import DownloadManager
 from vidpull.models import GroupStatus, Job, JobStatus
 from vidpull.store import Store
 from vidpull.tui.screens.link import LinkScreen
+from vidpull.tui.widgets import write_row
 
 COLUMNS = ("#", "Song", "Status", "Progress", "Speed", "ETA", "Match")
 # at 132 columns everything but the match, which is the last for that reason, is in sight
@@ -84,16 +85,13 @@ class GroupScreen(ModalScreen[None]):
             + (f" · {note}" if note else "")
         )
         table = self.query_one("#songs", DataTable)
+        columns = [self._columns[name] for name in COLUMNS]
+        listed = set()
         for index, job in enumerate(self.store.list(group_id=self.group_id), 1):
-            cells = self._cells(index, job)
-            key = str(job.id)
-            if key in table.rows:
-                for column, value in zip(COLUMNS, cells, strict=True):
-                    table.update_cell(  # type: ignore[arg-type]
-                        key, self._columns[column], value, update_width=True
-                    )
-            else:
-                table.add_row(*cells, key=key)
+            listed.add(str(job.id))
+            write_row(table, str(job.id), columns, self._cells(index, job))
+        for key in [row.value for row in table.rows if row.value not in listed]:
+            table.remove_row(key)  # a song that was deleted, from the Failed tab for one
 
     def _cells(self, index: int, job: Job) -> list[object]:
         status = job.phase if job.status.is_active and job.phase else job.status.value

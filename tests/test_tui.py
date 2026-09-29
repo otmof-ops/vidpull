@@ -1965,3 +1965,64 @@ def test_the_songs_of_a_run_show_their_speed_and_take_a_link(config, paths, stor
     finally:
         engine.let(50)
         app.manager.stop()
+
+
+def test_a_row_that_did_not_change_is_not_written_again(config, paths, store, video_info):
+    """A cell that is written is measured for the width of its column and the table is
+    drawn again. The songs of a 676-song playlist, all written once a second, kept the
+    app from answering a key for half a minute."""
+    from rich.text import Text
+
+    from vidpull.tui.widgets import write_row
+
+    engine = StepEngine(info=video_info)
+    config.concurrency = 1
+    app = make_app(config, paths, store, engine, song_engine=trouble())
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            app.query_one("#url", Input).value = ALBUM
+            await pilot.press("enter")
+            assert await until(pilot, lambda: engine.waiting == 1)
+            await pilot.press("escape")
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, GroupScreen))
+            screen = app.screen
+            rows = screen.query_one("#songs", DataTable)
+            assert await until(pilot, lambda: rows.row_count == 6)
+            first = store.list(group_id=1)[0]
+            assert await until(pilot, lambda: cells(rows, str(first.id))[4] == "2.0 KB/s")
+            written = []
+            update = rows.update_cell
+
+            def counted(row, column, value, **kwargs):
+                written.append((str(row), str(value)))
+                return update(row, column, value, **kwargs)
+
+            rows.update_cell = counted
+            screen.reload()
+            screen.reload()
+            assert written == []  # nothing changed: nothing is written
+            store.update(first.id, phase="extracting audio", status=JobStatus.PROCESSING)
+            screen.reload()
+            # its status, and the speed and the ETA it no longer has: three cells of one row
+            assert [row for row, _ in written] == [str(first.id)] * 3
+            assert {value for _, value in written} == {"extracting audio", ""}
+            # the same words in another colour are another cell
+            columns = [screen._columns[name] for name in ("#", "Song")]
+            key = str(first.id)
+            assert write_row(rows, key, columns, ["1", Text("x")]) == 1
+            assert write_row(rows, key, columns, ["1", Text("x")]) == 0
+            assert write_row(rows, key, columns, ["1", Text("x", style="red")]) == 1
+            assert write_row(rows, key, columns, ["1", "x"]) == 1
+            # a song that was deleted leaves the screen
+            last = store.list(group_id=1)[-1]
+            store.delete(last.id)
+            screen.reload()
+            assert rows.row_count == 5 and str(last.id) not in {r.value for r in rows.rows}
+
+    try:
+        run(flow())
+    finally:
+        engine.let(50)
+        app.manager.stop()

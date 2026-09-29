@@ -28,6 +28,10 @@ All notable changes to vidpull are recorded here. The format follows
   run show their own in two columns of their own.
 - A transfer too short for yt-dlp to name its speed, which is most songs, showed none: it is
   measured from what came and the time it took.
+- **With the songs of a long playlist open, vidpull took half a minute to answer a key**
+  (since 1.5.0). Every row was written again once a second, changed or not, and every cell
+  written is measured for the width of its column. Only what changed is written now: with
+  676 songs a key is answered in under a tenth of a second.
 - A song that was not found was counted as "pending (p)" in the line at the bottom, as if it
   were a copied link waiting for a format.
 - `vidpull queue retry` on a song of a run that was over left the run as it was; the run is

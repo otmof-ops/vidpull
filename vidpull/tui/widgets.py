@@ -2,8 +2,39 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
+from rich.text import Text
 from textual import events
-from textual.widgets import Input
+from textual.widgets import DataTable, Input
+
+
+def write_row(
+    table: DataTable, key: str, columns: Sequence[object], cells: Sequence[object]
+) -> int:
+    """Put a row into a table: a new row, or those cells of it that changed. Returns how
+    many cells were written.
+
+    A cell that is written is measured anew for the width of its column and the table is
+    drawn again. Written once a second, changed or not, the 676 songs of a playlist kept
+    the app from answering a key for half a minute.
+    """
+    if key not in table.rows:
+        table.add_row(*cells, key=key)
+        return len(cells)
+    written = 0
+    for column, value in zip(columns, cells, strict=True):
+        if _same(table.get_cell(key, column), value):  # type: ignore[arg-type]
+            continue
+        table.update_cell(key, column, value, update_width=True)  # type: ignore[arg-type]
+        written += 1
+    return written
+
+
+def _same(shown: object, value: object) -> bool:
+    if isinstance(shown, Text) and isinstance(value, Text):
+        return shown.plain == value.plain and shown.style == value.style
+    return type(shown) is type(value) and shown == value
 
 
 class UrlInput(Input):

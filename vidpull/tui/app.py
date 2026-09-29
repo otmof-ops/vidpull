@@ -78,7 +78,7 @@ from vidpull.tui.screens.picker import FormatPicker, Pick
 from vidpull.tui.screens.settings import SettingsScreen
 from vidpull.tui.screens.uninstall import UninstallScreen
 from vidpull.tui.screens.update import UpdateScreen
-from vidpull.tui.widgets import UrlInput
+from vidpull.tui.widgets import UrlInput, write_row
 from vidpull.uninstall import UninstallPlan
 from vidpull.update import (
     BusyError,
@@ -1794,16 +1794,8 @@ class VidpullApp(App[PostExit | None]):
     def _upsert_group(self, group: Group) -> None:
         if group.id is None or self._table is None:
             return
-        table = self._table
-        key = f"g{group.id}"
-        cells = self._cells_group(group)
-        if key in table.rows:
-            for column, value in zip(COLUMNS, cells, strict=True):
-                table.update_cell(  # type: ignore[arg-type]
-                    key, self._columns[column], value, update_width=True
-                )
-        else:
-            table.add_row(*cells, key=key)
+        columns = [self._columns[name] for name in COLUMNS]
+        write_row(self._table, f"g{group.id}", columns, self._cells_group(group))
 
     def _remove_group_row(self, group: Group) -> None:
         if self._table is None:
@@ -1836,16 +1828,8 @@ class VidpullApp(App[PostExit | None]):
     def _upsert(self, job: Job) -> None:
         if job.id is None or self._table is None:
             return
-        table = self._table
-        key = str(job.id)
-        cells = self._cells(job)
-        if key in table.rows:
-            for column, value in zip(COLUMNS, cells, strict=True):
-                table.update_cell(  # type: ignore[arg-type]
-                    key, self._columns[column], value, update_width=True
-                )
-        else:
-            table.add_row(*cells, key=key)
+        columns = [self._columns[name] for name in COLUMNS]
+        write_row(self._table, str(job.id), columns, self._cells(job))
 
     def _remove_row(self, job: Job) -> None:
         if self._table is None:

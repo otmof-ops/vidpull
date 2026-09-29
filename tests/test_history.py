@@ -218,12 +218,18 @@ def test_a_reason_in_few_words():
     assert brief_reason("ERROR: [vimeo] 76979871: Unable to download JSON") == (
         "Unable to download JSON"
     )
-    outage = (
+    refused = "YouTube refused the upload (age-restricted, private, removed?)"
+    for said in (  # by 1.3.1, and since 1.4.1
         "YouTube Music did not answer in 4 attempts over 3 min: YT-DLP download error - "
-        "https://www.youtube.com/watch?v=w_fFXdS2mDo"
-    )
+        "https://www.youtube.com/watch?v=w_fFXdS2mDo",
+        "YouTube refused the upload found for it in 2 attempts over 20 s: YT-DLP download "
+        "error - https://www.youtube.com/watch?v=w_fFXdS2mDo (age-restricted, private or "
+        "removed?)",
+    ):
+        assert brief_reason(said) == refused
+    outage = "Spotify did not answer in 4 attempts over 1 min: [Errno 104] reset - https://e/x"
     assert brief_reason(outage) == (
-        "YouTube Music did not answer in 4 attempts over 3 min: YT-DLP download error"
+        "Spotify did not answer in 4 attempts over 1 min: [Errno 104] reset"
     )
     for plain in (
         "no confident match on YouTube Music",

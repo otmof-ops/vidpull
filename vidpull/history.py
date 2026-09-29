@@ -124,8 +124,11 @@ def entries(store: Store, *, limit: int = MAX_ENTRIES) -> list[Entry]:
 _REASON_LEAD = re.compile(r"^(?:ERROR:\s*)?(?:https?://\S+?:\s+)?(?:\[[^\]\s]+\]\s+\S+:\s+)?")
 _REASON_LINK = re.compile(r"\s*[-:]\s*https?://\S+\s*$")
 _SENTENCE_END = re.compile(r"(?<=[^\s.])\.\s+(?=[A-Z])")
-# said in yt-dlp's words, which are about its own options
-_PLAIN_WORDS = (("sign in to confirm your age", "age-restricted: needs a YouTube sign-in"),)
+# said in the words of yt-dlp and spotDL, which are about their own options and workings
+_PLAIN_WORDS = (
+    ("sign in to confirm your age", "age-restricted: needs a YouTube sign-in"),
+    ("yt-dlp download error", "YouTube refused the upload (age-restricted, private, removed?)"),
+)
 
 
 def brief_reason(text: str) -> str:
