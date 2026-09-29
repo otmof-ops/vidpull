@@ -40,7 +40,7 @@ from vidpull.duplicates import Duplicate, Finder, settle
 from vidpull.engine import Engine, ProbeError, YtDlpEngine
 from vidpull.formats import build_menu, human_size, preset_selection
 from vidpull.log import RingBufferHandler, setup_logging
-from vidpull.manager import PAUSE_META, DownloadManager
+from vidpull.manager import PAUSE_META, DownloadManager, GroupProgress
 from vidpull.manifest import Manifest
 from vidpull.models import (
     Group,
@@ -72,6 +72,7 @@ from vidpull.store import Store
 from vidpull.tui.screens.confirm import ConfirmScreen, TextScreen
 from vidpull.tui.screens.duplicate import DuplicateScreen
 from vidpull.tui.screens.group import GroupScreen
+from vidpull.tui.screens.link import LinkScreen
 from vidpull.tui.screens.logview import LogScreen
 from vidpull.tui.screens.picker import FormatPicker, Pick
 from vidpull.tui.screens.settings import SettingsScreen
@@ -96,6 +97,12 @@ COLUMNS = ("#", "Title", "Format", "Status", "Progress", "Speed", "ETA", "Size")
 BAR_HINT = "Pause (space) stops the downloads until you resume · Clear list (f): to History"
 BAR_PAUSED = "PAUSED: nothing downloads until you press Resume, or space"
 HISTORY_COLUMNS = ("Ended", "Title", "Format", "Result", "Size", "On list")
+FAILED_COLUMNS = ("#", "Title", "From", "Why")
+FAILED_HINT = (
+    "What failed or was not found. enter gives the selected one another link · r tries it "
+    "again · d takes it off the list"
+)
+FAILED_NONE = "Nothing has failed: what fails or is not found is listed here once its run is over."
 HISTORY_VIEWS = {"log-download": "download", "log-app": "app", "log-updates": "updates"}
 STATUS_STYLE = {
     JobStatus.PENDING: "yellow",
@@ -129,6 +136,9 @@ space  pause the queue, and resume it: what is downloading stops and goes on fro
        was; nothing starts while it is paused, and it stays paused when vidpull is closed
 d      delete the selected job or run (asks; can also delete its files)
 o      open the download folder              f  clear the list: what is finished moves to History
+2      Failed: what failed or was not found, once its run is over. enter gives the selected
+       one another link to download from (a song keeps its title, artists and cover),
+       r retries it, d takes it off the list. 1 is the Downloads tab, 3 the History
 h      History: every finished download with its own log, the app log, the update log
        (r brings one back onto the list, d deletes it for good, esc returns to the list)
 w      toggle the clipboard watcher          s  settings
@@ -280,6 +290,9 @@ class VidpullApp(App[PostExit | None]):
         Binding("o", "open", "Open"),
         Binding("f", "clear_finished", "Clear list"),
         Binding("h", "history", "History"),
+        Binding("1", "show_tab('tab-downloads')", "Downloads", show=False),
+        Binding("2", "show_tab('tab-failed')", "Failed", show=False),
+        Binding("3", "show_tab('tab-history')", "History", show=False),
         Binding("w", "toggle_watch", "Clipboard", show=False),
         Binding("s", "settings", "Settings"),
         Binding("u", "update", "Update"),
@@ -335,6 +348,7 @@ class VidpullApp(App[PostExit | None]):
         # "apply to all" for the links still waiting: True downloads duplicates again
         self._batch_duplicates: bool | None = None
         self._known: Finder | None = None  # what was downloaded before, for one paste
+        self._failed_rows: list[tuple[str, str, str, str]] | None = None  # as they are shown
         self._quitting = threading.Event()  # set when the app is quit
         self._asking: _Asking | None = None  # a run's duplicate question, while it is up
         self._questions: list[_Question] = []  # runs waiting to ask theirs
@@ -358,8 +372,18 @@ class VidpullApp(App[PostExit | None]):
         return self.query_one("#history", DataTable)
 
     @property
+    def failed_table(self) -> DataTable:
+        return self.query_one("#failed", DataTable)
+
+    @property
     def views(self) -> TabbedContent:
         return self.query_one("#views", TabbedContent)
+
+    def _in_failed(self) -> bool:
+        try:
+            return self.views.active == "tab-failed"
+        except NoMatches:
+            return False
 
     def _in_history(self) -> bool:
         try:
@@ -437,6 +461,15 @@ class VidpullApp(App[PostExit | None]):
                         yield Button("Clear list", id="clear-list", compact=True)
                         yield Static(BAR_HINT, id="bar-hint", classes="bar-hint")
                     yield DataTable(id="jobs", cursor_type="row", zebra_stripes=True)
+                with TabPane("Failed", id="tab-failed"):
+                    with Horizontal(classes="bar"):
+                        yield Button("Another link", id="fail-link", compact=True)
+                        yield Button("Retry", id="fail-retry", compact=True)
+                        yield Button("Delete", id="fail-delete", compact=True)
+                        yield Button("Retry all", id="fail-retry-all", compact=True)
+                        yield Button("Delete all", id="fail-delete-all", compact=True)
+                    yield Static(FAILED_HINT, id="failed-hint", classes="bar-hint")
+                    yield DataTable(id="failed", cursor_type="row", zebra_stripes=True)
                 with TabPane("History", id="tab-history"):
                     with Horizontal(classes="bar"):
                         yield Button("This download", id="log-download", compact=True)
@@ -457,6 +490,7 @@ class VidpullApp(App[PostExit | None]):
         keys = table.add_columns(*COLUMNS)
         self._columns = dict(zip(COLUMNS, keys, strict=True))
         self.history_table.add_columns(*HISTORY_COLUMNS)
+        self.failed_table.add_columns(*FAILED_COLUMNS)
         if self.store.get_meta(PAUSE_META) == "1":
             self.manager.pause()  # it was paused when vidpull was closed: nothing starts
         self.manager.start()  # requeues interrupted jobs first, so the rows below are current
@@ -505,8 +539,24 @@ class VidpullApp(App[PostExit | None]):
                 self._table.move_cursor(row=self._table.get_row_index(key))
         if group.is_terminal:
             self._install_deferred()  # a run's songs do not come by one by one
+        if group.is_terminal:
+            self._reload_failed()  # what failed in it is left to resolve from now on
         if group.status == GroupStatus.DONE and previous not in {None, GroupStatus.DONE}:
-            self._desktop_notify(f"{group.kind.capitalize()} finished", group.display_title)
+            progress = self.manager.group_progress(group)
+            self._desktop_notify(
+                f"{group.kind.capitalize()} finished",
+                f"{group.display_title}: {progress.tally()}",
+            )
+            if progress.unresolved:
+                self.notify(
+                    f"{progress.tally()}. What failed or was not found is in the Failed "
+                    "tab (press 2, or click it): give it another link, retry it or delete it",
+                    title=_short(group.display_title, 40),
+                    severity="warning",
+                    timeout=20,
+                )
+            else:
+                self.notify(progress.tally(), title=_short(group.display_title, 40), timeout=8)
         elif group.status == GroupStatus.FAILED and previous not in {None, GroupStatus.FAILED}:
             self.notify(
                 f"{_short(group.display_title, 50)}: {group.error}",
@@ -544,6 +594,8 @@ class VidpullApp(App[PostExit | None]):
             )
         if job.is_terminal and self._in_history():
             self._reload_history()
+        if job.is_terminal or job.status == JobStatus.QUEUED:
+            self._reload_failed()  # it failed, or it left the list to be tried again
         if job.is_terminal:
             self._install_deferred()
 
@@ -1000,6 +1052,8 @@ class VidpullApp(App[PostExit | None]):
 
     def on_paste(self, event: events.Paste) -> None:
         """A paste that landed outside the link box (the table, or a modal)."""
+        if isinstance(self.screen, LinkScreen):
+            return  # it is the link that was asked for, not a new download
         if self.accept_pasted_text(event.text):
             event.stop()
             return
@@ -1106,10 +1160,168 @@ class VidpullApp(App[PostExit | None]):
         self._reload_history()
         self.history_table.focus()
 
+    def action_show_tab(self, tab: str) -> None:
+        """1, 2, 3: the Downloads, the Failed and the History tab."""
+        self.views.active = tab
+        if tab == "tab-history":
+            self._reload_history()
+            self.history_table.focus()
+        elif tab == "tab-failed":
+            self._reload_failed()
+            self.failed_table.focus()
+        else:
+            self.table.focus()
+
     @on(TabbedContent.TabActivated, "#views")
     def _view_changed(self, event: TabbedContent.TabActivated) -> None:
         if event.pane.id == "tab-history":
             self._reload_history()
+        elif event.pane.id == "tab-failed":
+            self._reload_failed()
+
+    # --------------------------------------------------------------- failed
+    def _failed_id(self) -> int | None:
+        table = self.failed_table
+        if table.row_count == 0:
+            return None
+        try:
+            row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+        except Exception:
+            return None
+        return None if row_key is None or row_key.value is None else int(str(row_key.value))
+
+    def _reload_failed(self) -> None:
+        """Fill the Failed tab and put their number on it, keeping the cursor where it was."""
+        try:
+            table = self.failed_table
+        except NoMatches:
+            return
+        found = history.failures(self.store)
+        rows = [
+            (
+                str(one.job.id),
+                _short(one.job.display_title, 46),
+                _short(one.where, 28),
+                _short(one.brief, 80),
+            )
+            for one in found
+        ]
+        if rows != self._failed_rows:
+            before = self._failed_id()
+            at = table.cursor_row
+            table.clear()
+            for number, title, where, why in rows:
+                table.add_row(number, Text(title), Text(where), Text(why, style="red"), key=number)
+            self._failed_rows = rows
+            keys = [row[0] for row in rows]
+            if rows:
+                # the one that was selected, or, when it is gone, the one that took its place
+                row = keys.index(str(before)) if str(before) in keys else min(at, len(rows) - 1)
+                with contextlib.suppress(Exception):
+                    table.move_cursor(row=max(0, row))
+        label = f"Failed ({len(rows)})" if rows else "Failed"
+        with contextlib.suppress(Exception):
+            self.views.get_tab("tab-failed").label = label
+            self.query_one("#failed-hint", Static).update(FAILED_HINT if rows else FAILED_NONE)
+
+    def _failed_job(self) -> Job | None:
+        job_id = self._failed_id()
+        job = self.store.get(job_id) if job_id is not None else None
+        if job is None:
+            self.notify("nothing is selected in the Failed tab", severity="warning", timeout=4)
+        return job
+
+    def action_another_link(self, job: Job | None = None) -> None:
+        """Give a download that failed or was not found another link to come from."""
+        job = job or self._failed_job()
+        if job is None or job.id is None:
+            return
+        job_id = job.id
+
+        def take(link: str) -> str | None:
+            try:
+                self.manager.relink(job_id, link)
+            except ValueError as exc:
+                return str(exc)
+            return None
+
+        def taken(done: bool | None) -> None:
+            if done:
+                self.notify(
+                    f"downloading {_short(job.display_title, 50)} from the link you gave",
+                    timeout=6,
+                )
+            self._reload_failed()
+
+        why = history.brief_reason(job.error or job.phase or job.status.value)
+        self.push_screen(
+            LinkScreen(job.display_title, _short(why, 200), take, song=job.song is not None),
+            callback=taken,
+        )
+
+    def _drop_failed(self, job: Job) -> None:
+        """Take a failed download off the list for good; its run keeps a line about it."""
+        if job.id is None:
+            return
+        why = history.brief_reason(job.error or job.phase or job.status.value)
+        if job.group_id is not None:
+            self.store.add_log(
+                "info",
+                f"taken off the failed list: {job.display_title} ({_short(why, 120)})",
+                group_id=job.group_id,
+            )
+        self.manager.delete(job.id, delete_files=False)
+
+    @on(DataTable.RowSelected, "#failed")
+    def _failed_chosen(self) -> None:
+        self.action_another_link()
+
+    @on(Button.Pressed, "#fail-link")
+    def _fail_link_pressed(self) -> None:
+        self.action_another_link()
+
+    @on(Button.Pressed, "#fail-retry")
+    def _fail_retry_pressed(self) -> None:
+        self.action_retry()
+
+    @on(Button.Pressed, "#fail-delete")
+    def _fail_delete_pressed(self) -> None:
+        self.action_delete()
+
+    @on(Button.Pressed, "#fail-retry-all")
+    def _fail_retry_all(self) -> None:
+        found = history.failures(self.store)
+        queued = sum(
+            1 for one in found if one.job.id is not None and self.manager.retry(one.job.id)
+        )
+        self.notify(
+            f"trying {queued} download(s) again" if queued else "nothing here to retry", timeout=5
+        )
+        self._reload_failed()
+
+    @on(Button.Pressed, "#fail-delete-all")
+    def _fail_delete_all(self) -> None:
+        found = history.failures(self.store)
+        if not found:
+            self.notify("nothing here to delete", timeout=4)
+            return
+
+        def decided(result: tuple[bool, bool] | None) -> None:
+            if result and result[0]:
+                for one in found:
+                    self._drop_failed(one.job)
+                self.notify(f"took {len(found)} failed download(s) off the list", timeout=6)
+                self._reload_failed()
+
+        self.push_screen(
+            ConfirmScreen(
+                f"Take all {len(found)} failed downloads off the list? No file is touched; "
+                "each run keeps a line about what was taken off.",
+                danger=True,
+                yes_label="Delete all",
+            ),
+            callback=decided,
+        )
 
     @on(Button.Pressed, "#clear-list")
     def _clear_pressed(self) -> None:
@@ -1272,6 +1484,9 @@ class VidpullApp(App[PostExit | None]):
             self.notify("only failed or cancelled jobs can be retried", severity="warning")
         elif from_history:
             self._focus_list()  # it is back on the list
+        elif self._in_failed():
+            self.notify(f"trying {_short(job.display_title, 50)} again", timeout=4)
+        self._reload_failed()
 
     def action_delete(self) -> None:
         selected = self._selected()
@@ -1300,6 +1515,12 @@ class VidpullApp(App[PostExit | None]):
             return
         job = selected
         if job is None or job.id is None:
+            return
+        if self._in_failed():
+            # nothing was downloaded, so there is nothing to ask about
+            self._drop_failed(job)
+            self.notify(f"took {_short(job.display_title, 50)} off the list", timeout=4)
+            self._reload_failed()
             return
         job_id = job.id
         checkbox = "Also delete its downloaded file(s)" if job.files else None
@@ -1504,6 +1725,9 @@ class VidpullApp(App[PostExit | None]):
         if self._in_history():
             key = self._history_key()
             return history.find(self.store, key) if key else None
+        if self._in_failed():
+            job_id = self._failed_id()
+            return self.store.get(job_id) if job_id is not None else None
         table = self.table
         if table.row_count == 0:
             return None
@@ -1532,7 +1756,7 @@ class VidpullApp(App[PostExit | None]):
             status = brief_note(group.error) if group.error else "resolving"
             bar = ""
         else:
-            title = f"{group.display_title} · {group.entry_count} songs"
+            title = _run_title(group.display_title, progress)
             if group.status == GroupStatus.ACTIVE:
                 if self.manager.paused and progress.active is None:
                     stage = "paused"
@@ -1542,29 +1766,28 @@ class VidpullApp(App[PostExit | None]):
                     stage = "retrying"  # a service did not answer; the song's row says which
                 else:
                     stage = progress.active.status.value if progress.active else "queued"
-                status = f"{stage} {progress.done}/{progress.total}"
+                status = stage
                 if progress.stages > 1:
                     status += f" · batch {progress.stage}/{progress.stages}"
             elif group.status == GroupStatus.DONE:
-                status = f"done {progress.done}/{progress.total}"
+                status = "done"
                 if progress.skipped:
-                    status += f", {progress.skipped} skipped"
-                if progress.failed or progress.pending:
-                    status += f", {progress.failed + progress.pending} not found or failed"
+                    status += f" · {progress.skipped} skipped"
+                if progress.unresolved:
+                    status += f" · {progress.unresolved} failed: press 2"
             elif group.status == GroupStatus.CANCELLED:
-                status = f"cancelled, {progress.done}/{progress.total} done"
+                status = "cancelled"
             else:
                 status = f"failed: {group.error}" if group.error else "failed"
             bar = _bar_percent(progress.percent)
-        active = progress.active
         return [
             f"G{group.id}",
-            Text(_short(title, 48)),
+            Text(title),
             Text(_short(group.selection.label, 34)),
             Text(_short(status, 40), style=GROUP_STYLE.get(group.status, "")),
             Text(bar),
-            Text(_speed(active.speed) if active else ""),
-            Text(_eta(active.eta) if active else ""),
+            Text(_speed(progress.speed)),
+            Text(_eta(progress.eta) if group.status == GroupStatus.ACTIVE else ""),
             Text(human_size(progress.bytes) if progress.bytes else ""),
         ]
 
@@ -1636,9 +1859,12 @@ class VidpullApp(App[PostExit | None]):
     def _refresh_status(self) -> None:
         self._next_question()  # a run's question that waited for a screen to close
         self._follow_pause()
-        for group in self.store.list_groups():
-            if group.status == GroupStatus.RESOLVING:
-                self._upsert_group(group)  # keeps the elapsed time moving while spotDL works
+        self._reload_failed()
+        for group in self.store.list_groups(cleared=False):
+            if group.status in {GroupStatus.RESOLVING, GroupStatus.ACTIVE}:
+                # keeps the elapsed time moving while spotDL works, and a run's estimate
+                # while a song is looked for, which takes longer than its download
+                self._upsert_group(group)
         counts = self.store.counts()
         parts = [
             f"vidpull {__version__}",
@@ -1649,10 +1875,14 @@ class VidpullApp(App[PostExit | None]):
         ]
         if counts.get("staged"):
             parts.append(f"{counts['staged']} staged")
-        if counts.get("pending"):
-            parts.append(f"{counts['pending']} pending (p)")
+        # a song that was not found is pending too, and it is no link waiting for a format
+        copied = [j for j in self.store.list([JobStatus.PENDING], cleared=False) if not j.song]
+        if copied:
+            parts.append(f"{len(copied)} pending (p)")
         parts.append(f"{counts.get('done', 0)} done")
-        if counts.get("failed"):
+        if self._failed_rows:
+            parts.append(f"{len(self._failed_rows)} failed (press 2)")
+        elif counts.get("failed"):
             parts.append(f"{counts['failed']} failed")
         parts.append("clipboard " + ("on" if self._watcher else "off"))
         self._check_stale()
@@ -1728,6 +1958,17 @@ def _bar(job: Job) -> str:
     if job.status in {JobStatus.PENDING, JobStatus.QUEUED}:
         return ""
     return _bar_percent(job.progress)
+
+
+def _run_title(name: str, progress: GroupProgress, width: int = 56) -> str:
+    """A run's name with how it stands: ``Hevs199099 · 534/676 done · 20 failed``.
+
+    The count is what is read; a long name gives way to it.
+    """
+    tally = f" · {progress.done}/{progress.total} done"
+    if progress.unresolved:
+        tally += f" · {progress.unresolved} failed"
+    return _short(name, max(12, width - len(tally))) + tally
 
 
 def _bar_percent(percent: float) -> str:

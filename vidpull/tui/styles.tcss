@@ -99,6 +99,7 @@ VerticalScroll {
 }
 
 GroupScreen #dialog {
+    width: 98%;
     height: 85%;
 }
 
@@ -120,9 +121,20 @@ GroupScreen DataTable {
     width: 1fr;
 }
 
-#history {
+#history,
+#failed {
     height: 1fr;
     margin: 0 1;
+}
+
+#failed-hint {
+    height: auto;
+    margin: 0 1;
+}
+
+#link-problem {
+    height: auto;
+    margin-bottom: 1;
 }
 
 #history-log {

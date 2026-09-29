@@ -1,6 +1,14 @@
 import threading
+import time
 
-from tests.helpers import MATCHED_URL, FakeEngine, FakeSongEngine, sample_song, wait_until
+from tests.helpers import (
+    MATCHED_URL,
+    FakeEngine,
+    FakeSongEngine,
+    PickySongEngine,
+    sample_song,
+    wait_until,
+)
 from vidpull.engine import DownloadResult
 from vidpull.manager import NO_MATCH_PHASE, DownloadManager
 from vidpull.models import Group, GroupStatus, Job, JobStatus, Selection, SelectionKind
@@ -1227,3 +1235,337 @@ def test_closing_while_paused_keeps_what_waits(store, config, paths):
         assert wait_until(lambda: store.get(job.id).status == JobStatus.DONE)
     finally:
         second.stop()
+
+
+def a_run_with_trouble(store, config, paths, engine=None, workers=1):
+    """Five songs: Song 2 fails, Song 4 is not found, the rest download."""
+    engine = engine or FakeEngine()
+    manager, events = make_manager(store, config, paths, engine, workers=workers)
+    manager.song_engine = PickySongEngine(
+        songs=five_songs(), fails=("Song 2",), unfound=("Song 4",)
+    )
+    manager.start()
+    group = manager.start_group(ALBUM, "album", selection())
+    manager.resolve_group(group.id)
+    assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+    return manager, engine, group, events
+
+
+def test_a_run_says_how_it_stands_as_it_goes(store, config, paths):
+    manager, engine, group, _ = a_run_with_trouble(store, config, paths)
+    try:
+        progress = manager.group_progress(store.get_group(group.id))
+        assert (progress.total, progress.done, progress.failed, progress.pending) == (5, 3, 1, 1)
+        assert progress.downloaded == 3 and progress.unresolved == 2
+        assert progress.tally() == "3/5 downloaded · 1 failed · 1 not found"
+        assert store.get_group(group.id).error == "1 failed, 1 not found"
+        # what the rows are counted from is one query, and says what the songs say
+        counts, skipped, size = store.group_summary(group.id)
+        songs = store.list(group_id=group.id)
+        assert counts == {"done": 3, "failed": 1, "pending": 1} and skipped == 0
+        assert size == sum(s.total_bytes or s.downloaded_bytes or 0 for s in songs)
+        assert store.group_summary(999) == ({}, 0, 0)
+    finally:
+        manager.stop()
+
+
+def test_the_tally_counts_what_was_skipped_apart(store, config, paths):
+    config.duplicates = "skip"
+    songs = five_songs()
+    earlier_download(store, paths, songs[0], "one.mp3")
+    manager, _ = make_manager(store, config, paths, FakeEngine(), workers=1)
+    manager.song_engine = FakeSongEngine(songs=songs)
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        progress = manager.group_progress(store.get_group(group.id))
+        assert progress.tally() == "4/5 downloaded · 1 skipped"
+        assert (progress.done, progress.downloaded, progress.skipped) == (5, 4, 1)
+    finally:
+        manager.stop()
+
+
+def test_another_link_for_a_song_that_was_not_found(store, config, paths):
+    manager, engine, group, _ = a_run_with_trouble(store, config, paths)
+    try:
+        songs = {j.song.title: j for j in store.list(group_id=group.id)}
+        unfound, failed = songs["Song 4"], songs["Song 2"]
+        before = len(manager.song_engine.matched)
+        queued = manager.relink(unfound.id, "  youtu.be/abcdefghijk  ")
+        assert queued.status == JobStatus.QUEUED
+        assert queued.matched_url == "https://youtu.be/abcdefghijk"
+        assert wait_until(lambda: store.get(unfound.id).status == JobStatus.DONE)
+        assert len(manager.song_engine.matched) == before  # the link is the match
+        assert engine.json_probes[-1] == "https://youtu.be/abcdefghijk"
+        assert engine.infos[-1]["track"] == "Song 4"  # the song keeps what it is
+        assert engine.infos[-1]["artist"] == "Carly Rae Jepsen"
+        logged = [line.message for line in store.job_log(unfound.id)]
+        assert "given another link: https://youtu.be/abcdefghijk" in logged
+        # the run was over; it counts anew when the song has ended, and leaves the rest alone
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert store.get_group(group.id).error == "1 failed"
+        assert store.get(failed.id).status == JobStatus.FAILED
+        tried = [title for title in manager.song_engine.matched if title.endswith("Song 2")]
+        assert len(tried) == 2  # its second pass, and no third
+    finally:
+        manager.stop()
+
+
+def test_another_link_for_a_download_that_failed(store, config, paths):
+    engine = FakeEngine(fail=True)
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.start()
+    try:
+        job = manager.enqueue("https://vimeo.com/1", selection())
+        assert wait_until(lambda: store.get(job.id).status == JobStatus.FAILED)
+        engine.fail = False
+        queued = manager.relink(job.id, "https://vimeo.com/2?utm_source=x")
+        assert queued.url == "https://vimeo.com/2?utm_source=x" and queued.matched_url == ""
+        assert wait_until(lambda: store.get(job.id).status == JobStatus.DONE)
+    finally:
+        manager.stop()
+
+
+def test_a_link_that_will_not_do(store, config, paths):
+    import pytest
+
+    manager, engine, group, _ = a_run_with_trouble(store, config, paths)
+    try:
+        songs = {j.song.title: j for j in store.list(group_id=group.id)}
+        failed, done = songs["Song 2"], songs["Song 1"]
+        for link, words in (
+            ("", "that is not a link"),
+            ("not a link at all", "that is not a link"),
+            ("https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl", "not its sound"),
+            ("spotify:track:11dFghVXANMlKmJXsNCbNl", "not its sound"),
+        ):
+            with pytest.raises(ValueError, match=words):
+                manager.relink(failed.id, link)
+        with pytest.raises(ValueError, match="only a download that failed"):
+            manager.relink(done.id, "https://youtu.be/abcdefghijk")
+        with pytest.raises(ValueError, match="that download is gone"):
+            manager.relink(9999, "https://youtu.be/abcdefghijk")
+        assert store.get(failed.id).status == JobStatus.FAILED and len(engine.downloads) == 3
+    finally:
+        manager.stop()
+
+
+def test_a_song_tried_again_brings_its_run_back(store, config, paths):
+    manager, engine, group, _ = a_run_with_trouble(store, config, paths)
+    try:
+        assert manager.clear_finished() == 1  # the run is in the history now
+        assert store.get_group(group.id).cleared_at is not None
+        failed = next(j for j in store.list(group_id=group.id) if j.status == JobStatus.FAILED)
+        manager.song_engine.fails = ()
+        assert manager.retry(failed.id) is not None
+        assert store.get_group(group.id).cleared_at is None  # back on the list, all of it
+        assert all(j.cleared_at is None for j in store.list(group_id=group.id))
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert store.get(failed.id).status == JobStatus.DONE
+        assert store.get_group(group.id).error == "1 not found"
+    finally:
+        manager.stop()
+
+
+def test_the_speed_of_a_run_is_what_its_songs_download_at_together(store, config, paths):
+    manager, _ = make_manager(store, config, paths, FakeEngine(), workers=1)
+    group = store.add_group(
+        Group(url=ALBUM, kind="album", selection=selection(), status=GroupStatus.ACTIVE)
+    )
+    for status, speed in (
+        (JobStatus.MATCHING, None),  # the first of them, and it has no speed to show
+        (JobStatus.DOWNLOADING, 2000.0),
+        (JobStatus.DOWNLOADING, 500.0),
+        (JobStatus.PROCESSING, 900.0),  # a speed left over from its download
+        (JobStatus.STAGED, None),
+        (JobStatus.QUEUED, None),
+    ):
+        job = Job(url="https://e/s", selection=selection(), status=status, group_id=group.id)
+        job.speed = speed
+        store.add(job)
+    progress = manager.group_progress(group)
+    assert progress.speed == 2500.0
+    assert (progress.staged, progress.queued, progress.total) == (1, 1, 6)
+    assert progress.active is not None and progress.eta is None  # nothing has ended yet
+    assert manager.group_progress(Group(url=ALBUM, kind="album", selection=selection())).total == 0
+
+
+def test_a_run_estimates_its_end_from_how_its_last_songs_went(store, config, paths, monkeypatch):
+    from collections import deque
+
+    from vidpull import manager as module
+
+    manager, _ = make_manager(store, config, paths, FakeEngine(), workers=1)
+    group = store.add_group(
+        Group(url=ALBUM, kind="album", selection=selection(), status=GroupStatus.ACTIVE)
+    )
+    for status in [JobStatus.DONE] * 4 + [JobStatus.DOWNLOADING] + [JobStatus.STAGED] * 9:
+        store.add(Job(url="https://e/s", selection=selection(), status=status, group_id=group.id))
+    now = 1000.0
+    monkeypatch.setattr(module.time, "monotonic", lambda: now)
+    manager._ended[group.id] = deque([now - 62, now - 42, now - 22, now - 2])  # one in 20 s
+    assert manager.group_progress(group).eta == 10 * 20 - 2  # ten left, two seconds in
+    manager._ended[group.id] = deque([now - 22, now - 2])
+    assert manager.group_progress(group).eta is None  # too few to go by
+    manager._ended[group.id] = deque([now - 62, now - 42, now - 22, now - 2])
+    manager.pause()
+    assert manager.group_progress(group).eta is None  # it stands still
+    manager.resume()
+    assert manager._ended == {}  # and how fast it was before says nothing now
+    # a song that has been at it far longer than the others does not make the rest negative
+    manager._ended[group.id] = deque([now - 1000, now - 980, now - 960])
+    assert manager.group_progress(group).eta == 10 * 20 - 20
+
+
+def test_a_run_remembers_that_it_was_over(store, config, paths):
+    manager, engine, group, _ = a_run_with_trouble(store, config, paths)
+    try:
+        ended = store.get_group(group.id).ended_at
+        assert ended is not None
+        songs = {j.song.title: j for j in store.list(group_id=group.id)}
+        assert manager.relink(songs["Song 4"].id, "https://youtu.be/abcdefghijk")
+        assert wait_until(lambda: store.get(songs["Song 4"].id).status == JobStatus.DONE)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert store.get_group(group.id).ended_at == ended  # the first time it was over
+    finally:
+        manager.stop()
+
+
+def test_a_run_that_was_cancelled_was_not_through_its_songs(store, config, paths):
+    import threading
+
+    block = threading.Event()
+    manager, _ = make_manager(store, config, paths, FakeEngine(block=block), workers=1)
+    manager.song_engine = FakeSongEngine(songs=five_songs())
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert wait_until(lambda: manager.active_count == 1)
+        assert manager.cancel_group(group.id)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.CANCELLED)
+        assert store.get_group(group.id).ended_at is None
+    finally:
+        block.set()
+        manager.stop()
+
+
+def test_a_song_tried_again_in_a_later_session_does_not_bring_the_others_with_it(
+    store, config, paths
+):
+    """The link was given from the command line, or the app was closed before the song
+    came: the app that runs it next knows from the run that it was over before."""
+    from vidpull import history
+
+    manager, engine, group, _ = a_run_with_trouble(store, config, paths)
+    songs = {j.song.title: j for j in store.list(group_id=group.id)}
+    manager.stop()
+    idle, _ = make_manager(store, config, paths, FakeEngine(), workers=1)  # never started
+    idle.relink(songs["Song 4"].id, "https://youtu.be/abcdefghijk")
+    assert store.get_group(group.id).status == GroupStatus.ACTIVE
+    # what else failed in it stays left to resolve while it is live again
+    assert [one.job.id for one in history.failures(store)] == [songs["Song 2"].id]
+
+    later, _ = make_manager(store, config, paths, engine, workers=1)
+    later.song_engine = PickySongEngine(songs=five_songs(), fails=("Song 2",))
+    later.start()
+    try:
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert store.get(songs["Song 4"].id).status == JobStatus.DONE
+        assert store.get(songs["Song 2"].id).status == JobStatus.FAILED
+        assert later.song_engine.matched == []  # nobody asked for Song 2 again
+        assert store.get_group(group.id).error == "1 failed"
+    finally:
+        later.stop()
+
+
+def test_a_run_counts_again_when_a_song_of_it_is_deleted(store, config, paths):
+    manager, engine, group, events = a_run_with_trouble(store, config, paths)
+    try:
+        songs = {j.song.title: j for j in store.list(group_id=group.id)}
+        assert store.get_group(group.id).error == "1 failed, 1 not found"
+        assert manager.delete(songs["Song 4"].id)
+        assert store.get_group(group.id).error == "1 failed"
+        progress = manager.group_progress(store.get_group(group.id))
+        assert progress.tally() == "3/4 downloaded · 1 failed"
+        assert manager.delete(songs["Song 2"].id)
+        assert store.get_group(group.id).error == ""
+        assert store.get_group(group.id).status == GroupStatus.DONE
+        assert manager.group_progress(store.get_group(group.id)).tally() == "3/3 downloaded"
+    finally:
+        manager.stop()
+
+
+class Transfers(FakeEngine):
+    """Reports what yt-dlp reports of a song: a line or two of a transfer that takes no
+    time, and no speed with the line that says the file is through."""
+
+    def __init__(self, lines, took=0.12, **kwargs):
+        super().__init__(**kwargs)
+        self.lines = lines
+        self.took = took
+        self.held = threading.Event()  # set: the download waits before it goes on to convert
+        self.go = threading.Event()
+
+    def download(self, job, download_dir, temp_dir, on_progress, cancel, on_log, *, info=None):
+        from vidpull.engine import Progress
+
+        self.downloads.append(job.id)
+        for status, downloaded, speed in self.lines:
+            if status == "finished":
+                time.sleep(self.took)
+            on_progress(Progress(status=status, downloaded=downloaded, total=4000, speed=speed))
+        if self.held.is_set():
+            self.go.wait(5)
+        on_progress(Progress(status="processing", phase="extracting audio"))
+        return DownloadResult(ok=True, files=[], returncode=0)
+
+
+def test_a_transfer_too_short_to_name_its_speed_is_measured(store, config, paths):
+    engine = Transfers([("downloading", 100, None), ("finished", 4000, None)])
+    engine.held.set()
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.start()
+    try:
+        job = manager.enqueue("https://e/v", selection())
+        assert wait_until(lambda: store.get(job.id).downloaded_bytes == 4000)
+        speed = store.get(job.id).speed
+        assert speed is not None and 4000 / 1.0 < speed <= 4000 / 0.12  # what came, over the time
+        engine.go.set()
+        assert wait_until(lambda: store.get(job.id).status == JobStatus.DONE)
+        assert store.get(job.id).speed is None
+    finally:
+        engine.go.set()
+        manager.stop()
+
+
+def test_a_run_shows_the_speed_of_its_last_transfer_between_transfers(
+    store, config, paths, monkeypatch
+):
+    from vidpull import manager as module
+
+    engine = Transfers([("downloading", 2000, 5000.0), ("finished", 4000, None)], took=0.0)
+    manager, _ = make_manager(store, config, paths, engine, workers=1)
+    manager.song_engine = FakeSongEngine(songs=five_songs())
+    manager.start()
+    try:
+        group = manager.start_group(ALBUM, "album", selection())
+        manager.resolve_group(group.id)
+        assert wait_until(lambda: store.get_group(group.id).status == GroupStatus.DONE)
+        assert manager._speeds[group.id][0] == 5000.0  # what yt-dlp named is what is kept
+        over = store.get_group(group.id)
+        assert manager.group_progress(over).speed is None  # the run is over: nothing downloads
+
+        live = store.update_group(group.id, status=GroupStatus.ACTIVE)
+        assert manager.group_progress(live).speed == 5000.0  # the last transfer, a moment ago
+        at = time.monotonic()
+        monkeypatch.setattr(module.time, "monotonic", lambda: at + module.SPEED_KEPT + 1)
+        assert manager.group_progress(live).speed is None  # that is too long ago to say
+        monkeypatch.setattr(module.time, "monotonic", lambda: at)
+        manager.pause()
+        assert manager.group_progress(live).speed is None and manager._speeds == {}
+        manager.resume()
+    finally:
+        manager.stop()

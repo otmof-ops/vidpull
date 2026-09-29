@@ -283,3 +283,82 @@ def test_each_download_keeps_its_own_log(store: Store, monkeypatch):
     assert store.delete_group(7) or store.group_log(7) == []
     store.close()
     store.add_log("info", "after close", job_id=second.id)  # never raises
+
+
+def test_migrates_a_version_4_database_and_an_older_vidpull_can_still_write_to_it(paths):
+    """Version 5 gives a run the time it was over for the first time. The column is
+    optional, so a vidpull rolled back to 1.5.0 reads and writes the same database."""
+    import sqlite3
+
+    from vidpull.models import GroupStatus
+
+    path = paths.db_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', uploader TEXT NOT NULL DEFAULT '',
+            duration REAL, is_playlist INTEGER NOT NULL DEFAULT 0, entry_count INTEGER,
+            selection TEXT NOT NULL, status TEXT NOT NULL, progress REAL NOT NULL DEFAULT 0,
+            downloaded_bytes INTEGER, total_bytes INTEGER, speed REAL, eta REAL,
+            phase TEXT NOT NULL DEFAULT '', filename TEXT NOT NULL DEFAULT '',
+            files TEXT NOT NULL DEFAULT '[]', error TEXT NOT NULL DEFAULT '',
+            worker TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            started_at TEXT, finished_at TEXT, song TEXT NOT NULL DEFAULT '',
+            matched_url TEXT NOT NULL DEFAULT '', group_id INTEGER, cleared_at TEXT
+        );
+        CREATE TABLE groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL, kind TEXT NOT NULL,
+            selection TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+            entry_count INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, cleared_at TEXT
+        );
+        CREATE TABLE job_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, group_id INTEGER,
+            at TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL
+        );
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta VALUES ('schema_version', '4');
+        """
+    )
+    selection = Selection(SelectionKind.PRESET, "best", "Best").to_json()
+    old_insert = (
+        "INSERT INTO groups(url, kind, selection, name, status, entry_count, error, "
+        "created_at, updated_at, cleared_at) VALUES(?, 'playlist', ?, ?, 'done', 676, "
+        "'8 failed, 16 not found', 't', 't', NULL)"
+    )
+    conn.execute(old_insert, ("https://open.spotify.com/playlist/p", selection, "Hevs199099"))
+    conn.execute(
+        "INSERT INTO jobs(url, selection, status, error, created_at, updated_at, group_id) "
+        "VALUES('https://e/song', ?, 'failed', 'Sign in to confirm your age', 't', 't', 1)",
+        (selection,),
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    try:
+        assert store.get_meta("schema_version") == str(SCHEMA_VERSION) == "5"
+        group = store.get_group(1)
+        assert group.name == "Hevs199099" and group.ended_at is None
+        assert group.status == GroupStatus.DONE and store.get(1).status == JobStatus.FAILED
+        assert store.update_group(1, ended_at="2026-09-30T00:00:00+00:00").ended_at
+        assert store.group_summary(1) == ({"failed": 1}, 0, 0)
+    finally:
+        store.close()
+    # what 1.5.0 does with it: it names the columns it knows, and reads rows by name
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    conn.execute(old_insert, ("https://open.spotify.com/album/a", selection, "Added by 1.5.0"))
+    conn.commit()
+    row = conn.execute("SELECT * FROM groups WHERE id = 2").fetchone()
+    assert row["name"] == "Added by 1.5.0" and row["cleared_at"] is None
+    conn.close()
+    again = Store(path)  # and the newer one takes it from there
+    try:
+        assert again.get_group(2).ended_at is None and len(again.list_groups()) == 2
+        assert again.get_meta("schema_version") == "5"
+    finally:
+        again.close()

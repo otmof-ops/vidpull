@@ -6,6 +6,7 @@ its files; this module reads them back for the History tab and ``vidpull queue h
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -117,6 +118,79 @@ def entries(store: Store, *, limit: int = MAX_ENTRIES) -> list[Entry]:
         )
     found.sort(key=lambda entry: entry.when, reverse=True)
     return found[: max(1, limit)]
+
+
+# what yt-dlp leads an error with: "ERROR: ", the link, "[youtube] Z3-8c1CLiIQ: "
+_REASON_LEAD = re.compile(r"^(?:ERROR:\s*)?(?:https?://\S+?:\s+)?(?:\[[^\]\s]+\]\s+\S+:\s+)?")
+_REASON_LINK = re.compile(r"\s*[-:]\s*https?://\S+\s*$")
+_SENTENCE_END = re.compile(r"(?<=[^\s.])\.\s+(?=[A-Z])")
+# said in yt-dlp's words, which are about its own options
+_PLAIN_WORDS = (("sign in to confirm your age", "age-restricted: needs a YouTube sign-in"),)
+
+
+def brief_reason(text: str) -> str:
+    """Why a download did not come, in the few words a list has room for: the first
+    sentence of it, without the link and the extractor's name in front."""
+    whole = " ".join(text.split())
+    lowered = whole.lower()
+    for sign, words in _PLAIN_WORDS:
+        if sign in lowered:
+            return words
+    brief = _REASON_LEAD.sub("", whole, count=1)
+    brief = _SENTENCE_END.split(brief, maxsplit=1)[0]
+    brief = _REASON_LINK.sub("", brief).strip()
+    return brief or whole
+
+
+@dataclass
+class Failure:
+    """A download that is over and did not come: what is left to resolve."""
+
+    job: Job
+    group: Group | None  # the run it is a song of
+    why: str
+
+    @property
+    def where(self) -> str:
+        if self.group is None:
+            return ""
+        return f"G{self.group.id} {self.group.display_title}"
+
+    @property
+    def brief(self) -> str:
+        return brief_reason(self.why)
+
+
+def is_unresolved(job: Job) -> bool:
+    """Failed, or a song no match was found for."""
+    if job.status == JobStatus.FAILED:
+        return True
+    return job.status == JobStatus.PENDING and job.song is not None
+
+
+def failures(store: Store) -> list[Failure]:
+    """What failed or was not found, in the order it was added, once its run is over.
+
+    While a run goes on it may still try a failed song a second time, so its songs are
+    not listed yet. They stay listed when the run is live again because one of them is
+    tried again. A run that was cleared from the list still has its failures here: they
+    are left to resolve until they are resolved.
+    """
+    groups: dict[int, Group | None] = {}
+    found: list[Failure] = []
+    for job in store.list([JobStatus.FAILED, JobStatus.PENDING]):
+        if job.id is None or not is_unresolved(job):
+            continue
+        group = None
+        if job.group_id is not None:
+            if job.group_id not in groups:
+                groups[job.group_id] = store.get_group(job.group_id)
+            group = groups[job.group_id]
+            if group is not None and not group.is_terminal and group.ended_at is None:
+                continue
+        why = job.error or job.phase or job.status.value
+        found.append(Failure(job, group, " ".join(why.split())))
+    return found
 
 
 def find(store: Store, key: str) -> Job | Group | None:

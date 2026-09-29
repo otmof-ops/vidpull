@@ -227,6 +227,17 @@ def build_parser() -> argparse.ArgumentParser:
     q_pause.set_defaults(func=cmd_queue_pause, paused=True)
     q_resume = queue_sub.add_parser("resume", help="resume a paused queue")
     q_resume.set_defaults(func=cmd_queue_pause, paused=False)
+    q_failed = queue_sub.add_parser(
+        "failed", help="what failed or was not found, once its run is over"
+    )
+    q_failed.add_argument("--json", action="store_true")
+    q_failed.set_defaults(func=cmd_queue_failed)
+    q_link = queue_sub.add_parser(
+        "link", help="give a download that failed or was not found another link"
+    )
+    q_link.add_argument("id", type=int, metavar="ID")
+    q_link.add_argument("url", metavar="URL", help="a link to the audio or video itself")
+    q_link.set_defaults(func=cmd_queue_link)
     q_history = queue_sub.add_parser("history", help="every download that is over, newest first")
     q_history.add_argument("-n", "--limit", type=int, default=40, metavar="N")
     q_history.add_argument("--json", action="store_true")
@@ -505,6 +516,19 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
             manager.stop(wait=True)
     for group_id in runs:
         ids.extend(j.id or 0 for j in store.list(group_id=group_id))
+        group = store.get_group(group_id)
+        if group is not None:
+            progress = manager.group_progress(group)
+            console.print(
+                f"{group.display_title}: {progress.tally()}", markup=False, highlight=False
+            )
+            if progress.unresolved:
+                console.print(
+                    f"{progress.unresolved} left to resolve: vidpull queue failed",
+                    style="yellow",
+                    markup=False,
+                    highlight=False,
+                )
     failures = 0
     for job_id in ids:
         job = store.get(job_id)
@@ -934,6 +958,57 @@ def cmd_queue_pause(args: argparse.Namespace, ctx: Context) -> int:
     return EXIT_OK
 
 
+def cmd_queue_failed(args: argparse.Namespace, ctx: Context) -> int:
+    if not ctx.paths.db_file.exists():
+        print("nothing has failed")
+        return EXIT_OK
+    store = Store(ctx.paths.db_file)
+    found = history.failures(store)
+    store.close()
+    if args.json:
+        rows = [
+            {
+                "id": one.job.id,
+                "title": one.job.display_title,
+                "run": one.group.id if one.group is not None else None,
+                "from": one.job.url,
+                "why": one.brief,
+                "error": one.why,
+            }
+            for one in found
+        ]
+        print(json.dumps(rows, indent=1, ensure_ascii=False))
+        return EXIT_OK
+    if not found:
+        print("nothing has failed")
+        return EXIT_OK
+    for one in found:
+        where = f"[G{one.group.id}] " if one.group is not None else ""
+        print(f"{one.job.id:>5}  {_short(where + one.job.display_title, 56):<56}  {one.brief}")
+    print(
+        f"{len(found)} left to resolve: `vidpull queue link ID URL` gives one another link, "
+        "`vidpull queue retry ID` tries it again, `vidpull queue rm ID` deletes it"
+    )
+    return EXIT_OK
+
+
+def cmd_queue_link(args: argparse.Namespace, ctx: Context) -> int:
+    store = Store(ctx.paths.db_file)
+    manager = DownloadManager(store, YtDlpEngine(ctx.config, ctx.paths), ctx.config, ctx.paths)
+    try:
+        job = manager.relink(args.id, args.url)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
+    finally:
+        store.close()
+    print(
+        f"job {job.id} ({_short(job.display_title, 50)}) is queued with the link; "
+        "it runs the next time the TUI starts"
+    )
+    return EXIT_OK
+
+
 def cmd_queue_rm(args: argparse.Namespace, ctx: Context) -> int:
     store = Store(ctx.paths.db_file)
     engine = YtDlpEngine(ctx.config, ctx.paths)
@@ -955,13 +1030,12 @@ def cmd_queue_rm(args: argparse.Namespace, ctx: Context) -> int:
 
 def cmd_queue_retry(args: argparse.Namespace, ctx: Context) -> int:
     store = Store(ctx.paths.db_file)
-    job = store.get(args.id)
-    if job is None or job.status not in {JobStatus.FAILED, JobStatus.CANCELLED}:
-        print("only failed or cancelled jobs can be retried", file=sys.stderr)
-        store.close()
-        return EXIT_FAILURE
-    store.update(args.id, status=JobStatus.QUEUED, error="", phase="", progress=0.0)
+    manager = DownloadManager(store, YtDlpEngine(ctx.config, ctx.paths), ctx.config, ctx.paths)
+    queued = manager.retry(args.id)  # a song's run is opened again with it
     store.close()
+    if queued is None:
+        print("only failed, cancelled or unmatched jobs can be retried", file=sys.stderr)
+        return EXIT_FAILURE
     print(f"job {args.id} queued; it runs the next time the TUI starts")
     return EXIT_OK
 

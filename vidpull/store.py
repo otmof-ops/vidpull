@@ -15,9 +15,19 @@ import threading
 from collections.abc import Iterable
 from pathlib import Path
 
-from vidpull.models import Group, GroupStatus, Job, JobStatus, LogLine, Selection, Song, utcnow
+from vidpull.models import (
+    SKIPPED,
+    Group,
+    GroupStatus,
+    Job,
+    JobStatus,
+    LogLine,
+    Selection,
+    Song,
+    utcnow,
+)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 LOG_LINES_PER_JOB = 300  # a download's own log is kept with it; this bounds a noisy one
 
 _GROUPS_TABLE = """
@@ -32,7 +42,8 @@ CREATE TABLE IF NOT EXISTS groups (
     error TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    cleared_at TEXT
+    cleared_at TEXT,
+    ended_at TEXT
 );
 """
 
@@ -113,6 +124,7 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         _LOG_TABLE,
         *_LOG_INDEXES,
     ),
+    5: ("ALTER TABLE groups ADD COLUMN ended_at TEXT",),
 }
 
 _COLUMNS = (
@@ -155,6 +167,7 @@ _GROUP_COLUMNS = (
     "created_at",
     "updated_at",
     "cleared_at",
+    "ended_at",
 )
 
 
@@ -460,6 +473,24 @@ class Store:
             ).fetchall()
         return [_log_from_row(r) for r in rows]
 
+    def group_summary(self, group_id: int) -> tuple[dict[str, int], int, int]:
+        """A run in three numbers, without reading its songs one by one: its songs by
+        status, how many of the done ones are duplicates that were skipped, and the bytes
+        of what was downloaded."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) AS n, "
+                "SUM(CASE WHEN phase LIKE ? THEN 1 ELSE 0 END) AS skipped, "
+                "SUM(COALESCE(NULLIF(total_bytes, 0), downloaded_bytes, 0)) AS bytes "
+                "FROM jobs WHERE group_id = ? GROUP BY status",
+                (f"{SKIPPED}%", group_id),
+            ).fetchall()
+        counts = {str(r["status"]): int(r["n"]) for r in rows}
+        done = next((r for r in rows if r["status"] == str(JobStatus.DONE)), None)
+        skipped = int(done["skipped"] or 0) if done is not None else 0
+        size = int(done["bytes"] or 0) if done is not None else 0
+        return counts, skipped, size
+
     def group_counts(self, group_id: int) -> dict[str, int]:
         with self._lock:
             rows = self._conn.execute(
@@ -578,6 +609,7 @@ def _group_to_row(group: Group) -> dict[str, object]:
         "created_at": group.created_at,
         "updated_at": group.updated_at,
         "cleared_at": group.cleared_at,
+        "ended_at": group.ended_at,
     }
 
 
@@ -594,6 +626,7 @@ def _group_from_row(row: sqlite3.Row) -> Group:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         cleared_at=row["cleared_at"],
+        ended_at=row["ended_at"],
     )
 
 

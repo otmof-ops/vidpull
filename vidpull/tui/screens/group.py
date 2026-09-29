@@ -9,11 +9,16 @@ from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Static
 
+from vidpull.history import brief_reason
 from vidpull.manager import DownloadManager
 from vidpull.models import GroupStatus, Job, JobStatus
 from vidpull.store import Store
+from vidpull.tui.screens.link import LinkScreen
 
-COLUMNS = ("#", "Song", "Status", "Progress", "Match")
+COLUMNS = ("#", "Song", "Status", "Progress", "Speed", "ETA", "Match")
+# at 132 columns everything but the match, which is the last for that reason, is in sight
+SONG_WIDTH = 37
+STATUS_WIDTH = 39
 STATUS_STYLE = {
     JobStatus.PENDING: "yellow",
     JobStatus.QUEUED: "dim",
@@ -33,6 +38,7 @@ class GroupScreen(ModalScreen[None]):
         Binding("q", "close", "Close"),
         Binding("c", "cancel_song", "Cancel song"),
         Binding("r", "retry_song", "Retry song"),
+        Binding("l", "link_song", "Another link"),
     ]
 
     def __init__(self, store: Store, manager: DownloadManager, group_id: int):
@@ -47,8 +53,9 @@ class GroupScreen(ModalScreen[None]):
             yield Static("", id="group-title", classes="title")
             yield DataTable(id="songs", cursor_type="row", zebra_stripes=True)
             yield Static(
-                "c cancels the selected song · r retries it · esc closes "
-                "(c on the row behind this screen cancels the whole run)",
+                "c cancels the selected song · r retries it · l gives one that failed or was "
+                "not found another link · esc closes (c on the row behind this screen cancels "
+                "the whole run)",
                 classes="hint",
             )
 
@@ -70,9 +77,11 @@ class GroupScreen(ModalScreen[None]):
         status = group.status.value
         if group.status == GroupStatus.RESOLVING:
             status = "resolving the track list…"
+        note = group.error if group.status != GroupStatus.DONE else ""  # the tally says it
         title.update(
-            f"{group.display_title} · {progress.done}/{progress.total} done · {status}"
-            + (f" · {group.error}" if group.error else "")
+            f"{group.display_title} · {status} · {progress.tally()}"
+            + (f" · about {_left(progress.eta)} left" if progress.eta else "")
+            + (f" · {note}" if note else "")
         )
         table = self.query_one("#songs", DataTable)
         for index, job in enumerate(self.store.list(group_id=self.group_id), 1):
@@ -91,7 +100,7 @@ class GroupScreen(ModalScreen[None]):
         if job.status == JobStatus.PENDING and job.phase:
             status = job.phase
         if job.status == JobStatus.FAILED and job.error:
-            status = f"failed: {job.error}"
+            status = brief_reason(job.error)  # it is red: that says it failed
         if job.skipped:
             status = job.phase
         if self.manager.paused and job.status in {JobStatus.QUEUED, JobStatus.STAGED}:
@@ -103,12 +112,14 @@ class GroupScreen(ModalScreen[None]):
         title = job.display_title
         return [
             str(job.song.track_number if job.song and job.song.track_number else index),
-            Text(title if len(title) <= 48 else title[:47] + "…"),
+            Text(title if len(title) <= SONG_WIDTH else title[: SONG_WIDTH - 1] + "…"),
             Text(
-                status if len(status) <= 40 else status[:39] + "…",
+                status if len(status) <= STATUS_WIDTH else status[: STATUS_WIDTH - 1] + "…",
                 style=STATUS_STYLE.get(job.status, ""),
             ),
             Text(bar),
+            Text(_speed(job.speed) if job.status == JobStatus.DOWNLOADING else ""),
+            Text(_left(job.eta) if job.status == JobStatus.DOWNLOADING and job.eta else ""),
             Text(job.matched_url.removeprefix("https://") if job.matched_url else ""),
         ]
 
@@ -134,5 +145,42 @@ class GroupScreen(ModalScreen[None]):
                 "only failed, cancelled or unmatched songs can be retried", severity="warning"
             )
 
+    def action_link_song(self) -> None:
+        job_id = self._selected_id()
+        job = self.store.get(job_id) if job_id is not None else None
+        if job is None or job.id is None:
+            return
+
+        def take(link: str) -> str | None:
+            try:
+                self.manager.relink(job.id or 0, link)
+            except ValueError as exc:
+                return str(exc)
+            return None
+
+        why = brief_reason(job.error or job.phase or job.status.value)
+        self.app.push_screen(
+            LinkScreen(job.display_title, why[:200], take, song=job.song is not None)
+        )
+
     def action_close(self) -> None:
         self.dismiss(None)
+
+
+def _speed(value: float | None) -> str:
+    if not value:
+        return ""
+    for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
+        if value < 1024 or unit == "GB/s":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return ""
+
+
+def _left(seconds: float | None) -> str:
+    if seconds is None:
+        return ""
+    total = int(seconds)
+    if total >= 3600:
+        return f"{total // 3600}h{(total % 3600) // 60:02d}m"
+    return f"{total // 60}:{total % 60:02d}"

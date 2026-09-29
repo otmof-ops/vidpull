@@ -62,6 +62,7 @@ open the folder.
 | `o` | open the download folder |
 | `f` | clear the list: everything finished moves to History (there is a **Clear list** button too) |
 | `h` | the History tab, and back (`esc` returns to the list as well) |
+| `1` / `2` / `3` | the Downloads, the Failed and the History tab |
 | `u` / `x` | update vidpull, or remove it |
 | `s` / `l` / `?` | settings, log, help |
 | `q` | quit; anything still downloading picks up where it left off next time |
@@ -77,6 +78,33 @@ The queue stays paused when you close vidpull and is still paused when you open 
 until you resume it. Links you add while it is paused wait with the rest. From another
 terminal, `vidpull queue pause` and `vidpull queue resume` do the same to an open vidpull;
 `vidpull get` is never paused, since it is a download you asked for there and then.
+
+### What failed
+
+An album or playlist counts its songs through on its row as it goes, what came out of all of
+them and what did not: `Hevs199099 · 534/676 done · 9 failed`. The **Speed** column is what its
+songs download at (a song is looked for for twenty seconds and transferred in one, so between
+two transfers it is the speed of the last), and **ETA** is when the run will be through, from
+how fast its last thirty songs went.
+
+When the run is over, what failed or was not found is in the **Failed** tab (`2`), apart from
+everything that came. A download that is no song of a run is there as soon as it has failed.
+
+| In Failed | Does |
+| --- | --- |
+| `enter`, **Another link** | asks for a link to download that one from instead: any link to the audio or video itself, a YouTube link for instance. A song keeps what it is: the file gets its title, artists, album, track number and cover |
+| `r`, **Retry** | tries it again as it is |
+| `d`, **Delete** | takes it off the list for good; its run keeps a line about it in its log |
+| **Retry all**, **Delete all** | the same for everything on the list (**Delete all** asks first) |
+
+The rest of the list stays where it is while one of them downloads again, and one that fails
+again comes back with the new reason. The tab says how many are left (`Failed (24)`), and so does
+the line at the bottom. In the songs of a run (Enter on its row), `l` gives the selected song
+another link.
+
+From the command line: `vidpull queue failed` lists them, `vidpull queue link ID URL` gives one
+another link, `vidpull queue retry ID` tries one again and `vidpull queue rm ID` deletes it.
+`vidpull get` ends a run with the count: `Hevs199099: 652/676 downloaded · 8 failed · 16 not found`.
 
 ### The list and the history
 
@@ -167,7 +195,7 @@ vidpull get https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl --list   # the
 ```
 
 An album or playlist is **one row** in the queue (`G1`, `G2`, …). It appears the moment you paste
-the link, shows the track list being fetched, then counts its songs through (`downloading 4/12`).
+the link, shows the track list being fetched, then counts its songs through (`4/12 done`).
 `c` on that row cancels the whole run at any stage, fetch included; `r` retries what failed, or
 fetches the track list again when that is what failed;
 `d` deletes it, files optional; Enter or `p` shows the songs behind it, each with its own status
@@ -185,14 +213,15 @@ Spotify and YouTube Music both stop answering for minutes at a time. vidpull wai
 again: a track list is tried five times over about three minutes, a song's lookup four times
 over about a minute, and the row says so while it waits (`Spotify did not answer, try 3/5`).
 A song that still fails is tried once more when the rest of the run is through, and what is left
-after that says why in its log (Enter on the run, or the History tab).
+after that is in the **Failed** tab with the reason, to be given another link, retried or deleted.
 
 The first Spotify link offers to install spotDL into its own environment under
 `~/.local/share/vidpull/spotdl-venv` (about 200 MB, no sudo); nothing is installed without your
 yes, `vidpull update` keeps it current and `vidpull uninstall` removes it with everything else.
 spotDL keeps its own settings in `~/.config/spotdl`. A song with no confident match on YouTube
-Music waits as pending; `p` or `r` looks again. The quality ceiling is YouTube's stream, so a
-320 kbps MP3 is still made from that source.
+Music is in the **Failed** tab once its run is over: give it the link of an upload you found
+yourself, or let `r` look again. The quality ceiling is YouTube's stream, so a 320 kbps MP3 is
+still made from that source.
 
 ## Keeping it current
 

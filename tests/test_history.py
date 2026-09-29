@@ -140,3 +140,99 @@ def test_an_older_download_gets_its_log_from_the_app_log_file(store: Store, path
     assert lines[-1].endswith(f"job {failed.id}: HTTP Error 403")
     kept = history.record(store, f"j{video.id}", paths)  # its own stored log wins
     assert "log:" in kept and kept[-1].endswith("warning Replacing existing file")
+
+
+def test_what_is_left_to_resolve(store):
+    from vidpull.history import failures, is_unresolved
+    from vidpull.models import Group, GroupStatus, Song
+
+    chosen = Selection(SelectionKind.PRESET, "best", "Best")
+
+    def add(status, *, group=None, song=None, error="", phase="", title="", cleared=None):
+        job = Job(url="https://e/x", selection=chosen, status=status, title=title)
+        job.group_id, job.song, job.error, job.phase = group, song, error, phase
+        job.cleared_at = cleared
+        return store.add(job)
+
+    over = store.add_group(
+        Group(
+            url="https://e/a", kind="album", selection=chosen, name="Over", status=GroupStatus.DONE
+        )
+    )
+    going = store.add_group(
+        Group(
+            url="https://e/b",
+            kind="album",
+            selection=chosen,
+            name="Going",
+            status=GroupStatus.ACTIVE,
+        )
+    )
+    gone = store.add_group(
+        Group(
+            url="https://e/c",
+            kind="album",
+            selection=chosen,
+            name="Cleared",
+            status=GroupStatus.DONE,
+        )
+    )
+    store.update_group(gone.id, cleared_at="2026-09-30T00:00:00+00:00")
+    song = Song(title="Airbag", artists=["Radiohead"])
+    alone = add(JobStatus.FAILED, error="HTTP Error 403:\n Forbidden", title="A video")
+    failed = add(JobStatus.FAILED, group=over.id, song=song, error="YouTube refused it")
+    unfound = add(JobStatus.PENDING, group=over.id, song=song, phase="no confident match")
+    add(JobStatus.DONE, group=over.id, song=song)
+    add(JobStatus.CANCELLED, group=over.id, song=song)
+    add(JobStatus.FAILED, group=going.id, song=song, error="it may still get its second pass")
+    add(JobStatus.PENDING, title="copied, waiting for a format")  # the clipboard's
+    old = add(
+        JobStatus.FAILED, group=gone.id, song=song, error="x", cleared="2026-09-30T00:00:00+00:00"
+    )
+
+    found = failures(store)
+    assert [one.job.id for one in found] == [alone.id, failed.id, unfound.id, old.id]
+    assert [one.where for one in found] == ["", "G1 Over", "G1 Over", "G3 Cleared"]
+    assert [one.why for one in found] == [
+        "HTTP Error 403: Forbidden",
+        "YouTube refused it",
+        "no confident match",
+        "x",
+    ]
+    assert all(is_unresolved(one.job) for one in found)
+    store.update_group(going.id, status=GroupStatus.DONE)  # its run is over: it is listed now
+    assert len(failures(store)) == 5
+
+
+def test_a_reason_in_few_words():
+    from vidpull.history import brief_reason
+
+    age = (
+        "https://music.youtube.com/watch?v=Z3-8c1CLiIQ: [youtube] Z3-8c1CLiIQ: Sign in to "
+        "confirm your age. Use --cookies-from-browser or --cookies for the authentication. "
+        "See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for"
+    )
+    assert brief_reason(age) == "age-restricted: needs a YouTube sign-in"
+    gone = "https://youtu.be/x: [youtube] x: Video unavailable. This video has been removed"
+    assert brief_reason(gone) == "Video unavailable"
+    assert brief_reason("ERROR: [vimeo] 76979871: Unable to download JSON") == (
+        "Unable to download JSON"
+    )
+    outage = (
+        "YouTube Music did not answer in 4 attempts over 3 min: YT-DLP download error - "
+        "https://www.youtube.com/watch?v=w_fFXdS2mDo"
+    )
+    assert brief_reason(outage) == (
+        "YouTube Music did not answer in 4 attempts over 3 min: YT-DLP download error"
+    )
+    for plain in (
+        "no confident match on YouTube Music",
+        "HTTP Error 403: Forbidden",
+        "boom",
+        "ffmpeg exited with 1 (see the log)",
+        "v1.2 of it is gone",
+    ):
+        assert brief_reason(plain) == plain
+    assert brief_reason("  two\n lines ") == "two lines"
+    assert brief_reason("https://e/only-a-link") == "https://e/only-a-link"
+    assert brief_reason("") == ""

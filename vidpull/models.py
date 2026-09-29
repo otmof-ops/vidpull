@@ -189,6 +189,8 @@ class Group:
     created_at: str = field(default_factory=utcnow)
     updated_at: str = field(default_factory=utcnow)
     cleared_at: str | None = None  # taken off the list; still in the history
+    # when it was over for the first time; it stays when a song of it is tried again
+    ended_at: str | None = None
 
     @property
     def display_title(self) -> str:

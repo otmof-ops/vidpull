@@ -6,6 +6,38 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **A run counts what came, as it goes.** The row of an album or playlist says how many of its
+  songs are done out of all of them, and how many failed or were not found:
+  `Hevs199099 · 534/676 done · 9 failed`. `vidpull get` ends a run with the same count.
+- **The Failed tab** (`2`). Once a run is over, what failed or was not found in it is listed
+  apart from what came, with the reason in a few words. **Another link** (`enter`) downloads
+  the selected one from a link you give instead, and a song keeps its title, artists, album and
+  cover; **Retry** (`r`) tries it again; **Delete** (`d`) takes it off the list. **Retry all**
+  and **Delete all** do it for the whole list. `l` does the same for a song in the songs of a
+  run. From a terminal: `vidpull queue failed` and `vidpull queue link ID URL`.
+- `1`, `2` and `3` switch between the Downloads, the Failed and the History tab.
+
+### Fixed
+
+- **The Speed and ETA of an album or playlist were nearly always empty.** They were those of
+  the first song at work, which is looked for most of the time and has neither. Speed is now
+  what the run's songs download at, together, and between two transfers the speed of the last
+  one; ETA is when the run will be through, from how fast its last songs went. The songs of a
+  run show their own in two columns of their own.
+- A transfer too short for yt-dlp to name its speed, which is most songs, showed none: it is
+  measured from what came and the time it took.
+- A song that was not found was counted as "pending (p)" in the line at the bottom, as if it
+  were a copied link waiting for a format.
+- `vidpull queue retry` on a song of a run that was over left the run as it was; the run is
+  now live again with the song and says how it ended anew.
+
+### Changed
+
+- The job database is at version 5: a run records when it was over for the first time. A
+  vidpull rolled back to 1.5.0 reads and writes the same database.
+
 ## [1.5.0] - 2026-09-29
 
 ### Added
