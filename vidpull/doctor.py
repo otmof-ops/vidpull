@@ -223,13 +223,16 @@ def _update_log_check(paths: Paths) -> Check:
     if not paths.update_log.exists():
         return Check("update log", "ok", f"{paths.update_log} (nothing recorded yet)")
     update_log = UpdateLog(paths.update_log)
-    last = update_log.last_end()
-    summary = " ".join(last.split()[:1] + last.split()[3:7]) if last else "no finished transaction"
-    failed = " failed " in f" {last} "
+    last = update_log.last_transaction()
+    count = update_log.transactions()
+    if last is None:
+        return Check("update log", "ok", f"{paths.update_log} ({count} transaction(s))")
+    action, when, ok, message = last
+    outcome = "ok" if ok else f"FAILED: {message[:80]}"
     return Check(
         "update log",
-        "warn" if failed else "ok",
-        f"{paths.update_log} ({update_log.transactions()} transaction(s); last: {summary})",
+        "ok" if ok else "warn",
+        f"{paths.update_log} ({count} transaction(s); last: {action} at {when}, {outcome})",
     )
 
 

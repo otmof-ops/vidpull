@@ -230,4 +230,4 @@ def test_update_log_command(capsys, paths):
     assert len(out) == 2 and " END   ok " in out[0] and " NOTE " in out[1]
     assert cli.main(["doctor"]) in (0, 1)
     report = capsys.readouterr().out
-    assert "update log" in report and "1 transaction(s)" in report
+    assert "update log" in report and "1 transaction(s); last: engine-only at " in report

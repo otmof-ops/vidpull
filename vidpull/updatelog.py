@@ -206,6 +206,23 @@ class UpdateLog:
         except OSError:
             return 0
 
+    def last_transaction(self) -> tuple[str, str, bool, str] | None:
+        """(action, when, ok, message) of the last finished transaction, or ``None``."""
+        actions: dict[str, str] = {}
+        last: tuple[str, str, bool, str] | None = None
+        for line in self.tail(400):
+            parts = line.split(None, 3)
+            if len(parts) < 4:
+                continue
+            stamp, txn, kind, text = parts
+            if kind == "BEGIN":
+                actions[txn] = text.split(" trigger=", 1)[0]
+            elif kind == "END":
+                words = text.split(None, 2)
+                message = words[2].split(" | ", 1)[0] if len(words) > 2 else ""
+                last = (actions.get(txn, "update"), stamp, words[0] == "ok", message)
+        return last
+
     def last_end(self) -> str:
         for line in reversed(self.tail(200)):
             if " END " in line:

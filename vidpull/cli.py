@@ -46,6 +46,7 @@ from vidpull.update import (
     UpdateError,
     UpdatePipeline,
     finalize_install,
+    hold_generation,
     install_spotdl,
     note_first_run,
 )
@@ -244,6 +245,7 @@ def main(argv: list[str] | None = None) -> int:
     config = Config.load(paths.config_file)
     ctx = Context(paths=paths, config=config)
     func = getattr(args, "func", cmd_tui)
+    hold_generation(paths)  # an update elsewhere must not prune the copy this process runs
     if args.command in {None, "tui", "get"}:
         note_first_run(paths)
     if args.command in {None, "tui", "get"} and not args.no_preflight:

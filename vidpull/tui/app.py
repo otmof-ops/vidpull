@@ -42,6 +42,7 @@ from vidpull.models import (
 )
 from vidpull.paths import Paths
 from vidpull.procs import redact_url, which
+from vidpull.semver import Version
 from vidpull.spotdl import (
     InstallError,
     ResolveError,
@@ -324,10 +325,6 @@ class VidpullApp(App[PostExit | None]):
         self._seen_status[job.id] = job.status
         if job.status == JobStatus.DONE and previous not in {None, JobStatus.DONE}:
             self._desktop_notify("Download finished", job.display_title)
-        if job.is_terminal and self._deferred_update and self.manager.is_idle:
-            tag, self._deferred_update = self._deferred_update, None
-            self._auto_updating = True
-            self.auto_update(tag)
         elif job.status == JobStatus.FAILED and previous not in {None, JobStatus.FAILED}:
             self.notify(
                 f"{_short(job.display_title, 50)}: {job.error}",
@@ -335,6 +332,10 @@ class VidpullApp(App[PostExit | None]):
                 severity="error",
                 timeout=8,
             )
+        if job.is_terminal and self._deferred_update and self.manager.is_idle:
+            tag, self._deferred_update = self._deferred_update, None
+            self._auto_updating = True
+            self.auto_update(tag)
 
     @on(ClipboardUrl)
     def _clipboard_url(self, message: ClipboardUrl) -> None:
@@ -351,6 +352,8 @@ class VidpullApp(App[PostExit | None]):
 
     @on(UpdateAvailable)
     def _update_available(self, message: UpdateAvailable) -> None:
+        if message.tag == self._update_tag:
+            return  # said already; the status bar keeps showing it
         self._update_tag = message.tag
         if self.config.auto_update and not self._auto_updating:
             self._auto_updating = True
@@ -367,7 +370,10 @@ class VidpullApp(App[PostExit | None]):
         """Build the new release next to this one, then ask before restarting into it."""
         try:
             result = self.pipeline.run(busy=lambda: self.manager.active_count > 0, trigger="auto")
-        except BusyError:
+        except BusyError as exc:
+            if "another vidpull update" in str(exc):
+                self.call_from_thread(self.notify, str(exc), timeout=8)
+                return
             self._deferred_update = tag
             self.call_from_thread(
                 self.notify, f"vidpull {tag} installs once the downloads finish", timeout=8
@@ -381,8 +387,19 @@ class VidpullApp(App[PostExit | None]):
                 self.notify, str(exc), title="Update failed", severity="error", timeout=10
             )
             return
+        except Exception as exc:  # a full disk, a lost directory: the app keeps running
+            log.exception("auto-update failed")
+            self.call_from_thread(
+                self.notify,
+                f"{type(exc).__name__}: {exc}",
+                title="Update failed",
+                severity="error",
+                timeout=10,
+            )
+            return
         finally:
             self._auto_updating = False
+        self.store.set_meta("update_candidate", "")  # installed: nothing left to offer
         if result.restart_required:
             self.call_from_thread(self._offer_restart, tag)
         else:
@@ -419,10 +436,12 @@ class VidpullApp(App[PostExit | None]):
             now = time.time()
             if last and now - float(last) < self.config.update_check_hours * 3600:
                 cached = self.store.get_meta("update_candidate") or ""
-                if cached:
+                if cached and self._newer_than_installed(cached):
                     self.post_message(UpdateAvailable(cached))
                 return
             result = self.pipeline.check(trigger="startup")
+            if result.error:
+                return  # offline: ask again next time instead of remembering a failure
             self.store.set_meta("update_check_at", str(now))
             self.store.set_meta(
                 "update_candidate", result.candidate.tag if result.candidate else ""
@@ -431,6 +450,11 @@ class VidpullApp(App[PostExit | None]):
                 self.post_message(UpdateAvailable(result.candidate.tag))
         except Exception:
             log.exception("update check failed")
+
+    def _newer_than_installed(self, tag: str) -> bool:
+        candidate = Version.try_parse(tag)
+        installed = getattr(self.pipeline, "installed_version", lambda: None)()
+        return candidate is not None and (installed is None or candidate > installed)
 
     @work(thread=True, group="probe")
     def probe(
@@ -832,6 +856,10 @@ class VidpullApp(App[PostExit | None]):
 
     def action_update(self) -> None:
         def finished(result: str | None) -> None:
+            cached = self.store.get_meta("update_candidate") or ""
+            if cached and not self._newer_than_installed(cached):
+                self.store.set_meta("update_candidate", "")
+                self._update_tag = None
             if result == "restart":
                 self.exit(PostExit("restart"))
 

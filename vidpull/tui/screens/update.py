@@ -134,6 +134,8 @@ class UpdateScreen(ModalScreen[str | None]):
             self.app.call_from_thread(self._enable_restart)
         except UpdateError as exc:
             self._report_from_thread(f"rollback failed: {exc}")
+        except Exception as exc:  # never let a worker error kill the app
+            self._report_from_thread(f"unexpected error: {type(exc).__name__}: {exc}")
         finally:
             self.app.call_from_thread(self._set_busy, False)
 

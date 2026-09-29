@@ -51,6 +51,9 @@ def test_ids_count_up_and_an_exception_ends_the_transaction_as_failed(paths):
     assert any(line.split()[1:3] == ["-", "NOTE"] and "vidpull=9.9.9" in line for line in lines)
     assert lines[-1].endswith("no previous generation to roll back to")  # one event, one line
     assert log.transactions() == 3 and "u0003 END   failed" in log.last_end()
+    action, when, ok, message = log.last_transaction()
+    assert (action, ok, message) == ("rollback", False, "no previous generation to roll back to")
+    assert when.endswith("+00:00")
     # a lost counter file is rebuilt from the log itself
     paths.update_log.with_name("updates.log.seq").unlink()
     assert UpdateLog(paths.update_log).begin("check", "cli").id == "u0004"

@@ -29,7 +29,7 @@ from vidpull.manifest import Generation, Manifest
 from vidpull.paths import Paths
 from vidpull.procs import clean_env, run, which
 from vidpull.semver import Version
-from vidpull.spotdl import SpotdlError
+from vidpull.spotdl import SPOTDL_SPECS, SpotdlError
 from vidpull.spotdl import install as spotdl_install
 from vidpull.updatelog import Transaction, UpdateLog, installed_packages, snapshot
 from vidpull.versioning import (
@@ -70,6 +70,7 @@ class UpdateCheck:
     candidate: Version | None
     error: str = ""
     unreleased: bool = False  # the default branch has commits after the newest release
+    held: Version | None = None  # rolled back from: not offered until a newer release exists
     head: str = ""
     latest_commit: str = ""
 
@@ -83,10 +84,16 @@ class UpdateCheck:
             return [f"check failed: {self.error}"]
         current = self.current.tag if self.current else "unknown"
         latest = self.latest.tag if self.latest else "none"
-        lines = [
-            f"installed {current}, newest release {latest}",
-            f"update available: {self.candidate.tag}" if self.candidate else "up to date",
-        ]
+        lines = [f"installed {current}, newest release {latest}"]
+        if self.candidate:
+            lines.append(f"update available: {self.candidate.tag}")
+        elif self.held is not None:
+            lines.append(
+                f"{self.held.tag} is held back because you rolled back from it; "
+                f"`vidpull update --to {self.held.tag}` installs it anyway"
+            )
+        else:
+            lines.append("up to date")
         if self.unreleased:
             lines.append(
                 f"note: the repository has changes newer than {latest} that are not in a release "
@@ -132,6 +139,21 @@ class Layout:
         self.build_root = paths.data_dir / "build"
         self.current_link = paths.data_dir / "current"
         self.lock_file = paths.data_dir / "update.lock"
+
+    def next_id(self, manifest: Manifest | None, tag: str) -> str:
+        """The next generation id: past every sequence the manifest or the disk has seen."""
+        seen = [g.sequence for g in manifest.generations] if manifest else []
+        try:
+            for entry in self.gen_root.iterdir():
+                head = entry.name.split("-", 1)[0]
+                if head.isdigit():
+                    seen.append(int(head))
+        except OSError:
+            pass
+        return f"{max(seen, default=0) + 1:04d}-{tag}"
+
+    def in_use_file(self, gen_id: str) -> Path:
+        return self.gen_dir(gen_id) / ".inuse"
 
     def gen_dir(self, gen_id: str) -> Path:
         return self.gen_root / gen_id
@@ -213,7 +235,7 @@ class UpdatePipeline:
         config: Config,
         *,
         manifest: Manifest | None = None,
-        repo_url: str = REPO_URL,
+        repo_url: str | None = None,
         report: Reporter | None = None,
         python: str | None = None,
         trigger: str = "cli",
@@ -221,13 +243,14 @@ class UpdatePipeline:
     ):
         self.paths = paths
         self.config = config
-        self.repo_url = repo_url
         self.trigger = trigger  # who asks: cli, tui, startup, auto, install.sh
         self.log = update_log or UpdateLog(paths.update_log)
         self._active = threading.local()
         self.report: Reporter = report or (lambda _line: None)
         self.layout = Layout(paths)
         self.manifest = manifest if manifest is not None else Manifest.load(paths.manifest_file)
+        # a copy installed from a fork updates from that fork
+        self.repo_url = repo_url or (self.manifest.repo_url if self.manifest else "") or REPO_URL
         self.python = python or base_python()
 
     # ------------------------------------------------------------ queries
@@ -239,7 +262,14 @@ class UpdatePipeline:
             and self.layout.current_link.is_symlink()
         )
 
+    def _reload(self) -> None:
+        """Read the manifest again: another window or a terminal may have updated since."""
+        fresh = Manifest.load(self.paths.manifest_file)
+        if fresh is not None:
+            self.manifest = fresh
+
     def installed_version(self) -> Version | None:
+        self._reload()
         if self.manifest and self.manifest.current_generation:
             return Version.try_parse(self.manifest.current_generation.tag)
         return current_version()
@@ -286,11 +316,19 @@ class UpdatePipeline:
             return UpdateCheck(current=current, latest=None, candidate=None, error=str(exc))
         newest = max(state.tags) if state.tags else None
         candidate = update_candidate(current, state.tags, include_prerelease=include)
+        held = (
+            Version.try_parse(self.manifest.held) if self.manifest and self.manifest.held else None
+        )
+        if candidate is None or held is None or candidate > held:
+            held = None
+        else:
+            candidate = None  # rolled back from it: a newer release lifts the hold
         latest_commit = state.commits.get(newest.tag, "") if newest else ""
         return UpdateCheck(
             current=current,
             latest=newest,
             candidate=candidate,
+            held=held,
             unreleased=bool(state.head and latest_commit and state.head != latest_commit),
             head=state.head,
             latest_commit=latest_commit,
@@ -320,6 +358,7 @@ class UpdatePipeline:
         dry_run: bool,
         busy: Callable[[], bool] | None,
     ) -> UpdateResult:
+        self._reload()
         if not self.installed or self.manifest is None:
             raise NotInstalledError(install_hint())
         if busy is not None and busy():
@@ -333,6 +372,12 @@ class UpdatePipeline:
                 raise UpdateError("cannot tell which release is installed")
             target = current
             source = current_gen.tag
+            if source.endswith(".dirty"):
+                raise UpdateError(
+                    f"this copy was installed from a checkout with uncommitted changes ({source}), "
+                    "which no update can rebuild. Install the checkout again with "
+                    "./install.sh --from DIR, or update the app when a release is available"
+                )
             if "+" in source:  # installed from a checkout: rebuild that commit, not the release
                 exact_commit = current_gen.commit
             self._say(
@@ -360,7 +405,7 @@ class UpdatePipeline:
             source = target.tag
 
         if dry_run:
-            gen_id = self.manifest.next_id(source)
+            gen_id = self.layout.next_id(self.manifest, source)
             return UpdateResult(
                 ok=True,
                 message=f"dry run: would build generation {gen_id} from {source} "
@@ -369,8 +414,19 @@ class UpdatePipeline:
 
         self._preflight()
         with self._lock():
-            gen_id = self.manifest.next_id(source)
+            self._reload()  # under the lock: what is installed now is what gets replaced
+            if self.manifest is None or self.manifest.current != (
+                current_gen.id if current_gen else None
+            ):
+                now = self.manifest.current if self.manifest else "nothing"
+                raise UpdateError(
+                    f"the installed copy changed while this update was starting (now {now}); "
+                    "check again"
+                )
+            gen_id = self.layout.next_id(self.manifest, source)
             gen_dir = self.layout.gen_dir(gen_id)
+            if gen_dir.exists():
+                raise UpdateError(f"{gen_dir} already exists; nothing was changed")
             build_dir = self.layout.build_root / f"src-{gen_id}"
             try:
                 if exact_commit:
@@ -391,7 +447,8 @@ class UpdatePipeline:
                 previous = current_gen
                 self._activate(generation)
             except Exception:
-                self._discard(gen_dir)
+                if self.layout.current_target() != (gen_dir / "venv").resolve():
+                    self._discard(gen_dir)  # never the directory current points at
                 raise
             finally:
                 shutil.rmtree(build_dir, ignore_errors=True)
@@ -426,6 +483,7 @@ class UpdatePipeline:
             return result
 
     def _rollback(self) -> UpdateResult:
+        self._reload()
         if not self.installed or self.manifest is None:
             raise NotInstalledError(f"nothing to roll back: {install_hint()}")
         previous = self.manifest.previous_generation
@@ -439,8 +497,17 @@ class UpdatePipeline:
             was = self.manifest.current_generation
             self.layout.point_current(previous.id)
             self.manifest.swap_previous()
+            left = Version.try_parse(was.tag) if was else None
+            back = Version.try_parse(previous.tag)
+            if left is not None and back is not None and left > back:
+                self.manifest.held = left.tag  # not offered again until a newer release exists
             self.manifest.save(self.paths.manifest_file)
         self._say(f"rolled back to {previous.id}; restart vidpull to run it")
+        if self.manifest.held:
+            self._say(
+                f"{self.manifest.held} is held back: no update installs it again until a newer "
+                f"release exists, or you run `vidpull update --to {self.manifest.held}`"
+            )
         return UpdateResult(
             ok=True,
             message=f"rolled back to {previous.tag}",
@@ -461,6 +528,11 @@ class UpdatePipeline:
             return
         names = ("spotdl", "ytmusicapi")
         before = installed_packages(self.paths.spotdl_venv, names)
+        pins = dict(spec.split("==", 1) for spec in SPOTDL_SPECS if "==" in spec)
+        if pins and all(before.get(name) == version for name, version in pins.items()):
+            found = ", ".join(f"{name} {version}" for name, version in pins.items())
+            self._say(f"spotDL environment already matches this release ({found}); left as it is")
+            return
         self._say("refreshing spotDL")
         try:
             spotdl_install(self.paths, self.python, report=self._say, upgrade=True)
@@ -600,12 +672,42 @@ class UpdatePipeline:
         return ytdlp_version, vidpull_version
 
     def _activate(self, generation: Generation) -> None:
+        """Make ``generation`` current: symlink, manifest and launcher, or none of them."""
         assert self.manifest is not None
-        self.manifest.activate(generation)
-        self.layout.point_current(generation.id)
-        self.manifest.save(self.paths.manifest_file)
-        if self.paths.launcher.exists() or self.manifest.launcher:
-            write_launcher(self.paths)
+        manifest = self.manifest
+        before = (manifest.current, manifest.previous, list(manifest.generations), manifest.held)
+        manifest.activate(generation)
+        held, new = Version.try_parse(manifest.held or ""), Version.try_parse(generation.tag)
+        if held is not None and new is not None and new >= held:
+            manifest.held = ""  # installed on purpose, or superseded
+        try:
+            self.layout.point_current(generation.id)
+            manifest.save(self.paths.manifest_file)
+            self._write_launcher()
+        except Exception:
+            manifest.current, manifest.previous, manifest.generations, manifest.held = before
+            with contextlib.suppress(OSError):
+                if before[0]:
+                    self.layout.point_current(before[0])
+                manifest.save(self.paths.manifest_file)
+            raise
+
+    def _write_launcher(self) -> None:
+        """Refresh the launcher vidpull installed; a file of someone else's is left alone."""
+        assert self.manifest is not None
+        if not self.manifest.launcher:
+            return  # installed with --no-launcher
+        launcher = self.paths.launcher
+        try:
+            foreign = launcher.exists() and "vidpull launcher" not in launcher.read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            foreign = True
+        if foreign:
+            self._say(f"{launcher} is not vidpull's launcher; left as it is")
+            return
+        write_launcher(self.paths)
 
     def _prune(self) -> None:
         assert self.manifest is not None
@@ -616,6 +718,9 @@ class UpdatePipeline:
                 if gen_dir.exists() and (gen_dir / "venv").resolve() == running:
                     continue  # never delete the generation this process runs from
             except OSError:
+                continue
+            if generation_in_use(self.layout, gen.id):
+                self._say(f"keeping generation {gen.id}: a running vidpull still uses it")
                 continue
             self._say(f"pruning old generation {gen.id}")
             self._discard(gen_dir)
@@ -667,7 +772,7 @@ def finalize_install(
     if gen_dir.parent.resolve() != layout.gen_root.resolve():
         raise UpdateError(f"{gen_dir} is not under {layout.gen_root}")
     pipeline = UpdatePipeline(paths, Config(), manifest=manifest, repo_url=repo_url, report=report)
-    with pipeline._transaction(f"install {tag}", trigger) as txn:
+    with pipeline._transaction(f"install {tag}", trigger) as txn, pipeline._lock():
         _finalize(
             pipeline, layout, manifest, gen_dir, tag, commit, python, launcher, created_download_dir
         )
@@ -706,6 +811,40 @@ def _finalize(
     manifest.save(paths.manifest_file)
     pipeline.manifest = manifest
     pipeline._prune()
+
+
+_held: list[object] = []  # open handles keep this process's generation locked while it runs
+
+
+def hold_generation(paths: Paths, prefix: Path | None = None) -> bool:
+    """Mark the generation this process runs from as in use, until the process ends."""
+    layout = Layout(paths)
+    try:
+        running = Path(prefix or sys.prefix).resolve()
+        if not running.is_relative_to(layout.gen_root.resolve()) or running.name != "venv":
+            return False
+        handle = open(layout.in_use_file(running.parent.name), "a+")  # noqa: SIM115
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    _held.append(handle)
+    return True
+
+
+def generation_in_use(layout: Layout, gen_id: str) -> bool:
+    """True while any vidpull process holds ``gen_id`` (see ``hold_generation``)."""
+    path = layout.in_use_file(gen_id)
+    if not path.exists():
+        return False
+    try:
+        with open(path, "a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 def install_spotdl(

@@ -582,3 +582,69 @@ def test_the_update_screen_hands_the_pipeline_back_and_shows_the_log(
             assert pipeline.report is sentinel
 
     run(flow())
+
+
+def test_a_failed_check_is_not_remembered(config, paths, store, video_info):
+    from vidpull.update import UpdateCheck
+
+    class Offline(FakePipeline):
+        def check(self, *, include_prerelease=None, trigger=None):
+            self.runs += 1
+            return UpdateCheck(current=None, latest=None, candidate=None, error="no network")
+
+    pipeline = Offline()
+    app = make_app(config, paths, store, FakeEngine(info=video_info), pipeline=pipeline)
+    app.config.update_check = True
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            assert await until(pilot, lambda: pipeline.runs == 1)
+            await pilot.pause(0.1)
+
+    run(flow())
+    assert store.get_meta("update_check_at") is None and app._update_tag is None
+
+
+def test_a_release_already_installed_is_not_offered_from_the_cache(
+    config, paths, store, video_info
+):
+    import time
+
+    from vidpull.semver import Version
+
+    store.set_meta("update_check_at", str(time.time()))
+    store.set_meta("update_candidate", "v9.9.9")
+    pipeline = FakePipeline()
+    pipeline.installed_version = lambda: Version.parse("9.9.9")
+    app = make_app(config, paths, store, FakeEngine(info=video_info), pipeline=pipeline)
+    app.config.update_check = True
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.3)
+            assert app._update_tag is None  # nothing announced
+            pipeline.installed_version = lambda: Version.parse("9.9.8")
+            app.check_updates()
+            assert await until(pilot, lambda: app._update_tag == "v9.9.9")
+
+    run(flow())
+
+
+def test_a_background_update_that_blows_up_leaves_the_app_running(config, paths, store, video_info):
+    class Exploding(FakePipeline):
+        def run(self, **kwargs):
+            self.runs += 1
+            raise OSError("no space left on device")
+
+    pipeline = Exploding()
+    app = make_app(config, paths, store, FakeEngine(info=video_info), pipeline=pipeline)
+    app.config.update_check = True
+    app.config.auto_update = True
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            assert await until(pilot, lambda: pipeline.runs == 1 and not app._auto_updating)
+            await pilot.pause(0.2)
+            assert app.is_running and not isinstance(app.screen, ConfirmScreen)
+
+    run(flow())

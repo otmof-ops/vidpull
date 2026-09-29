@@ -13,6 +13,7 @@ from tests.test_versioning import make_repo
 from vidpull.config import Config
 from vidpull.manifest import Generation, Manifest
 from vidpull.semver import Version
+from vidpull.spotdl import SPOTDL_SPECS
 from vidpull.update import (
     BusyError,
     Layout,
@@ -20,6 +21,8 @@ from vidpull.update import (
     UpdateError,
     UpdatePipeline,
     finalize_install,
+    generation_in_use,
+    hold_generation,
     install_spotdl,
     launcher_script,
     note_first_run,
@@ -304,16 +307,14 @@ def test_check_says_when_the_repository_is_ahead_of_its_newest_release(
     assert transactions(paths)[-1][1].startswith("failed ")
 
 
-def checkout_install(paths, repo, commit: str) -> None:
+def checkout_install(paths, repo, commit: str, tag: str = "v0.2.0+abc123def456") -> None:
     """A generation installed with ./install.sh --from DIR: its tag carries the commit."""
     layout = Layout(paths)
-    gen_id = "0001-v0.2.0+abc123def456"
+    gen_id = f"0001-{tag}"
     shutil.rmtree(layout.gen_dir(gen_id), ignore_errors=True)
     fake_generation(layout.gen_dir(gen_id) / "venv", "0.2.0")
     manifest = Manifest(repo_url=repo)
-    manifest.activate(
-        Generation(gen_id, "v0.2.0+abc123def456", commit, "0.2.0", "2026.01.01", sys.executable)
-    )
+    manifest.activate(Generation(gen_id, tag, commit, "0.2.0", "2026.01.01", sys.executable))
     layout.point_current(gen_id)
     manifest.save(paths.manifest_file)
 
@@ -400,3 +401,153 @@ def test_a_failed_spotdl_install_is_recorded(paths):
     begin, end = transactions(paths)[-1]
     assert begin.startswith("spotdl-install trigger=tui") and end.startswith("failed ")
     assert "InstallError" in end
+
+
+def test_a_window_with_an_old_manifest_cannot_downgrade(paths, repo, installed, monkeypatch):
+    window = make_pipeline(paths, repo, monkeypatch)  # opened while 0001-v0.1.0 was current
+    terminal = make_pipeline(paths, repo, monkeypatch)  # another process
+    assert terminal.run().generation.id == "0002-v0.2.0"
+
+    result = window.run(engine_only=True)  # the old window presses "Update engine"
+    assert result.generation.id == "0003-v0.2.0" and result.generation.tag == "v0.2.0"
+    manifest = Manifest.load(paths.manifest_file)
+    assert manifest.current == "0003-v0.2.0" and manifest.previous == "0002-v0.2.0"
+    assert "already up to date" in window.run().message  # and "Update app" rebuilds nothing
+
+    layout = Layout(paths)
+    (layout.gen_root / "0009-v9.9.9").mkdir()  # left by a crash; the manifest never heard of it
+    assert window.run(engine_only=True).generation.id == "0010-v0.2.0"
+    assert (layout.gen_root / "0009-v9.9.9").exists()
+
+
+def test_a_failed_switch_puts_everything_back(paths, repo, installed, monkeypatch):
+    pipeline = make_pipeline(paths, repo, monkeypatch)
+
+    def disk_full(_paths):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("vidpull.update.write_launcher", disk_full)
+    with pytest.raises(OSError, match="disk full"):
+        pipeline.run(target=Version.parse("0.2.0"))
+    layout = Layout(paths)
+    assert layout.current_target() == layout.venv_dir("0001-v0.1.0").resolve()
+    assert (layout.venv_dir("0001-v0.1.0") / "bin" / "vidpull").exists()
+    on_disk = Manifest.load(paths.manifest_file)
+    assert on_disk.current == "0001-v0.1.0" and on_disk.previous is None
+    assert [g.id for g in on_disk.generations] == ["0001-v0.1.0"]
+    assert not layout.gen_dir("0002-v0.2.0").exists()
+    assert pipeline.manifest.current == "0001-v0.1.0"
+    end = transactions(paths)[-1][1]
+    assert end.startswith("failed ") and "disk full" in end
+
+
+def test_a_rollback_holds_until_asked_or_until_a_newer_release(paths, repo, installed, monkeypatch):
+    pipeline = make_pipeline(paths, repo, monkeypatch)
+    pipeline.run()  # v0.2.0
+    lines: list[str] = []
+    pipeline.report = lines.append
+    pipeline.rollback()
+    assert Manifest.load(paths.manifest_file).held == "v0.2.0"
+    assert any("v0.2.0 is held back" in line for line in lines)
+
+    check = pipeline.check()
+    assert check.candidate is None and str(check.held) == "0.2.0"
+    assert check.lines()[1].startswith("v0.2.0 is held back because you rolled back from it")
+    assert "already up to date" in pipeline.run().message  # what auto-update would run
+    assert Manifest.load(paths.manifest_file).current == "0001-v0.1.0"
+
+    work = Path(repo.removeprefix("file://")).parent / "work"
+    (work / "pyproject.toml").write_text('[project]\nname = "vidpull"\nversion = "0.4.0"\n')
+    git(["commit", "-q", "-am", "release v0.4.0"], cwd=work)
+    git(["tag", "-a", "v0.4.0", "-m", "v0.4.0"], cwd=work)
+    git(["push", "-q", "--tags", repo.removeprefix("file://"), "main"], cwd=work)
+    check = pipeline.check()
+    assert str(check.candidate) == "0.4.0" and check.held is None  # a newer release lifts it
+
+    result = pipeline.run(target=Version.parse("0.2.0"))  # asked for by name
+    assert result.generation.tag == "v0.2.0"
+    assert Manifest.load(paths.manifest_file).held == ""
+
+
+def test_a_foreign_launcher_is_left_alone(paths, repo, installed, monkeypatch):
+    paths.launcher.write_text("#!/bin/sh\nexec pipx run vidpull\n")
+    lines: list[str] = []
+    make_pipeline(paths, repo, monkeypatch, lines=lines).run()
+    assert "pipx" in paths.launcher.read_text()
+    assert any("is not vidpull's launcher" in line for line in lines)
+
+
+def test_updates_come_from_the_repository_the_copy_was_installed_from(paths, repo, installed):
+    pipeline = UpdatePipeline(paths, Config(), python=sys.executable)  # no repository given
+    assert pipeline.repo_url == repo
+    assert str(pipeline.check().latest) == "0.2.0"
+
+
+def test_spotdl_is_left_alone_when_it_matches_the_release(paths, repo, installed, monkeypatch):
+    site = paths.spotdl_venv / "lib" / "python3.12" / "site-packages"
+    for spec in SPOTDL_SPECS:
+        name, _, version = spec.partition("==")
+        (site / f"{name}-{version}.dist-info").mkdir(parents=True)
+    (paths.spotdl_venv / "bin").mkdir(parents=True)
+    (paths.spotdl_venv / "bin" / "python").write_text("")
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("pip must not touch an environment that already matches")
+
+    monkeypatch.setattr("vidpull.update.spotdl_install", must_not_run)
+    lines: list[str] = []
+    make_pipeline(paths, repo, monkeypatch, lines=lines).run()
+    assert any("already matches this release" in line for line in lines)
+
+
+def test_a_generation_in_use_is_not_pruned(paths, repo, installed, monkeypatch):
+    from vidpull import update as update_module
+
+    layout = Layout(paths)
+    assert not generation_in_use(layout, "0001-v0.1.0")
+    assert hold_generation(paths, prefix=layout.venv_dir("0001-v0.1.0"))  # a window left open
+    assert not hold_generation(paths, prefix=paths.home)  # a checkout holds nothing
+    assert generation_in_use(layout, "0001-v0.1.0")
+
+    lines: list[str] = []
+    pipeline = make_pipeline(paths, repo, monkeypatch, lines=lines)
+    pipeline.run()
+    pipeline.run(engine_only=True)  # 0001 is neither current nor previous any more
+    assert layout.gen_dir("0001-v0.1.0").exists()
+    assert any("keeping generation 0001-v0.1.0" in line for line in lines)
+
+    update_module._held.pop().close()  # the window is closed
+    assert not generation_in_use(layout, "0001-v0.1.0")
+    pipeline.run(engine_only=True)
+    assert not layout.gen_dir("0001-v0.1.0").exists()
+    assert [g.id for g in Manifest.load(paths.manifest_file).generations] == [
+        "0003-v0.2.0",
+        "0004-v0.2.0",
+    ]
+
+
+def test_a_checkout_with_uncommitted_changes_cannot_be_rebuilt(paths, repo, monkeypatch):
+    tip = git(["rev-parse", "main"], cwd=Path(repo.removeprefix("file://"))).strip()
+    checkout_install(paths, repo, tip, tag="v0.2.0+abc123def456.dirty")
+    pipeline = make_pipeline(paths, repo, monkeypatch)
+    with pytest.raises(UpdateError, match="uncommitted changes"):
+        pipeline.run(engine_only=True)
+    assert Manifest.load(paths.manifest_file).current == "0001-v0.2.0+abc123def456.dirty"
+
+
+def test_an_install_does_not_run_beside_an_update(paths, repo):
+    layout = Layout(paths)
+    gen_dir = layout.gen_dir("0001-v0.1.0")
+    fake_generation(gen_dir / "venv", "0.1.0")
+    pipeline = UpdatePipeline(paths, Config(), repo_url=repo, python=sys.executable)
+    with pipeline._lock(), pytest.raises(BusyError, match="already running"):
+        finalize_install(
+            paths,
+            gen_dir=gen_dir,
+            tag="v0.1.0",
+            commit="b" * 40,
+            python=sys.executable,
+            repo_url=repo,
+        )
+    assert Manifest.load(paths.manifest_file) is None
+    assert transactions(paths)[-1][1].startswith("failed ")

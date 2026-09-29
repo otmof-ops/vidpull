@@ -172,6 +172,10 @@ if [ -n "$FROM_DIR" ]; then
   [ -n "$COMMIT" ] || COMMIT=unknown
   TAG="$(git -C "$SRC" describe --tags --exact-match 2>/dev/null | tr -d '[:space:]' || true)"
   [ -n "$TAG" ] || TAG="v${VERSION}+${COMMIT:0:12}"
+  # tracked files changed since that commit: this is neither the release nor the commit
+  if [ -n "$(git -C "$SRC" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    TAG="v${VERSION}+${COMMIT:0:12}.dirty"
+  fi
   say "installing from checkout $SRC as $TAG"
 else
   if [ -z "$REF" ]; then
