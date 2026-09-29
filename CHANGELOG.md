@@ -6,6 +6,32 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- A **Clear list** button (and `f`, now in the footer) that takes every finished, failed and
+  cancelled download off the list, albums and playlists with their songs. Nothing is deleted:
+  files stay where they are and the downloads move to the history.
+- A **History** tab (`h`): everything that is over, newest first, whether or not it is still on
+  the list. The lower half shows the selected download in words, with its source, its matched
+  upload, its files and its own log; for a run, the run's log and every song with its result.
+  Buttons switch it to the app's log file or the update log. `r` puts a download back on the
+  list, `d` deletes its record, **Forget history** deletes the records of everything cleared.
+- Each download keeps its own log in the job database, so it survives the session and the log
+  file's rotation.
+- `vidpull queue history`, `vidpull queue log ID` and `vidpull queue clear --forget`.
+
+### Changed
+
+- `f` and `vidpull queue clear` used to delete finished jobs; they now clear them from the list
+  and keep them in the history. `vidpull uninstall --purge-downloads` still knows the files of
+  cleared downloads.
+- The footer uses shorter labels; Uninstall (`x`) and the session log (`l`) keep their keys and
+  are listed in the help (`?`). Job database schema 4 (`cleared_at`, `job_log`).
+
+### Fixed
+
+- Clearing the list left finished albums and playlists behind as empty rows ("done 0/0").
+
 ## [1.2.2] - 2026-09-29
 
 ### Added

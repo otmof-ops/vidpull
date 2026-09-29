@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import threading
 
-from textual.widgets import DataTable, Input
+from textual.widgets import DataTable, Input, RichLog
 
 from tests.helpers import FakeEngine, FakeSongEngine, wait_until
-from vidpull.models import GroupStatus, JobStatus, Selection, SelectionKind
+from vidpull.models import GroupStatus, Job, JobStatus, Selection, SelectionKind
 from vidpull.tui.app import PostExit, VidpullApp
 from vidpull.tui.screens.confirm import ConfirmScreen
 from vidpull.tui.screens.group import GroupScreen
@@ -179,7 +179,8 @@ def test_clipboard_pending_flow_and_screens_open(config, paths, store, video_inf
             await pilot.pause(0.05)
             await pilot.press("escape")
             await pilot.press("f")
-            assert await until(pilot, lambda: store.list() == [])
+            assert await until(pilot, lambda: store.list(cleared=False) == [])
+            assert len(store.list(cleared=True)) == 1  # cleared from the list, kept in the history
 
     run(flow())
     app.manager.stop()
@@ -646,5 +647,175 @@ def test_a_background_update_that_blows_up_leaves_the_app_running(config, paths,
             assert await until(pilot, lambda: pipeline.runs == 1 and not app._auto_updating)
             await pilot.pause(0.2)
             assert app.is_running and not isinstance(app.screen, ConfirmScreen)
+
+    run(flow())
+
+
+def history_text(app) -> str:
+    return "\n".join(str(line.text) for line in app.query_one("#history-log", RichLog).lines)
+
+
+def test_clear_list_moves_finished_downloads_to_the_history_tab(config, paths, store, video_info):
+    engine = FakeEngine(info=video_info)
+    app = make_app(config, paths, store, engine)
+
+    async def flow():
+        async with app.run_test(size=(150, 46)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = URL
+            await pilot.press("enter")
+            assert await until(pilot, lambda: isinstance(app.screen, FormatPicker))
+            await pilot.press("enter")
+            assert await until(pilot, lambda: len(store.list()) == 1)
+            job = store.list()[0]
+            assert wait_until(lambda: store.get(job.id).status == JobStatus.DONE)
+            table = app.query_one("#jobs", DataTable)
+            assert await until(pilot, lambda: table.row_count == 1)
+
+            await pilot.click("#clear-list")  # the button
+            assert await until(pilot, lambda: table.row_count == 0)
+            assert store.list(cleared=False) == [] and store.get(job.id).cleared_at
+            assert (paths.home / "dl" / "clip.mp4").exists()  # the file is not touched
+            assert await until(pilot, lambda: " 0 done" in str(app.query_one("#status").render()))
+
+            await pilot.press("escape")
+            await pilot.press("h")  # the History tab
+            records = app.query_one("#history", DataTable)
+            assert app.views.active == "tab-history"
+            assert await until(pilot, lambda: records.row_count == 1)
+            row = [str(cell) for cell in records.get_row(f"j{job.id}")]
+            assert (
+                row[1].startswith("Big Buck") and row[3] == "done" and row[5] == ""
+            )  # off the list
+            assert await until(pilot, lambda: "fake engine starting" in history_text(app))
+            text = history_text(app)
+            assert "from     " in text and "file     " in text and "cleared  " in text
+
+            await pilot.click("#log-updates")
+            assert await until(pilot, lambda: "updates.log ---" in history_text(app))
+            await pilot.click("#log-app")
+            assert await until(pilot, lambda: "vidpull.log ---" in history_text(app))
+            await pilot.click("#log-download")
+            assert await until(pilot, lambda: "fake engine starting" in history_text(app))
+
+            await pilot.press("h")  # and back
+            assert app.views.active == "tab-downloads"
+            await pilot.press("h")
+            await pilot.press("escape")  # escape returns to the list too
+            assert app.views.active == "tab-downloads"
+
+    run(flow())
+
+
+def test_history_retry_delete_and_forget(config, paths, store, video_info):
+    selection = Selection(SelectionKind.PRESET, "best", "Best")
+    done = store.add(
+        Job(
+            url="https://e/done",
+            selection=selection,
+            status=JobStatus.DONE,
+            title="Finished earlier",
+            finished_at="2026-09-29T10:00:00+00:00",
+        )
+    )
+    failed = store.add(
+        Job(
+            url="https://e/failed",
+            selection=selection,
+            status=JobStatus.FAILED,
+            title="Failed earlier",
+            error="boom",
+            finished_at="2026-09-29T11:00:00+00:00",
+        )
+    )
+    engine = FakeEngine(info=video_info)
+    app = make_app(config, paths, store, engine)
+
+    async def flow():
+        async with app.run_test(size=(150, 46)) as pilot:
+            table = app.query_one("#jobs", DataTable)
+            assert await until(pilot, lambda: table.row_count == 2)
+            await pilot.press("escape")
+            await pilot.press("f")
+            assert await until(pilot, lambda: table.row_count == 0)
+            await pilot.press("h")
+            records = app.query_one("#history", DataTable)
+            assert await until(pilot, lambda: records.row_count == 2)
+            assert [str(records.get_row_at(n)[1]) for n in range(2)] == [
+                "Failed earlier",
+                "Finished earlier",
+            ]  # newest first
+            assert await until(pilot, lambda: "failed: boom" in history_text(app))
+
+            await pilot.press("r")  # the failed one goes back onto the list and runs
+            assert await until(pilot, lambda: app.views.active == "tab-downloads")
+            assert store.get(failed.id).cleared_at is None
+            assert wait_until(lambda: store.get(failed.id).status == JobStatus.DONE)
+            assert await until(pilot, lambda: table.row_count == 1)
+
+            await pilot.press("h")
+            assert await until(pilot, lambda: records.row_count == 2)
+            records.move_cursor(row=records.get_row_index(f"j{done.id}"))
+            await pilot.press("d")
+            assert await until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
+            await pilot.press("y")
+            assert await until(pilot, lambda: store.get(done.id) is None)
+            assert await until(pilot, lambda: records.row_count == 1)
+
+            await pilot.click("#forget-history")  # nothing is cleared now: the other is on the list
+            await pilot.pause(0.1)
+            assert not isinstance(app.screen, ConfirmScreen)
+            await pilot.press("f")
+            assert await until(pilot, lambda: store.get(failed.id).cleared_at is not None)
+            await pilot.click("#forget-history")
+            assert await until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
+            assert "files are not touched" in app.screen.question
+            await pilot.press("y")
+            assert await until(pilot, lambda: store.list() == [])
+            assert await until(pilot, lambda: records.row_count == 0)
+            assert await until(pilot, lambda: "nothing has finished yet" in history_text(app))
+
+    run(flow())
+
+
+def test_a_cleared_run_is_one_history_row_with_its_songs(config, paths, store, video_info):
+    from tests.helpers import sample_song
+
+    songs = [
+        sample_song(title="Airbag", track_number=1),
+        sample_song(title="Lucky", track_number=2),
+    ]
+    for song in songs:
+        song.list_name = "OK Computer"
+    engine = FakeEngine(info=video_info)
+    app = make_app(config, paths, store, engine, song_engine=FakeSongEngine(songs=songs))
+
+    async def flow():
+        async with app.run_test(size=(150, 46)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = ALBUM
+            await pilot.press("enter")
+            assert await until(pilot, lambda: len(store.list_groups()) == 1)
+            assert await until(pilot, lambda: store.get_group(1).status == GroupStatus.DONE)
+            table = app.query_one("#jobs", DataTable)
+            await pilot.press("escape")
+            await pilot.press("f")
+            assert await until(pilot, lambda: table.row_count == 0)
+            assert store.get_group(1).cleared_at and all(j.cleared_at for j in store.list())
+            await pilot.press("h")
+            records = app.query_one("#history", DataTable)
+            assert await until(pilot, lambda: records.row_count == 1)
+            row = [str(cell) for cell in records.get_row("g1")]
+            assert row[1] == "OK Computer · 2 songs" and row[3] == "done 2/2"
+            assert await until(pilot, lambda: "songs:" in history_text(app))
+            text = history_text(app)
+            assert (
+                "Carly Rae Jepsen - Airbag" in text
+                and "2 songs" in text
+                and "fetching the track" in text
+            )
+            await pilot.press("enter")  # the songs behind it
+            assert await until(pilot, lambda: isinstance(app.screen, GroupScreen))
+            await pilot.press("escape")
 
     run(flow())

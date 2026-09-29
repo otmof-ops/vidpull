@@ -59,9 +59,33 @@ open the folder.
 | `a` / `v` | focus the link box / paste from the clipboard (any terminal paste works too) |
 | `c` / `r` / `d` | cancel, retry, delete the selected download (delete can take the files with it) |
 | `o` | open the download folder |
+| `f` | clear the list: everything finished moves to History (there is a **Clear list** button too) |
+| `h` | the History tab, and back (`esc` returns to the list as well) |
 | `u` / `x` | update vidpull, or remove it |
 | `s` / `l` / `?` | settings, log, help |
 | `q` | quit; anything still downloading picks up where it left off next time |
+
+### The list and the history
+
+The **Downloads** tab is the working list. **Clear list** (`f`) takes every finished, failed and
+cancelled download off it, albums and playlists with their songs. Nothing is deleted: the files
+stay where they are, and each download moves to the **History** tab with its record.
+
+The History tab lists everything that is over, newest first, whether or not it is still on the
+list. Move to a row and the lower half shows that download in words: what it was, how it ended,
+where it came from, which upload a song was matched to, where the file went, and **its own log**,
+which is kept with it. For an album or playlist it shows the run's log and every song with its
+result. The buttons above switch that half to the app's log file or the update log.
+
+| In History | Does |
+| --- | --- |
+| `r` | put a failed or cancelled download back on the list and run it again |
+| `d` | delete that download's record for good (it asks; it can take the files with it) |
+| `enter` | on an album or playlist: the songs behind it |
+| **Forget history** | delete the records of everything that was cleared; files are not touched |
+
+From the command line: `vidpull queue clear`, `vidpull queue history`, `vidpull queue log ID`
+(`G3` for a run), and `vidpull queue clear --forget`.
 
 ### Without the picker
 

@@ -148,6 +148,7 @@ class Job:
     song: Song | None = None  # set when the job came from a music link, not a media URL
     matched_url: str = ""  # the upload the song was matched to; empty until matched
     group_id: int | None = None  # the album or playlist run this song belongs to
+    cleared_at: str | None = None  # taken off the list; still in the history
 
     @property
     def display_title(self) -> str:
@@ -178,6 +179,7 @@ class Group:
     error: str = ""
     created_at: str = field(default_factory=utcnow)
     updated_at: str = field(default_factory=utcnow)
+    cleared_at: str | None = None  # taken off the list; still in the history
 
     @property
     def display_title(self) -> str:
@@ -186,6 +188,17 @@ class Group:
     @property
     def is_terminal(self) -> bool:
         return self.status.is_terminal
+
+
+@dataclass(frozen=True)
+class LogLine:
+    """One line of a download's own log, kept with it in the history."""
+
+    at: str
+    level: str
+    message: str
+    job_id: int | None = None
+    group_id: int | None = None
 
 
 @dataclass(frozen=True)

@@ -15,9 +15,10 @@ import threading
 from collections.abc import Iterable
 from pathlib import Path
 
-from vidpull.models import Group, GroupStatus, Job, JobStatus, Selection, Song, utcnow
+from vidpull.models import Group, GroupStatus, Job, JobStatus, LogLine, Selection, Song, utcnow
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+LOG_LINES_PER_JOB = 300  # a download's own log is kept with it; this bounds a noisy one
 
 _GROUPS_TABLE = """
 CREATE TABLE IF NOT EXISTS groups (
@@ -30,9 +31,25 @@ CREATE TABLE IF NOT EXISTS groups (
     entry_count INTEGER NOT NULL DEFAULT 0,
     error TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    cleared_at TEXT
 );
 """
+
+_LOG_TABLE = """
+CREATE TABLE IF NOT EXISTS job_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER,
+    group_id INTEGER,
+    at TEXT NOT NULL,
+    level TEXT NOT NULL,
+    message TEXT NOT NULL
+);
+"""
+_LOG_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_job_log_job ON job_log(job_id)",
+    "CREATE INDEX IF NOT EXISTS idx_job_log_group ON job_log(group_id)",
+)
 
 _SCHEMA = (
     """
@@ -62,7 +79,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at TEXT,
     song TEXT NOT NULL DEFAULT '',
     matched_url TEXT NOT NULL DEFAULT '',
-    group_id INTEGER
+    group_id INTEGER,
+    cleared_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE TABLE IF NOT EXISTS meta (
@@ -71,6 +89,9 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
     + _GROUPS_TABLE
+    + _LOG_TABLE
+    + ";\n".join(_LOG_INDEXES)
+    + ";\n"
 )
 
 # Statements that take a database from version N-1 to N. ``ALTER TABLE ... ADD COLUMN`` is
@@ -85,6 +106,12 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE jobs ADD COLUMN group_id INTEGER",
         "CREATE INDEX IF NOT EXISTS idx_jobs_group ON jobs(group_id)",
         _GROUPS_TABLE,
+    ),
+    4: (
+        "ALTER TABLE jobs ADD COLUMN cleared_at TEXT",
+        "ALTER TABLE groups ADD COLUMN cleared_at TEXT",
+        _LOG_TABLE,
+        *_LOG_INDEXES,
     ),
 }
 
@@ -114,6 +141,7 @@ _COLUMNS = (
     "song",
     "matched_url",
     "group_id",
+    "cleared_at",
 )
 
 _GROUP_COLUMNS = (
@@ -126,6 +154,7 @@ _GROUP_COLUMNS = (
     "error",
     "created_at",
     "updated_at",
+    "cleared_at",
 )
 
 
@@ -159,14 +188,11 @@ class Store:
 
     def _migrate(self, recorded: int) -> None:
         for version in range(recorded + 1, SCHEMA_VERSION + 1):
-            columns = {
-                str(row["name"]) for row in self._conn.execute("PRAGMA table_info(jobs)").fetchall()
-            }
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 for statement in _MIGRATIONS.get(version, ()):
                     added = _added_column(statement)
-                    if added is not None and added in columns:
+                    if added is not None and added[1] in self._columns_of(added[0]):
                         continue
                     self._conn.execute(statement)
                 self._conn.execute(
@@ -179,6 +205,10 @@ class Store:
                 with contextlib.suppress(sqlite3.Error):
                     self._conn.execute("ROLLBACK")
                 raise
+
+    def _columns_of(self, table: str) -> set[str]:
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {str(row["name"]) for row in rows}
 
     # ------------------------------------------------------------- meta
     def get_meta(self, key: str) -> str | None:
@@ -219,7 +249,9 @@ class Store:
         *,
         limit: int | None = None,
         group_id: int | None = None,
+        cleared: bool | None = None,
     ) -> list[Job]:
+        """Jobs, oldest first. ``cleared``: False the list, True the cleared ones, None both."""
         sql = "SELECT * FROM jobs"
         clauses: list[str] = []
         params: list[object] = []
@@ -232,6 +264,8 @@ class Store:
         if group_id is not None:
             clauses.append("group_id = ?")
             params.append(int(group_id))
+        if cleared is not None:
+            clauses.append("cleared_at IS NOT NULL" if cleared else "cleared_at IS NULL")
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY id"
@@ -283,6 +317,7 @@ class Store:
     def delete(self, job_id: int) -> bool:
         with self._lock:
             cur = self._conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+            self._conn.execute("DELETE FROM job_log WHERE job_id = ?", (job_id,))
         return cur.rowcount > 0
 
     def clear(self, statuses: Iterable[JobStatus]) -> int:
@@ -330,10 +365,14 @@ class Store:
             files.extend(job.files)
         return files
 
-    def counts(self) -> dict[str, int]:
+    def counts(self, *, cleared: bool | None = False) -> dict[str, int]:
+        """Jobs by status: the list's own by default, not what was cleared from it."""
+        where = ""
+        if cleared is not None:
+            where = " WHERE cleared_at IS NOT NULL" if cleared else " WHERE cleared_at IS NULL"
         with self._lock:
             rows = self._conn.execute(
-                "SELECT status, COUNT(*) AS n FROM jobs GROUP BY status"
+                f"SELECT status, COUNT(*) AS n FROM jobs{where} GROUP BY status"
             ).fetchall()
         return {str(r["status"]): int(r["n"]) for r in rows}
 
@@ -356,9 +395,12 @@ class Store:
             row = self._conn.execute("SELECT * FROM groups WHERE id = ?", (group_id,)).fetchone()
         return None if row is None else _group_from_row(row)
 
-    def list_groups(self) -> list[Group]:
+    def list_groups(self, *, cleared: bool | None = None) -> list[Group]:
+        where = ""
+        if cleared is not None:
+            where = " WHERE cleared_at IS NOT NULL" if cleared else " WHERE cleared_at IS NULL"
         with self._lock:
-            rows = self._conn.execute("SELECT * FROM groups ORDER BY id").fetchall()
+            rows = self._conn.execute(f"SELECT * FROM groups{where} ORDER BY id").fetchall()
         return [_group_from_row(r) for r in rows]
 
     def update_group(self, group_id: int, **fields: object) -> Group | None:
@@ -378,7 +420,45 @@ class Store:
     def delete_group(self, group_id: int) -> bool:
         with self._lock:
             cur = self._conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
+            self._conn.execute("DELETE FROM job_log WHERE group_id = ?", (group_id,))
         return cur.rowcount > 0
+
+    # --------------------------------------------------------------- log
+    def add_log(
+        self, level: str, message: str, *, job_id: int | None = None, group_id: int | None = None
+    ) -> None:
+        """Keep one line of a download's log with it. Never raises: a log must not stop a job."""
+        try:
+            with self._lock:
+                if job_id is not None:
+                    row = self._conn.execute(
+                        "SELECT COUNT(*) AS n FROM job_log WHERE job_id = ?", (job_id,)
+                    ).fetchone()
+                    if int(row["n"]) >= LOG_LINES_PER_JOB:
+                        return
+                self._conn.execute(
+                    "INSERT INTO job_log(job_id, group_id, at, level, message) "
+                    "VALUES(?, ?, ?, ?, ?)",
+                    (job_id, group_id, utcnow(), level, message[:2000]),
+                )
+        except sqlite3.Error:
+            pass
+
+    def job_log(self, job_id: int) -> list[LogLine]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM job_log WHERE job_id = ? ORDER BY id", (job_id,)
+            ).fetchall()
+        return [_log_from_row(r) for r in rows]
+
+    def group_log(self, group_id: int) -> list[LogLine]:
+        """The run's own lines (the track list, the batches), not its songs' lines."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM job_log WHERE group_id = ? AND job_id IS NULL ORDER BY id",
+                (group_id,),
+            ).fetchall()
+        return [_log_from_row(r) for r in rows]
 
     def group_counts(self, group_id: int) -> dict[str, int]:
         with self._lock:
@@ -389,11 +469,14 @@ class Store:
         return {str(r["status"]): int(r["n"]) for r in rows}
 
 
-def _added_column(statement: str) -> str | None:
+def _added_column(statement: str) -> tuple[str, str] | None:
+    """(table, column) when ``statement`` adds a column to one of the known tables."""
     words = statement.split()
     heads = [w.upper() for w in words[:5]]
-    if len(words) >= 6 and heads == ["ALTER", "TABLE", "JOBS", "ADD", "COLUMN"]:
-        return words[5]
+    if len(words) >= 6 and heads[:2] == ["ALTER", "TABLE"] and heads[3:] == ["ADD", "COLUMN"]:
+        table = words[2].lower()
+        if table in {"jobs", "groups"}:
+            return table, words[5]
     return None
 
 
@@ -446,6 +529,7 @@ def _to_row(job: Job) -> dict[str, object]:
         "song": job.song.to_json() if job.song is not None else "",
         "matched_url": job.matched_url,
         "group_id": job.group_id,
+        "cleared_at": job.cleared_at,
     }
 
 
@@ -478,6 +562,7 @@ def _from_row(row: sqlite3.Row) -> Job:
         song=Song.from_json(song_text) if song_text else None,
         matched_url=row["matched_url"] or "",
         group_id=row["group_id"],
+        cleared_at=row["cleared_at"],
     )
 
 
@@ -492,6 +577,7 @@ def _group_to_row(group: Group) -> dict[str, object]:
         "error": group.error,
         "created_at": group.created_at,
         "updated_at": group.updated_at,
+        "cleared_at": group.cleared_at,
     }
 
 
@@ -507,4 +593,15 @@ def _group_from_row(row: sqlite3.Row) -> Group:
         error=row["error"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        cleared_at=row["cleared_at"],
+    )
+
+
+def _log_from_row(row: sqlite3.Row) -> LogLine:
+    return LogLine(
+        at=row["at"],
+        level=row["level"],
+        message=row["message"],
+        job_id=row["job_id"],
+        group_id=row["group_id"],
     )

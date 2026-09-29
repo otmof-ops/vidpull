@@ -177,3 +177,109 @@ def test_groups_crud_and_job_membership(store: Store):
     store.requeue_stale()
     assert store.get_group(stuck.id).status == GroupStatus.FAILED
     assert "paste the link again" in store.get_group(stuck.id).error
+
+
+def test_migrates_a_version_3_database_and_keeps_its_rows(paths):
+    import sqlite3
+
+    path = paths.db_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', uploader TEXT NOT NULL DEFAULT '',
+            duration REAL, is_playlist INTEGER NOT NULL DEFAULT 0, entry_count INTEGER,
+            selection TEXT NOT NULL, status TEXT NOT NULL, progress REAL NOT NULL DEFAULT 0,
+            downloaded_bytes INTEGER, total_bytes INTEGER, speed REAL, eta REAL,
+            phase TEXT NOT NULL DEFAULT '', filename TEXT NOT NULL DEFAULT '',
+            files TEXT NOT NULL DEFAULT '[]', error TEXT NOT NULL DEFAULT '',
+            worker TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            started_at TEXT, finished_at TEXT, song TEXT NOT NULL DEFAULT '',
+            matched_url TEXT NOT NULL DEFAULT '', group_id INTEGER
+        );
+        CREATE TABLE groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL, kind TEXT NOT NULL,
+            selection TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+            entry_count INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta VALUES ('schema_version', '3');
+        """
+    )
+    selection = Selection(SelectionKind.PRESET, "best", "Best").to_json()
+    conn.execute(
+        "INSERT INTO groups(url, kind, selection, name, status, created_at, updated_at) "
+        "VALUES('https://open.spotify.com/album/x', 'album', ?, 'OK Computer', 'done', 't', 't')",
+        (selection,),
+    )
+    conn.execute(
+        "INSERT INTO jobs(url, selection, status, created_at, updated_at, group_id) "
+        "VALUES('https://e/song', ?, 'done', 't', 't', 1)",
+        (selection,),
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    try:
+        assert store.get_meta("schema_version") == str(SCHEMA_VERSION)
+        job, group = store.get(1), store.get_group(1)
+        assert job.cleared_at is None and group.cleared_at is None and group.name == "OK Computer"
+        assert [j.id for j in store.list(cleared=False)] == [1] and store.list(cleared=True) == []
+        store.add_log("info", "kept with the download", job_id=1, group_id=1)
+        assert [line.message for line in store.job_log(1)] == ["kept with the download"]
+    finally:
+        store.close()
+
+
+def test_cleared_downloads_leave_the_list_and_stay_in_the_store(store: Store):
+    from vidpull.models import Group, GroupStatus, utcnow
+
+    done = store.add(Job(url="https://e/a", selection=_job().selection, status=JobStatus.DONE))
+    running = store.add(_job("https://e/b"))
+    group = store.add_group(
+        Group(url="https://open.spotify.com/album/x", kind="album", selection=_job().selection)
+    )
+    store.update(done.id, cleared_at=utcnow())
+    store.update_group(group.id, status=GroupStatus.DONE, cleared_at=utcnow())
+    assert [j.id for j in store.list(cleared=False)] == [running.id]
+    assert [j.id for j in store.list(cleared=True)] == [done.id]
+    assert len(store.list()) == 2  # both, unless asked
+    assert store.counts() == {"queued": 1} and store.counts(cleared=None) == {
+        "done": 1,
+        "queued": 1,
+    }
+    assert store.list_groups(cleared=False) == [] and len(store.list_groups(cleared=True)) == 1
+    assert store.produced_files() == []
+    store.update(done.id, files=["/dl/a.mp4"])
+    assert store.produced_files() == ["/dl/a.mp4"]  # a cleared download still owns its files
+    store.update(done.id, cleared_at=None)
+    assert [j.id for j in store.list(cleared=False)] == [done.id, running.id]
+
+
+def test_each_download_keeps_its_own_log(store: Store, monkeypatch):
+    from vidpull import store as store_module
+
+    first, second = store.add(_job()), store.add(_job("https://e/other"))
+    store.add_log("info", "looking for the song", job_id=first.id, group_id=7)
+    store.add_log("warning", "x" * 5000, job_id=first.id, group_id=7)
+    store.add_log("error", "HTTP Error 403", job_id=second.id)
+    store.add_log("info", "12 songs, 10 at a time", group_id=7)
+    lines = store.job_log(first.id)
+    assert [(line.level, line.message[:12]) for line in lines] == [
+        ("info", "looking for "),
+        ("warning", "xxxxxxxxxxxx"),
+    ]
+    assert len(lines[1].message) == 2000 and lines[0].at.endswith("+00:00")
+    assert [line.message for line in store.group_log(7)] == ["12 songs, 10 at a time"]
+    monkeypatch.setattr(store_module, "LOG_LINES_PER_JOB", 3)
+    for n in range(5):
+        store.add_log("info", f"line {n}", job_id=second.id)
+    assert len(store.job_log(second.id)) == 3  # a noisy download cannot fill the database
+    assert store.delete(first.id) and store.job_log(first.id) == []
+    assert store.delete_group(7) or store.group_log(7) == []
+    store.close()
+    store.add_log("info", "after close", job_id=second.id)  # never raises
