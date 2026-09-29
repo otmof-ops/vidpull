@@ -6,6 +6,8 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-09-29
+
 ### Fixed
 
 - A Spotify album or playlist failed outright ("Could not get playlist info") when one request
