@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from vidpull import REPO_URL, __version__
@@ -81,6 +82,37 @@ def parse_ls_remote(output: str) -> list[Version]:
                 names.add(match.group(1))
     versions = [Version.try_parse(name) for name in names & peeled]
     return sorted(v for v in versions if v is not None)
+
+
+@dataclass
+class RemoteState:
+    """The releases on the remote, the commit each points at, and where its default branch is."""
+
+    tags: list[Version] = field(default_factory=list)
+    commits: dict[str, str] = field(default_factory=dict)  # "v1.2.3" -> commit
+    head: str = ""
+
+
+def parse_remote_state(output: str) -> RemoteState:
+    """``git ls-remote <repo> HEAD 'refs/tags/*'`` as a ``RemoteState``."""
+    state = RemoteState(tags=parse_ls_remote(output))
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        sha, ref = parts
+        if ref == "HEAD":
+            state.head = sha
+        elif ref.endswith("^{}"):
+            match = TAG_PATTERN.match(ref[:-3])
+            if match:
+                state.commits[match.group(1)] = sha  # the peeled line is the commit
+    return state
+
+
+def remote_state(repo_url: str = REPO_URL) -> RemoteState:
+    """Release tags, their commits and the default branch's head, in one request."""
+    return parse_remote_state(git(["ls-remote", repo_url, "HEAD", "refs/tags/*"]))
 
 
 def remote_tags(repo_url: str = REPO_URL) -> list[Version]:

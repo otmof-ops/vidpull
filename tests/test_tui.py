@@ -472,13 +472,14 @@ class FakePipeline:
         self.candidate = candidate
         self.runs = 0
 
-    def check(self, *, include_prerelease=None):
-        from types import SimpleNamespace
+    def check(self, *, include_prerelease=None, trigger=None):
+        from vidpull.semver import Version
+        from vidpull.update import UpdateCheck
 
-        tag = SimpleNamespace(tag=self.candidate) if self.candidate else None
-        return SimpleNamespace(candidate=tag, error="", latest=None, current=None)
+        candidate = Version.parse(self.candidate) if self.candidate else None
+        return UpdateCheck(current=None, latest=candidate, candidate=candidate)
 
-    def run(self, *, target=None, engine_only=False, dry_run=False, busy=None):
+    def run(self, *, target=None, engine_only=False, dry_run=False, busy=None, trigger=None):
         from types import SimpleNamespace
 
         from vidpull.update import BusyError
@@ -523,3 +524,61 @@ def test_startup_check_offers_the_update_or_installs_it(config, paths, store, vi
             assert app._update_tag is None
 
     run(flow_auto())
+
+
+def test_a_window_left_open_on_an_old_generation_says_so(
+    config, paths, store, video_info, monkeypatch
+):
+    from vidpull.manifest import Generation
+    from vidpull.tui import app as app_module
+
+    newer = Generation("0016-v1.2.2", "v1.2.2", "e" * 40, "1.2.2", "2026.08.19", "python")
+    answer = {"gen": None}
+    monkeypatch.setattr(app_module, "stale_generation", lambda paths: answer["gen"])
+    app = make_app(config, paths, store, FakeEngine(info=video_info))
+
+    async def flow():
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause(0.1)
+            assert "RESTART" not in str(app.query_one("#status").render())
+            answer["gen"] = newer  # an update was installed from another terminal
+            app._refresh_status()
+            app._refresh_status()  # noticed once, shown until the restart
+            await pilot.pause(0.1)
+            assert "RESTART to run 0016-v1.2.2" in str(app.query_one("#status").render())
+
+    run(flow())
+    notes = [line for line in paths.update_log.read_text().splitlines() if " NOTE " in line]
+    assert len(notes) == 1 and "generation 0016-v1.2.2 is installed" in notes[0]
+
+
+def test_the_update_screen_hands_the_pipeline_back_and_shows_the_log(
+    config, paths, store, video_info
+):
+    pipeline = FakePipeline(candidate=None)
+    pipeline.installed = False
+    pipeline.manifest = None
+    pipeline.paths = paths
+    sentinel = lambda line: None  # noqa: E731
+    pipeline.report = sentinel
+    from vidpull.updatelog import UpdateLog
+
+    pipeline.log = UpdateLog(paths.update_log)
+    pipeline.log.note("first start of generation 0015-v1.2.1")
+    app = make_app(config, paths, store, FakeEngine(info=video_info), pipeline=pipeline)
+
+    async def flow():
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.press("escape")
+            await pilot.press("u")
+            assert await until(pilot, lambda: isinstance(app.screen, UpdateScreen))
+            assert pipeline.report is not sentinel
+            app.screen._history()
+            await pilot.pause(0.1)
+            shown = "\n".join(str(line.text) for line in app.screen.query_one("#log").lines)
+            assert "first start of generation 0015-v1.2.1" in shown and "up to date" in shown
+            await pilot.press("escape")
+            assert await until(pilot, lambda: not isinstance(app.screen, UpdateScreen))
+            assert pipeline.report is sentinel
+
+    run(flow())

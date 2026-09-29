@@ -6,6 +6,36 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The update log, `~/.local/state/vidpull/updates.log`: every check, app update, engine
+  refresh, rollback, install and spotDL install is recorded as one transaction, with who asked
+  for it, every step the updater took, how it ended and how long it took, and the versions
+  before and after (vidpull, generation, commit, yt-dlp, spotDL, ytmusicapi). The first start
+  of each generation and every restart from the app are noted too. `vidpull update --log [N]`
+  prints it, the update screen has a History button, `vidpull doctor` reports it.
+- Check says when the repository has changes newer than its newest release, which no update
+  can install yet, instead of a bare "up to date".
+- A window left open while an update was installed says so: `RESTART to run …` in the status
+  bar and a notice, until it is restarted. The app also checks for releases while it stays
+  open, every `update_check_hours`, not only when it starts.
+
+### Changed
+
+- "Update engine" says what it did in plain words: which engines changed, and that the app is
+  unchanged. It used to end with "installed vX.Y.Z as generation N", which read as an app
+  update.
+- spotDL is pinned to the exact version vidpull was tested with (4.5.2) and moves with vidpull
+  releases; an engine refresh no longer pulls whatever spotDL is newest.
+
+### Fixed
+
+- "Update engine" on a copy installed from a checkout (`./install.sh --from .`) replaced the
+  app with the last release, silently. It now rebuilds the checkout's own commit, and refuses,
+  saying why, when the repository does not have that commit.
+- A background update could report into an update screen that had been closed and fail on it;
+  the screen now hands the updater back, and a broken report never stops an update.
+
 ## [1.2.1] - 2026-09-28
 
 ### Fixed

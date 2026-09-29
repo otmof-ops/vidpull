@@ -210,3 +210,24 @@ def test_get_album_link_runs_as_a_group(monkeypatch, capsys, paths, video_info):
         "G  1  done          2/2   songs  OK Computer" in listed
         and "[G1] Carly Rae Jepsen - Airbag" in listed
     )
+
+
+def test_update_log_command(capsys, paths):
+    from vidpull.updatelog import UpdateLog
+
+    assert cli.main(["update", "--log"]) == 0
+    captured = capsys.readouterr()
+    assert (
+        "no update has been recorded yet" in captured.out and str(paths.update_log) in captured.err
+    )
+    log = UpdateLog(paths.update_log)
+    with log.begin("engine-only", "tui", gen="0015-v1.2.1") as txn:
+        txn.line("refreshing the engines")
+        txn.end(True, "engines refreshed")
+    log.note("first start of generation 0016-v1.2.1")
+    assert cli.main(["update", "--log", "2"]) == 0
+    out = capsys.readouterr().out.strip().splitlines()
+    assert len(out) == 2 and " END   ok " in out[0] and " NOTE " in out[1]
+    assert cli.main(["doctor"]) in (0, 1)
+    report = capsys.readouterr().out
+    assert "update log" in report and "1 transaction(s)" in report

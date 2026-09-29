@@ -20,6 +20,7 @@ from vidpull.paths import Paths
 from vidpull.preflight import JS_RUNTIME_MINIMUM, tool_version
 from vidpull.procs import run, which
 from vidpull.spotdl import SpotdlEngine
+from vidpull.updatelog import UpdateLog
 from vidpull.versioning import git_describe, source_checkout
 
 DOCTOR_PROBE_URL = "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
@@ -47,6 +48,7 @@ def run_checks(
     checks.append(_db_check(paths))
     checks.append(_clipboard_check())
     checks.append(_launcher_check(paths))
+    checks.append(_update_log_check(paths))
     if online:
         checks.append(_online_probe(engine))
     return checks
@@ -214,6 +216,20 @@ def _launcher_check(paths: Paths) -> Check:
         "launcher",
         "ok" if on_path else "warn",
         f"{paths.launcher}" + ("" if on_path else " is not first on PATH"),
+    )
+
+
+def _update_log_check(paths: Paths) -> Check:
+    if not paths.update_log.exists():
+        return Check("update log", "ok", f"{paths.update_log} (nothing recorded yet)")
+    update_log = UpdateLog(paths.update_log)
+    last = update_log.last_end()
+    summary = " ".join(last.split()[:1] + last.split()[3:7]) if last else "no finished transaction"
+    failed = " failed " in f" {last} "
+    return Check(
+        "update log",
+        "warn" if failed else "ok",
+        f"{paths.update_log} ({update_log.transactions()} transaction(s); last: {summary})",
     )
 
 

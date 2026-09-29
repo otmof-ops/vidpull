@@ -43,7 +43,10 @@ log = logging.getLogger(__name__)
 
 # ytmusicapi 1.12.2 and 1.12.3 return nothing for spotDL's filtered searches (spotDL #2779,
 # ytmusicapi #1006); 1.12.1 works. Lift the pin when spotDL ships a fix.
-SPOTDL_SPECS: tuple[str, ...] = ("spotdl>=4.5.2,<5", "ytmusicapi==1.12.1")
+# Exact pins: vidpull runs spotDL's own functions (spotdl_tracklist.py), so a spotDL release
+# reaches users through a vidpull release that was tested against it, never through an
+# engine refresh.
+SPOTDL_SPECS: tuple[str, ...] = ("spotdl==4.5.2", "ytmusicapi==1.12.1")
 INSTALL_SIZE_HINT = "about 200 MB"
 
 VERSION_TIMEOUT = 60.0

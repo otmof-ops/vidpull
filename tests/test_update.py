@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -19,7 +20,10 @@ from vidpull.update import (
     UpdateError,
     UpdatePipeline,
     finalize_install,
+    install_spotdl,
     launcher_script,
+    note_first_run,
+    stale_generation,
 )
 from vidpull.versioning import git
 
@@ -212,3 +216,187 @@ def test_finalize_install_prunes_to_two_generations(paths, repo):
     assert manifest.current == "0003-v0.3.0" and manifest.previous == "0002-v0.2.0"
     assert sorted(p.name for p in layout.gen_root.iterdir()) == ["0002-v0.2.0", "0003-v0.3.0"]
     assert [g.id for g in manifest.generations] == ["0002-v0.2.0", "0003-v0.3.0"]
+
+
+def log_lines(paths) -> list[str]:
+    return paths.update_log.read_text().splitlines() if paths.update_log.exists() else []
+
+
+def transactions(paths) -> list[tuple[str, str]]:
+    """(BEGIN text, END text) per transaction, in order."""
+    begins: dict[str, str] = {}
+    pairs: list[tuple[str, str]] = []
+    for line in log_lines(paths):
+        _stamp, txn, kind, text = line.split(None, 3)
+        if kind == "BEGIN":
+            begins[txn] = text
+        elif kind == "END":
+            pairs.append((begins[txn], text))
+    return pairs
+
+
+def test_every_transaction_is_logged(paths, repo, installed, monkeypatch):
+    pipeline = make_pipeline(paths, repo, monkeypatch)
+    pipeline.trigger = "tui"
+    pipeline.check()
+    pipeline.run(trigger="auto")  # installs v0.2.0
+    pipeline.run(engine_only=True)
+    pipeline.rollback(trigger="cli")
+    with pytest.raises(UpdateError):
+        pipeline.run(target=Version.parse("0.3.0"))  # a lightweight tag is not a release
+    with pytest.raises(BusyError):
+        pipeline.run(busy=lambda: True)
+    plan = pipeline.run(target=Version.parse("0.2.0"), dry_run=True)
+    assert plan.ok
+
+    done = transactions(paths)
+    assert [begin.split()[0] for begin, _ in done] == [
+        "check", "update", "engine-only", "rollback", "update", "update", "update",
+    ]  # fmt: skip
+    check_begin, check_end = done[0]
+    assert "trigger=tui" in check_begin and "gen=0001-v0.1.0" in check_begin
+    assert "vidpull=0.1.0" in check_begin and 'spotdl="not installed"' in check_begin
+    assert check_end.startswith("ok ") and "installed v0.1.0, newest release v0.2.0" in check_end
+    assert "update available: v0.2.0" in check_end and "not in a release yet" in check_end
+
+    update_begin, update_end = done[1]
+    assert "trigger=auto" in update_begin and "gen=0001-v0.1.0" in update_begin
+    assert "installed v0.2.0 as generation 0002-v0.2.0" in update_end
+    assert "gen=0002-v0.2.0" in update_end and "vidpull=0.2.0" in update_end
+
+    engine_begin, engine_end = done[2]
+    assert "gen=0002-v0.2.0" in engine_begin and "gen=0003-v0.2.0" in engine_end
+    assert "engines refreshed" in engine_end and "the app is unchanged at v0.2.0" in engine_end
+
+    assert "trigger=cli" in done[3][0] and "rolled back to v0.2.0" in done[3][1]
+    assert done[4][1].startswith("failed ") and "not an annotated tag" in done[4][1]
+    assert done[5][1].startswith("failed ") and "BusyError: downloads are running" in done[5][1]
+    assert "(dry run)" in done[6][0] and "dry run: would build generation" in done[6][1]
+
+    text = "\n".join(log_lines(paths))
+    assert "fetching v0.2.0 from" in text and "- picker" in text  # the pipeline's own lines
+    assert "switched current to 0002-v0.2.0" in text and "pruning old generation" in text
+
+
+def test_check_says_when_the_repository_is_ahead_of_its_newest_release(
+    paths, repo, installed, tmp_path
+):
+    check = UpdatePipeline(paths, Config(), repo_url=repo, python=sys.executable).check()
+    assert check.unreleased and len(check.head) == 40 and check.head != check.latest_commit
+    assert any(
+        "changes newer than v0.2.0" in line and check.head[:12] in line for line in check.lines()
+    )
+
+    root = tmp_path / "released"
+    root.mkdir()
+    bare = make_repo(root, tags=("v0.1.0", "v0.2.0"))  # main stops at the newest tag
+    check = UpdatePipeline(
+        paths, Config(), repo_url=f"file://{bare}", python=sys.executable
+    ).check()
+    assert not check.unreleased and check.head == check.latest_commit
+    assert check.lines() == ["installed v0.1.0, newest release v0.2.0", "update available: v0.2.0"]
+
+    broken = UpdatePipeline(
+        paths, Config(), repo_url="file:///nowhere/at/all", python=sys.executable
+    )
+    failed = broken.check()
+    assert failed.error and failed.lines()[0].startswith("check failed: ")
+    assert transactions(paths)[-1][1].startswith("failed ")
+
+
+def checkout_install(paths, repo, commit: str) -> None:
+    """A generation installed with ./install.sh --from DIR: its tag carries the commit."""
+    layout = Layout(paths)
+    gen_id = "0001-v0.2.0+abc123def456"
+    shutil.rmtree(layout.gen_dir(gen_id), ignore_errors=True)
+    fake_generation(layout.gen_dir(gen_id) / "venv", "0.2.0")
+    manifest = Manifest(repo_url=repo)
+    manifest.activate(
+        Generation(gen_id, "v0.2.0+abc123def456", commit, "0.2.0", "2026.01.01", sys.executable)
+    )
+    layout.point_current(gen_id)
+    manifest.save(paths.manifest_file)
+
+
+def test_engine_refresh_keeps_a_checkout_build_at_its_own_commit(paths, repo, monkeypatch):
+    bare = Path(repo.removeprefix("file://"))
+    tip = git(["rev-parse", "main"], cwd=bare).strip()  # one commit after the v0.2.0 release
+    assert tip != git(["rev-parse", "v0.2.0^{commit}"], cwd=bare).strip()
+    checkout_install(paths, repo, tip)
+    pipeline = make_pipeline(paths, repo, monkeypatch)
+    built: list[str] = []
+    fake_build = UpdatePipeline._build
+
+    def recording_build(self, gen_id, gen_dir, build_dir):
+        built.append((build_dir / "pyproject.toml").read_text())
+        return fake_build(self, gen_id, gen_dir, build_dir)
+
+    monkeypatch.setattr(UpdatePipeline, "_build", recording_build)
+    result = pipeline.run(engine_only=True)
+    assert result.generation.id == "0002-v0.2.0+abc123def456"
+    assert result.generation.tag == "v0.2.0+abc123def456" and result.generation.commit == tip
+    assert 'version = "0.3.0"' in built[0]  # the checkout's own code, not the v0.2.0 release
+    assert "the app is unchanged at v0.2.0+abc123def456" in result.message
+
+
+def test_engine_refresh_refuses_rather_than_replace_a_checkout_build(paths, repo, monkeypatch):
+    for commit in ("c" * 40, "unknown"):
+        checkout_install(paths, repo, commit)
+        pipeline = make_pipeline(paths, repo, monkeypatch)
+        with pytest.raises(UpdateError, match="installed from a checkout"):
+            pipeline.run(engine_only=True)
+        layout = Layout(paths)
+        assert layout.current_target() == layout.venv_dir("0001-v0.2.0+abc123def456").resolve()
+        assert Manifest.load(paths.manifest_file).current == "0001-v0.2.0+abc123def456"
+        assert not list(layout.build_root.glob("src-*"))
+    assert transactions(paths)[-1][1].startswith("failed ")
+
+
+def test_a_broken_report_callback_never_stops_an_update(paths, repo, installed, monkeypatch):
+    pipeline = make_pipeline(paths, repo, monkeypatch)
+
+    def closed_screen(line: str) -> None:
+        raise RuntimeError("the update screen was closed")
+
+    pipeline.report = closed_screen
+    assert pipeline.run(target=Version.parse("0.2.0")).generation.id == "0002-v0.2.0"
+    assert "fetching v0.2.0 from" in "\n".join(log_lines(paths))
+
+
+def test_install_first_start_and_stale_window_are_recorded(paths, repo):
+    layout = Layout(paths)
+    for n, tag in ((1, "v0.1.0"), (2, "v0.2.0")):
+        gen_dir = layout.gen_dir(f"{n:04d}-{tag}")
+        fake_generation(gen_dir / "venv", tag[1:])
+        finalize_install(
+            paths, gen_dir=gen_dir, tag=tag, commit="d" * 40, python=sys.executable, repo_url=repo
+        )
+    done = transactions(paths)
+    assert [begin.split()[:3] for begin, _ in done] == [
+        ["install", "v0.1.0", "trigger=install.sh"],
+        ["install", "v0.2.0", "trigger=install.sh"],
+    ]
+    assert "generation 0002-v0.2.0 is now current" in done[1][1] and "gen=0002-v0.2.0" in done[1][1]
+
+    old, new = layout.venv_dir("0001-v0.1.0"), layout.venv_dir("0002-v0.2.0")
+    assert stale_generation(paths, prefix=old).id == "0002-v0.2.0"  # a window left open on 0001
+    assert stale_generation(paths, prefix=new) is None
+    assert stale_generation(paths, prefix=paths.home) is None  # a checkout, not a generation
+
+    note_first_run(paths, prefix=new)
+    note_first_run(paths, prefix=new)  # recorded once
+    note_first_run(paths, prefix=paths.home)  # not a generation: nothing to record
+    notes = [line for line in log_lines(paths) if " NOTE " in line]
+    assert len(notes) == 1 and "first start of generation 0002-v0.2.0" in notes[0]
+    note_first_run(paths, prefix=old)  # rolled back: that is a first start again
+    assert len([line for line in log_lines(paths) if " NOTE " in line]) == 2
+
+
+def test_a_failed_spotdl_install_is_recorded(paths):
+    from vidpull.spotdl import InstallError
+
+    with pytest.raises(InstallError):
+        install_spotdl(paths, "/nonexistent/python", trigger="tui")
+    begin, end = transactions(paths)[-1]
+    assert begin.startswith("spotdl-install trigger=tui") and end.startswith("failed ")
+    assert "InstallError" in end
