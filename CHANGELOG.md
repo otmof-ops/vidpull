@@ -6,6 +6,8 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-09-29
+
 ### Fixed
 
 - **Downloading the audio of a link deleted the video of that link.** yt-dlp was given the
