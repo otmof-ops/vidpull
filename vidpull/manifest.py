@@ -47,6 +47,7 @@ class Manifest:
     generations: list[Generation] = field(default_factory=list)
     launcher: str = ""
     created_download_dir: str = ""
+    held: str = ""  # the release a rollback left: not offered again until a newer one exists
 
     # ------------------------------------------------------------------ io
     @classmethod

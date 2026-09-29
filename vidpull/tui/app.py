@@ -42,6 +42,7 @@ from vidpull.models import (
 )
 from vidpull.paths import Paths
 from vidpull.procs import redact_url, which
+from vidpull.semver import Version
 from vidpull.spotdl import (
     InstallError,
     ResolveError,
@@ -51,7 +52,6 @@ from vidpull.spotdl import (
     spotify_kind,
 )
 from vidpull.spotdl import disclosure as spotdl_disclosure
-from vidpull.spotdl import install as spotdl_install
 from vidpull.store import Store
 from vidpull.tui.screens.confirm import ConfirmScreen, TextScreen
 from vidpull.tui.screens.group import GroupScreen
@@ -62,7 +62,15 @@ from vidpull.tui.screens.uninstall import UninstallScreen
 from vidpull.tui.screens.update import UpdateScreen
 from vidpull.tui.widgets import UrlInput
 from vidpull.uninstall import UninstallPlan
-from vidpull.update import BusyError, NotInstalledError, UpdateError, UpdatePipeline
+from vidpull.update import (
+    BusyError,
+    NotInstalledError,
+    UpdateError,
+    UpdatePipeline,
+    install_spotdl,
+    stale_generation,
+)
+from vidpull.updatelog import UpdateLog
 from vidpull.urls import extract_urls
 
 log = logging.getLogger(__name__)
@@ -201,6 +209,7 @@ class VidpullApp(App[PostExit | None]):
         self._seen_group_status: dict[str, GroupStatus] = {}
         self._auto_updating = False
         self._deferred_update: str | None = None  # a release waiting for the downloads to end
+        self._stale_gen: str | None = None  # a newer generation is installed; this window is old
         self._url_queue: list[str] = [u.strip() for u in (initial_urls or []) if u.strip()]
         self._batch_selection: Selection | None = None
         self._table: DataTable | None = None
@@ -258,6 +267,7 @@ class VidpullApp(App[PostExit | None]):
             self._start_watcher()
         if self.config.update_check:
             self.check_updates()
+            self.set_interval(max(1, self.config.update_check_hours) * 3600, self.check_updates)
         self.url_box.focus()
         self._probe_next()
 
@@ -315,10 +325,6 @@ class VidpullApp(App[PostExit | None]):
         self._seen_status[job.id] = job.status
         if job.status == JobStatus.DONE and previous not in {None, JobStatus.DONE}:
             self._desktop_notify("Download finished", job.display_title)
-        if job.is_terminal and self._deferred_update and self.manager.is_idle:
-            tag, self._deferred_update = self._deferred_update, None
-            self._auto_updating = True
-            self.auto_update(tag)
         elif job.status == JobStatus.FAILED and previous not in {None, JobStatus.FAILED}:
             self.notify(
                 f"{_short(job.display_title, 50)}: {job.error}",
@@ -326,6 +332,10 @@ class VidpullApp(App[PostExit | None]):
                 severity="error",
                 timeout=8,
             )
+        if job.is_terminal and self._deferred_update and self.manager.is_idle:
+            tag, self._deferred_update = self._deferred_update, None
+            self._auto_updating = True
+            self.auto_update(tag)
 
     @on(ClipboardUrl)
     def _clipboard_url(self, message: ClipboardUrl) -> None:
@@ -342,6 +352,8 @@ class VidpullApp(App[PostExit | None]):
 
     @on(UpdateAvailable)
     def _update_available(self, message: UpdateAvailable) -> None:
+        if message.tag == self._update_tag:
+            return  # said already; the status bar keeps showing it
         self._update_tag = message.tag
         if self.config.auto_update and not self._auto_updating:
             self._auto_updating = True
@@ -357,8 +369,11 @@ class VidpullApp(App[PostExit | None]):
     def auto_update(self, tag: str) -> None:
         """Build the new release next to this one, then ask before restarting into it."""
         try:
-            result = self.pipeline.run(busy=lambda: self.manager.active_count > 0)
-        except BusyError:
+            result = self.pipeline.run(busy=lambda: self.manager.active_count > 0, trigger="auto")
+        except BusyError as exc:
+            if "another vidpull update" in str(exc):
+                self.call_from_thread(self.notify, str(exc), timeout=8)
+                return
             self._deferred_update = tag
             self.call_from_thread(
                 self.notify, f"vidpull {tag} installs once the downloads finish", timeout=8
@@ -372,8 +387,19 @@ class VidpullApp(App[PostExit | None]):
                 self.notify, str(exc), title="Update failed", severity="error", timeout=10
             )
             return
+        except Exception as exc:  # a full disk, a lost directory: the app keeps running
+            log.exception("auto-update failed")
+            self.call_from_thread(
+                self.notify,
+                f"{type(exc).__name__}: {exc}",
+                title="Update failed",
+                severity="error",
+                timeout=10,
+            )
+            return
         finally:
             self._auto_updating = False
+        self.store.set_meta("update_candidate", "")  # installed: nothing left to offer
         if result.restart_required:
             self.call_from_thread(self._offer_restart, tag)
         else:
@@ -410,10 +436,12 @@ class VidpullApp(App[PostExit | None]):
             now = time.time()
             if last and now - float(last) < self.config.update_check_hours * 3600:
                 cached = self.store.get_meta("update_candidate") or ""
-                if cached:
+                if cached and self._newer_than_installed(cached):
                     self.post_message(UpdateAvailable(cached))
                 return
-            result = self.pipeline.check()
+            result = self.pipeline.check(trigger="startup")
+            if result.error:
+                return  # offline: ask again next time instead of remembering a failure
             self.store.set_meta("update_check_at", str(now))
             self.store.set_meta(
                 "update_candidate", result.candidate.tag if result.candidate else ""
@@ -422,6 +450,11 @@ class VidpullApp(App[PostExit | None]):
                 self.post_message(UpdateAvailable(result.candidate.tag))
         except Exception:
             log.exception("update check failed")
+
+    def _newer_than_installed(self, tag: str) -> bool:
+        candidate = Version.try_parse(tag)
+        installed = getattr(self.pipeline, "installed_version", lambda: None)()
+        return candidate is not None and (installed is None or candidate > installed)
 
     @work(thread=True, group="probe")
     def probe(
@@ -544,8 +577,11 @@ class VidpullApp(App[PostExit | None]):
         )
         python = getattr(self.engine, "python", None) or sys.executable
         try:
-            spotdl_install(
-                self.paths, python, report=lambda line: log.info("spotdl install: %s", line)
+            install_spotdl(
+                self.paths,
+                python,
+                trigger="tui",
+                report=lambda line: log.info("spotdl install: %s", line),
             )
         except InstallError as exc:
             self.call_from_thread(
@@ -820,6 +856,10 @@ class VidpullApp(App[PostExit | None]):
 
     def action_update(self) -> None:
         def finished(result: str | None) -> None:
+            cached = self.store.get_meta("update_candidate") or ""
+            if cached and not self._newer_than_installed(cached):
+                self.store.set_meta("update_candidate", "")
+                self._update_tag = None
             if result == "restart":
                 self.exit(PostExit("restart"))
 
@@ -1009,6 +1049,9 @@ class VidpullApp(App[PostExit | None]):
         if counts.get("failed"):
             parts.append(f"{counts['failed']} failed")
         parts.append("clipboard " + ("on" if self._watcher else "off"))
+        self._check_stale()
+        if self._stale_gen:
+            parts.append(f"RESTART to run {self._stale_gen} (u)")
         parts.append(
             f"update {self._update_tag} available (u)"
             if self._update_tag
@@ -1018,6 +1061,27 @@ class VidpullApp(App[PostExit | None]):
         )
         if self._status is not None:
             self._status.update(" · ".join(p for p in parts if p))
+
+    def _check_stale(self) -> None:
+        """Notice, once, that a newer generation was installed while this window was open."""
+        newer = stale_generation(self.paths)
+        gen_id = newer.id if newer else None
+        if gen_id == self._stale_gen:
+            return
+        self._stale_gen = gen_id
+        if newer is None:
+            return
+        UpdateLog(self.paths.update_log).note(
+            f"a window still runs vidpull {__version__}; generation {newer.id} is installed",
+            pid=os.getpid(),
+        )
+        self.notify(
+            f"vidpull {newer.tag} is installed, but this window still runs {__version__}. "
+            "Press u, then Restart (downloads resume), or quit and open vidpull again.",
+            title="Restart to use the update",
+            severity="warning",
+            timeout=30,
+        )
 
     def _start_watcher(self) -> bool:
         if available_reader() is None and self._clipboard_reader is read_clipboard:
@@ -1119,6 +1183,12 @@ def run_tui(config: Config, paths: Paths, urls: list[str] | None = None) -> int:
     if isinstance(result, PostExit):
         if result.action == "restart":
             argv = app.pipeline.restart_argv()
+            manifest = app.pipeline.manifest
+            UpdateLog(paths.update_log).note(
+                "restart requested from the app",
+                into=manifest.current if manifest else "",
+                pid=os.getpid(),
+            )
             print(f"restarting: {' '.join(argv)}")
             os.execv(argv[0], argv)
         if result.action == "uninstall" and result.plan is not None:

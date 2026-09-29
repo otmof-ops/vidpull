@@ -118,6 +118,31 @@ says so in the status bar. With `vidpull config set auto_update true` it install
 the background instead and asks before restarting into it; downloads in progress are never
 interrupted, the update waits for them.
 
+What the update screen (`u`) does, button by button:
+
+| Button | What changes |
+| --- | --- |
+| **Check** | nothing; it asks the repository for its releases and says where you stand |
+| **Update app** | installs the newest *release*. A fix that is merged but not released yet does not arrive this way; Check says so when the repository is ahead of its newest release |
+| **Update engine** | refreshes yt-dlp and the spotDL environment. The app itself stays exactly as it is: the generation number goes up, the version does not |
+| **Rollback** | switches back to the previous generation, offline |
+| **Restart** | relaunches vidpull in the generation that was just installed |
+| **History** | shows the update log |
+
+A window that was open while an update was installed keeps running the old version until it
+is restarted; its status bar says `RESTART to run …` until you do.
+
+**Every update is recorded** in `~/.local/state/vidpull/updates.log`: each check, app update,
+engine refresh, rollback, install and spotDL install, with who asked (the app, the command line,
+the startup check, auto-update, install.sh), every step the updater took, how it ended, and the
+versions before and after (vidpull, generation, commit, yt-dlp, spotDL, ytmusicapi). `vidpull update --log` prints the last 40 lines, `vidpull update --log 200` more.
+
+```
+2026-09-29T14:40:02+00:00 u0007 BEGIN engine-only trigger=tui vidpull=1.2.2 gen=0016-v1.2.2 commit=… yt-dlp=2026.08.19 spotdl=4.5.2
+2026-09-29T14:40:02+00:00 u0007 .     refreshing the engines; the app stays at v1.2.2 (…)
+2026-09-29T14:40:31+00:00 u0007 END   ok 29.1s engines refreshed (yt-dlp 2026.08.19 is already the newest); the app is unchanged … | gen=0017-v1.2.2 …
+```
+
 Sites change their pages and yt-dlp changes with them, so vidpull can refresh just the
 engine with `vidpull update --engine-only`. An update builds the new version next to the
 one you are running, checks that it works, and only then switches over; if anything goes

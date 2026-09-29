@@ -6,6 +6,58 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The update log, `~/.local/state/vidpull/updates.log`: every check, app update, engine
+  refresh, rollback, install and spotDL install is recorded as one transaction, with who asked
+  for it, every step the updater took, how it ended and how long it took, and the versions
+  before and after (vidpull, generation, commit, yt-dlp, spotDL, ytmusicapi). The first start
+  of each generation and every restart from the app are noted too. `vidpull update --log [N]`
+  prints it, the update screen has a History button, `vidpull doctor` reports it.
+- Check says when the repository has changes newer than its newest release, which no update
+  can install yet, instead of a bare "up to date".
+- A window left open while an update was installed says so: `RESTART to run …` in the status
+  bar and a notice, until it is restarted. The app also checks for releases while it stays
+  open, every `update_check_hours`, not only when it starts.
+
+### Changed
+
+- "Update engine" says what it did in plain words: which engines changed, and that the app is
+  unchanged. It used to end with "installed vX.Y.Z as generation N", which read as an app
+  update.
+- spotDL is pinned to the exact version vidpull was tested with (4.5.2) and moves with vidpull
+  releases; an engine refresh no longer pulls whatever spotDL is newest.
+
+### Fixed
+
+- "Update engine" on a copy installed from a checkout (`./install.sh --from .`) replaced the
+  app with the last release, silently. It now rebuilds the checkout's own commit, and refuses,
+  saying why, when the repository does not have that commit.
+- A background update could report into an update screen that had been closed and fail on it;
+  the screen now hands the updater back, and a broken report never stops an update.
+- A window that had been open since before another update worked from an old copy of the
+  install record: "Update engine" in it rebuilt the release it remembered, a downgrade, and
+  "Update app" could rebuild over the live generation. The updater now reads the record again
+  under its lock, never reuses a generation number the disk has seen, and never builds into a
+  directory that exists.
+- A failure right after the switch (a full disk while saving the record or the launcher) left
+  `current` pointing at a deleted generation. The switch is now all or nothing.
+- A rollback was undone by the next check: the release you had just left was offered again,
+  and installed without asking under `auto_update`. It is now held back until a newer release
+  exists or you ask for it by name with `vidpull update --to`.
+- An update no longer deletes a generation that another vidpull window or a long `vidpull get`
+  is still running from; it is removed by a later update, once nothing uses it.
+- A failed update check (no network) was remembered as "no update" for the next hour, and a
+  release could be announced again after it had been installed.
+- An unexpected error in a background update or a rollback (a full disk, a lost directory)
+  closed the app. It is now reported and the app keeps running.
+- A `~/.local/bin/vidpull` that vidpull did not write is no longer overwritten by an update; a
+  copy installed from a fork updates from that fork; an install no longer runs beside an update;
+  a checkout with uncommitted changes is installed as `+commit.dirty`, not as the release it
+  sits on, and "Update engine" refuses to rebuild it.
+- The spotDL environment is left alone when it already matches the release, instead of being
+  rewritten in place by every update.
+
 ## [1.2.1] - 2026-09-28
 
 ### Fixed

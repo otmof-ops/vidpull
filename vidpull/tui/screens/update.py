@@ -37,13 +37,17 @@ class UpdateScreen(ModalScreen[str | None]):
                 yield Button("Update engine", id="engine", disabled=not self.pipeline.installed)
                 yield Button("Rollback", id="rollback", disabled=not self._can_rollback())
                 yield Button("Restart", id="restart", variant="success", disabled=True)
+                yield Button("History", id="history")
                 yield Button("Close", id="close")
             yield RichLog(id="log", wrap=True, markup=False, highlight=False)
             yield Static(
-                "esc closes · a restart relaunches vidpull in the new generation", classes="hint"
+                "esc closes · a restart relaunches vidpull in the new generation · "
+                f"every update is recorded in {self.pipeline.paths.update_log}",
+                classes="hint",
             )
 
     def on_mount(self) -> None:
+        self._previous_report = self.pipeline.report
         self.pipeline.report = self._report_from_thread
         if not self.pipeline.installed:
             self._append(
@@ -52,6 +56,10 @@ class UpdateScreen(ModalScreen[str | None]):
                 "Checking for releases still works."
             )
         self.check()
+
+    def on_unmount(self) -> None:
+        # hand the pipeline back: a later background update must not report into a closed screen
+        self.pipeline.report = self._previous_report
 
     def _summary(self) -> Text:
         text = Text()
@@ -90,16 +98,9 @@ class UpdateScreen(ModalScreen[str | None]):
     def check(self) -> None:
         self.app.call_from_thread(self._set_busy, True)
         self._report_from_thread("checking releases…")
-        result = self.pipeline.check()
-        if result.error:
-            self._report_from_thread(f"check failed: {result.error}")
-        else:
-            current = result.current.tag if result.current else "unknown"
-            latest = result.latest.tag if result.latest else "none"
-            self._report_from_thread(f"installed {current}, newest tag {latest}")
-            self._report_from_thread(
-                f"update available: {result.candidate.tag}" if result.candidate else "up to date"
-            )
+        result = self.pipeline.check(trigger="tui")
+        for line in result.lines():
+            self._report_from_thread(line)
         self._candidate = result.candidate
         self.app.call_from_thread(self._set_busy, False)
 
@@ -110,7 +111,7 @@ class UpdateScreen(ModalScreen[str | None]):
             return
         self.app.call_from_thread(self._set_busy, True)
         try:
-            result = self.pipeline.run(engine_only=engine_only, busy=self.busy)
+            result = self.pipeline.run(engine_only=engine_only, busy=self.busy, trigger="tui")
             self._report_from_thread(result.message)
             if result.restart_required:
                 self.app.call_from_thread(self._enable_restart)
@@ -128,11 +129,13 @@ class UpdateScreen(ModalScreen[str | None]):
             return
         self.app.call_from_thread(self._set_busy, True)
         try:
-            result = self.pipeline.rollback()
+            result = self.pipeline.rollback(trigger="tui")
             self._report_from_thread(result.message)
             self.app.call_from_thread(self._enable_restart)
         except UpdateError as exc:
             self._report_from_thread(f"rollback failed: {exc}")
+        except Exception as exc:  # never let a worker error kill the app
+            self._report_from_thread(f"unexpected error: {type(exc).__name__}: {exc}")
         finally:
             self.app.call_from_thread(self._set_busy, False)
 
@@ -157,6 +160,14 @@ class UpdateScreen(ModalScreen[str | None]):
     @on(Button.Pressed, "#rollback")
     def _rollback(self) -> None:
         self.run_rollback()
+
+    @on(Button.Pressed, "#history")
+    def _history(self) -> None:
+        lines = self.pipeline.log.tail(40) if self.pipeline.paths.update_log.exists() else []
+        self._append("--- update log ---")
+        for line in lines or ["no update has been recorded yet"]:
+            self._append(line)
+        self._append("--- end of log ---")
 
     @on(Button.Pressed, "#restart")
     def _restart(self) -> None:

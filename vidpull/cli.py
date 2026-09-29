@@ -40,9 +40,17 @@ from vidpull.spotdl import (
     spotify_kind,
 )
 from vidpull.spotdl import disclosure as spotdl_disclosure
-from vidpull.spotdl import install as spotdl_install
 from vidpull.store import Store
-from vidpull.update import NotInstalledError, UpdateError, UpdatePipeline, finalize_install
+from vidpull.update import (
+    NotInstalledError,
+    UpdateError,
+    UpdatePipeline,
+    finalize_install,
+    hold_generation,
+    install_spotdl,
+    note_first_run,
+)
+from vidpull.updatelog import UpdateLog
 from vidpull.urls import looks_like_url, normalize_url
 from vidpull.versioning import git_describe, source_checkout
 
@@ -152,6 +160,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--rollback", action="store_true", help="switch back to the previous generation"
     )
     update.add_argument("--dry-run", action="store_true", help="show what would happen")
+    update.add_argument(
+        "--log",
+        nargs="?",
+        const=40,
+        type=int,
+        metavar="N",
+        help="print the last N lines of the update log (40 without a number) and exit",
+    )
     update.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     update.set_defaults(func=cmd_update)
 
@@ -229,6 +245,9 @@ def main(argv: list[str] | None = None) -> int:
     config = Config.load(paths.config_file)
     ctx = Context(paths=paths, config=config)
     func = getattr(args, "func", cmd_tui)
+    hold_generation(paths)  # an update elsewhere must not prune the copy this process runs
+    if args.command in {None, "tui", "get"}:
+        note_first_run(paths)
     if args.command in {None, "tui", "get"} and not args.no_preflight:
         _preflight(ctx, assume_yes=args.assume_yes)
     try:
@@ -456,7 +475,7 @@ def _offer_spotdl(ctx: Context, python: str, *, assume_yes: bool) -> bool:
         print("Skipped. Spotify links need it; run this again any time.")
         return False
     try:
-        spotdl_install(ctx.paths, python)
+        install_spotdl(ctx.paths, python, trigger="cli", report=print)
     except InstallError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return False
@@ -529,7 +548,13 @@ def _print_menu(console, table_cls, info, menu) -> None:
 
 
 def cmd_update(args: argparse.Namespace, ctx: Context) -> int:
-    pipeline = UpdatePipeline(ctx.paths, ctx.config, report=print)
+    if args.log is not None:
+        update_log = UpdateLog(ctx.paths.update_log)
+        lines = update_log.tail(args.log) if ctx.paths.update_log.exists() else []
+        print("\n".join(lines) if lines else "no update has been recorded yet")
+        print(f"\n{ctx.paths.update_log}", file=sys.stderr)
+        return EXIT_OK
+    pipeline = UpdatePipeline(ctx.paths, ctx.config, report=print, trigger="cli")
     if args.rollback:
         try:
             result = pipeline.rollback()
@@ -543,13 +568,7 @@ def cmd_update(args: argparse.Namespace, ctx: Context) -> int:
         if check.error:
             print(f"error: {check.error}", file=sys.stderr)
             return EXIT_FAILURE
-        current = check.current.tag if check.current else "unknown"
-        latest = check.latest.tag if check.latest else "none"
-        print(f"installed: {current}\nnewest tag: {latest}")
-        if check.candidate:
-            print(f"update available: {check.candidate.tag}")
-        else:
-            print("up to date")
+        print("\n".join(check.lines()))
         if not pipeline.installed and not args.check:
             from vidpull.update import install_hint
 

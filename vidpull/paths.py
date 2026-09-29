@@ -58,6 +58,11 @@ class Paths:
         return self.state_dir / f"{APP_NAME}.log"
 
     @property
+    def update_log(self) -> Path:
+        """Every update transaction, one line per event (see ``vidpull.updatelog``)."""
+        return self.state_dir / "updates.log"
+
+    @property
     def manifest_file(self) -> Path:
         return self.data_dir / "manifest.json"
 
