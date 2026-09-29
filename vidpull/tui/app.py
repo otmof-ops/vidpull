@@ -58,6 +58,8 @@ from vidpull.spotdl import (
     ResolveError,
     SongEngine,
     SpotdlEngine,
+    brief_note,
+    is_retry_note,
     is_spotify_link,
     spotify_kind,
 )
@@ -563,8 +565,19 @@ class VidpullApp(App[PostExit | None]):
         if not self.song_engine.available():
             self.call_from_thread(self._offer_spotdl, url)
             return
+
+        def waiting(message: str) -> None:
+            log.warning("%s: %s", redact_url(url), message)
+            self.call_from_thread(
+                self.notify,
+                brief_note(message),
+                title="Spotify link",
+                severity="warning",
+                timeout=10,
+            )
+
         try:
-            songs = self.song_engine.resolve(url)
+            songs = self.song_engine.resolve(url, report=waiting)
         except ResolveError as exc:
             self.call_from_thread(
                 self.notify, str(exc), title="Spotify link failed", severity="error", timeout=8
@@ -865,11 +878,16 @@ class VidpullApp(App[PostExit | None]):
             if selected.id is None:
                 return
             count = self.manager.retry_group(selected.id)
+            reopened = None if count else self.manager.reopen_group(selected.id)
             if count:
                 self.notify(f"retrying {count} song(s) of {_short(selected.display_title, 40)}")
+            elif reopened is not None:
+                # its track list never arrived: ask for it again
+                self.notify(f"fetching the {selected.kind}'s track list again; c cancels")
+                self.resolve_group(selected.id)
             else:
                 self.notify("nothing in this run to retry", severity="warning")
-            if from_history and count:
+            if from_history and (count or reopened is not None):
                 self._focus_list()  # it is back on the list
             return
         job = selected
@@ -1133,13 +1151,16 @@ class VidpullApp(App[PostExit | None]):
         progress = self.manager.group_progress(group)
         if group.status == GroupStatus.RESOLVING:
             title = f"{group.kind}: fetching the track list… ({_elapsed(group.created_at)})"
-            status = "resolving"
+            # while it waits to ask again, the run's error holds the reason
+            status = brief_note(group.error) if group.error else "resolving"
             bar = ""
         else:
             title = f"{group.display_title} · {group.entry_count} songs"
             if group.status == GroupStatus.ACTIVE:
                 if progress.resting:
                     stage = f"resting {self.config.stage_pause}s"
+                elif progress.active is not None and is_retry_note(progress.active.phase):
+                    stage = "retrying"  # a service did not answer; the song's row says which
                 else:
                     stage = progress.active.status.value if progress.active else "queued"
                 status = f"{stage} {progress.done}/{progress.total}"

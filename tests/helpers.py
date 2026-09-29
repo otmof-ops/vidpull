@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from vidpull.engine import DownloadResult, ProbeError, Progress
@@ -42,6 +43,10 @@ class FakeSongEngine:
         available: bool = True,
         resolve_error: str | None = None,
         resolve_block: threading.Event | None = None,
+        resolve_notes: tuple[str, ...] = (),
+        match_error: str | None = None,
+        match_errors: int | None = None,
+        match_notes: tuple[str, ...] = (),
     ):
         self.songs = songs if songs is not None else [sample_song()]
         self.match_url = match_url
@@ -49,6 +54,10 @@ class FakeSongEngine:
         self._available = available
         self.resolve_error = resolve_error
         self.resolve_block = resolve_block  # when set, resolve waits for it (or for cancel)
+        self.resolve_notes = resolve_notes  # reported, in order, before resolve answers
+        self.match_error = match_error  # a lookup that fails, as MatchError
+        self.match_errors = match_errors  # how many lookups fail that way; None is all
+        self.match_notes = match_notes  # reported, in order, before match answers
         self.resolved: list[str] = []
         self.matched: list[str] = []
 
@@ -58,10 +67,18 @@ class FakeSongEngine:
     def version(self) -> str:
         return "fake-4.5.2"
 
-    def resolve(self, url: str, cancel: threading.Event | None = None) -> list[Song]:
+    def resolve(
+        self,
+        url: str,
+        cancel: threading.Event | None = None,
+        report: Callable[[str], None] | None = None,
+    ) -> list[Song]:
         from vidpull.spotdl import ResolveCancelled, ResolveError
 
         self.resolved.append(url)
+        for note in self.resolve_notes:
+            if report is not None:
+                report(note)
         if self.resolve_block is not None:
             while not self.resolve_block.is_set():
                 if cancel is not None and cancel.is_set():
@@ -71,8 +88,22 @@ class FakeSongEngine:
             raise ResolveError(self.resolve_error)
         return [Song.from_json(s.to_json()) for s in self.songs]
 
-    def match(self, song: Song, cancel: threading.Event | None = None) -> Match | None:
+    def match(
+        self,
+        song: Song,
+        cancel: threading.Event | None = None,
+        report: Callable[[str], None] | None = None,
+    ) -> Match | None:
+        from vidpull.spotdl import MatchError
+
         self.matched.append(song.display_title)
+        for note in self.match_notes:
+            if report is not None:
+                report(note)
+        if self.match_error and (self.match_errors is None or self.match_errors > 0):
+            if self.match_errors is not None:
+                self.match_errors -= 1
+            raise MatchError(self.match_error)
         if self.match_url is None:
             return None
         return Match(self.match_url, self.match_song)

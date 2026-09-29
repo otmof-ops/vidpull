@@ -466,6 +466,75 @@ def test_cancel_key_stops_a_run_while_it_fetches_the_list(config, paths, store, 
     run(flow())
 
 
+def test_a_run_waiting_for_spotify_shows_it_on_its_row(config, paths, store, video_info):
+    from tests.helpers import sample_song
+
+    note = (
+        "Spotify did not answer, trying again in 15 s (attempt 3 of 5): Could not get "
+        "playlist info: Status Code: 504, Response: upstream request timeout"
+    )
+    block = threading.Event()
+    engine = FakeEngine(info=video_info)
+    songs = [sample_song(title="Airbag", track_number=1)]
+    song_engine = FakeSongEngine(songs=songs, resolve_notes=(note,), resolve_block=block)
+    app = make_app(config, paths, store, engine, song_engine=song_engine)
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = ALBUM
+            await pilot.press("enter")
+            table = app.query_one("#jobs", DataTable)
+            assert await until(pilot, lambda: table.row_count == 1)
+            assert await until(
+                pilot,
+                lambda: str(table.get_row("g1")[3]) == "Spotify did not answer, try 3/5",
+            )
+            assert "fetching the track list" in str(table.get_row("g1")[1])
+            await pilot.press("escape")
+            await pilot.press("enter")  # the run's own screen has the whole reason
+            assert await until(pilot, lambda: isinstance(app.screen, GroupScreen))
+            title = app.screen.query_one("#group-title")
+            assert await until(pilot, lambda: "upstream request timeout" in str(title.render()))
+            await pilot.press("escape")
+            block.set()  # Spotify answers
+            assert await until(pilot, lambda: store.get_group(1).status == GroupStatus.DONE)
+            assert await until(pilot, lambda: "done 1/1" in str(table.get_row("g1")[3]))
+            assert store.get_group(1).error == ""
+
+    try:
+        run(flow())
+    finally:
+        block.set()
+
+
+def test_r_on_a_run_that_failed_to_list_fetches_the_list_again(config, paths, store, video_info):
+    from tests.helpers import sample_song
+
+    engine = FakeEngine(info=video_info)
+    songs = [sample_song(title="Airbag", track_number=1)]
+    song_engine = FakeSongEngine(songs=songs, resolve_error="Spotify did not answer in 5 attempts")
+    app = make_app(config, paths, store, engine, song_engine=song_engine)
+
+    async def flow():
+        async with app.run_test(size=(120, 40)) as pilot:
+            box = app.query_one("#url", Input)
+            box.value = ALBUM
+            await pilot.press("enter")
+            table = app.query_one("#jobs", DataTable)
+            assert await until(pilot, lambda: store.get_group(1) is not None)
+            assert await until(pilot, lambda: store.get_group(1).status == GroupStatus.FAILED)
+            assert await until(pilot, lambda: "failed: Spotify" in str(table.get_row("g1")[3]))
+            song_engine.resolve_error = None  # Spotify is back
+            await pilot.press("escape")
+            await pilot.press("r")
+            assert await until(pilot, lambda: store.get_group(1).status == GroupStatus.DONE)
+            assert await until(pilot, lambda: "done 1/1" in str(table.get_row("g1")[3]))
+            assert len(store.list_groups()) == 1 and song_engine.resolved == [ALBUM, ALBUM]
+
+    run(flow())
+
+
 class FakePipeline:
     """Stands in for UpdatePipeline: one candidate release, an update that succeeds or is busy."""
 

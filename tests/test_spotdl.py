@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -13,14 +14,22 @@ from vidpull.spotdl import (
     NOT_VISIBLE,
     TRACKLIST_SCRIPT,
     InstallError,
+    MatchError,
     ResolveCancelled,
     ResolveError,
     SpotdlEngine,
+    _split_json,
+    brief_note,
     disclosure,
+    failure_text,
     install,
+    is_final,
+    is_no_match,
+    is_retry_note,
     is_spotify_link,
     is_youtube_url,
     normalize_spotify_link,
+    search_failure,
     song_from_spotdl,
     spotify_kind,
     spotify_visible,
@@ -43,8 +52,16 @@ def fake_song_engine(tmp_path, config, paths):
     shutil.copytree(FIXTURES, script_dir / "fixtures")
     script = script_dir / "fake_spotdl.py"
     script.chmod(0o755)
-    engine = SpotdlEngine(config, paths, python=str(script), visibility=lambda link: True)
+    engine = SpotdlEngine(
+        config,
+        paths,
+        python=str(script),
+        visibility=lambda link: True,
+        resolve_delays=(0, 0),  # three attempts, no waiting between them
+        match_delays=(0, 0),
+    )
     engine.mode_file = script_dir / "mode"  # type: ignore[attr-defined]
+    engine.runs_file = script_dir / "runs"  # type: ignore[attr-defined]
     engine.args_file = script_dir / "last-args.json"  # type: ignore[attr-defined]
     engine.script_file = script_dir / "last-script"  # type: ignore[attr-defined]
     return engine
@@ -113,7 +130,105 @@ def test_resolve_errors(fake_song_engine):
     # a playlist Spotify shows but spotDL still fails on keeps spotDL's own error, no guessing
     with pytest.raises(ResolveError) as excinfo:
         fake_song_engine.resolve("https://open.spotify.com/playlist/37i9dQZF1F5p3rmiWPIYgZ")
-    assert str(excinfo.value) == "Couldn't get metadata for the query"
+    assert str(excinfo.value).endswith(": Couldn't get metadata for the query")
+    assert "in 3 attempts" in str(excinfo.value)
+
+
+def test_resolve_asks_again_when_spotify_does_not_answer(fake_song_engine):
+    """One request without an answer used to end the run; the list arrives on a later try."""
+    fake_song_engine.mode_file.write_text("flaky:2")
+    notes: list[str] = []
+    songs = fake_song_engine.resolve(PLAYLIST, report=notes.append)
+    assert [s.title for s in songs] == ["Cut To The Feeling"]
+    assert fake_song_engine.runs_file.read_text() == "3"
+    assert notes == [
+        "Spotify did not answer, trying again now (attempt 2 of 3): Could not get playlist "
+        "info: Status Code: 504, Response: upstream request timeout",
+        "Spotify did not answer, trying again now (attempt 3 of 3): Could not get playlist "
+        "info: Status Code: 504, Response: upstream request timeout",
+    ]
+    assert brief_note(notes[1]) == "Spotify did not answer, try 3/3"
+    assert brief_note("something else: with detail") == "something else"
+    assert is_retry_note(brief_note(notes[1])) and not is_retry_note("matching on YouTube Music")
+
+
+def test_resolve_gives_up_with_the_reason_and_the_count(fake_song_engine):
+    fake_song_engine.mode_file.write_text("flaky:9")
+    with pytest.raises(ResolveError) as excinfo:
+        fake_song_engine.resolve(PLAYLIST)
+    assert re.fullmatch(
+        r"Spotify did not answer in 3 attempts over \d+ s: Could not get playlist info: "
+        r"Status Code: 504, Response: upstream request timeout",
+        str(excinfo.value),
+    )
+    assert fake_song_engine.runs_file.read_text() == "3"
+
+
+def test_attempts_stop_at_the_deadline(fake_song_engine, monkeypatch):
+    """Attempts that hang until their timeout must not add up to a quarter of an hour."""
+    monkeypatch.setattr("vidpull.spotdl.RETRY_DEADLINE", 0.0)
+    fake_song_engine.mode_file.write_text("flaky:9")
+    notes: list[str] = []
+    with pytest.raises(ResolveError) as excinfo:
+        fake_song_engine.resolve(PLAYLIST, report=notes.append)
+    assert "in 1 attempt over" in str(excinfo.value) and notes == []
+    assert fake_song_engine.runs_file.read_text() == "1"
+    song = song_from_spotdl(json.loads((FIXTURES / "spotdl_track.json").read_text())[0])
+    with pytest.raises(MatchError) as excinfo:
+        fake_song_engine.match(song)
+    assert "in 1 attempt over" in str(excinfo.value)
+    assert fake_song_engine.runs_file.read_text() == "2"
+
+
+def test_resolve_does_not_repeat_an_answer_that_will_not_change(fake_song_engine):
+    fake_song_engine.mode_file.write_text("hidden")
+    notes: list[str] = []
+    with pytest.raises(ResolveError) as excinfo:
+        fake_song_engine.resolve(PLAYLIST, report=notes.append)
+    assert str(excinfo.value) == (
+        "Playlist not available or not accessible, make sure it is public."
+    )
+    assert fake_song_engine.runs_file.read_text() == "1" and notes == []
+    song = song_from_spotdl(json.loads((FIXTURES / "spotdl_track.json").read_text())[0])
+    with pytest.raises(MatchError) as excinfo:
+        fake_song_engine.match(song, report=notes.append)
+    assert str(excinfo.value).startswith("Playlist not available")
+    assert fake_song_engine.runs_file.read_text() == "2" and notes == []
+
+
+def test_cancel_during_the_wait_between_attempts(tmp_path, config, paths):
+    script_dir = tmp_path / "fake-spotdl"
+    script_dir.mkdir()
+    shutil.copy(FAKE, script_dir / "fake_spotdl.py")
+    shutil.copytree(FIXTURES, script_dir / "fixtures")
+    (script_dir / "fake_spotdl.py").chmod(0o755)
+    (script_dir / "mode").write_text("flaky:9")
+    engine = SpotdlEngine(
+        config,
+        paths,
+        python=str(script_dir / "fake_spotdl.py"),
+        visibility=lambda link: True,
+        resolve_delays=(60,),
+        match_delays=(60,),
+    )
+    cancel = threading.Event()
+    notes: list[str] = []
+
+    def heard(note: str) -> None:
+        notes.append(note)
+        threading.Timer(0.2, cancel.set).start()  # cancel once the wait has begun
+
+    started = time.monotonic()
+    with pytest.raises(ResolveCancelled):
+        engine.resolve(PLAYLIST, cancel, heard)
+    assert time.monotonic() - started < 10
+    assert notes and "trying again in 60 s (attempt 2 of 2)" in notes[0]
+
+    cancel.clear()
+    song = song_from_spotdl(json.loads((FIXTURES / "spotdl_track.json").read_text())[0])
+    started = time.monotonic()
+    assert engine.match(song, cancel, heard) is None  # a cancelled lookup is not an error
+    assert time.monotonic() - started < 10
 
 
 def test_match_and_no_match(fake_song_engine):
@@ -131,7 +246,67 @@ def test_match_and_no_match(fake_song_engine):
     assert "--preload" in args and "--lyrics" in args
     assert fake_song_engine.script_file.read_text() == ""
     fake_song_engine.mode_file.write_text("nomatch")
+    fake_song_engine.runs_file.unlink()
     assert fake_song_engine.match(song) is None  # exit 0 with a null entry means no match
+    assert fake_song_engine.runs_file.read_text() == "1"  # found nothing: asked once
+    # spotDL 4.5 raises when every result was filtered out, and logs it as an exception
+    fake_song_engine.mode_file.write_text("noresults")
+    fake_song_engine.runs_file.unlink()
+    notes: list[str] = []
+    assert fake_song_engine.match(song, report=notes.append) is None
+    assert fake_song_engine.runs_file.read_text() == "1" and notes == []
+
+
+def test_match_tells_a_failed_lookup_from_no_match(fake_song_engine):
+    """spotDL exits 1 with a traceback, or 0 with a null entry when its search raised:
+    both are a lookup that failed, tried again, then an error with the reason in it."""
+    song = song_from_spotdl(json.loads((FIXTURES / "spotdl_track.json").read_text())[0])
+    fake_song_engine.mode_file.write_text("flaky:1")
+    notes: list[str] = []
+    found = fake_song_engine.match(song, report=notes.append)
+    assert found is not None and found.url == "https://music.youtube.com/watch?v=Jg4bxoyywyA"
+    assert len(notes) == 1 and notes[0].startswith("Spotify did not answer, trying again now")
+
+    fake_song_engine.runs_file.unlink()
+    fake_song_engine.mode_file.write_text("boxed")
+    with pytest.raises(MatchError) as excinfo:
+        fake_song_engine.match(song)
+    assert re.sub(r"over \d+ s", "over N s", str(excinfo.value)) == (
+        "YouTube Music did not answer in 3 attempts over N s: ConnectionError: "
+        "HTTPSConnectionPool(host='music.youtube.com', port=443): Max retries exceeded with "
+        "url: / (Caused by NameResolutionError(\"Failed to resolve 'music.youtube.com'\"))"
+    )
+    assert fake_song_engine.runs_file.read_text() == "3"
+
+    fake_song_engine.mode_file.write_text("searchfail")
+    with pytest.raises(MatchError) as excinfo:
+        fake_song_engine.match(song)
+    assert str(excinfo.value).endswith(": [Errno 104] Connection reset by peer (music.youtube.com)")
+    assert str(excinfo.value).startswith("YouTube Music did not answer in 3 attempts")
+
+    broken = SpotdlEngine(fake_song_engine.config, fake_song_engine.paths, python="/no/such")
+    with pytest.raises(MatchError) as excinfo:
+        broken.match(song)
+    assert "cannot run spotDL" in str(excinfo.value)
+
+
+def test_reading_spotdl_answers():
+    logged, data = _split_json("[12:25:03 AM] ERROR [x] went wrong\n[\n    null\n]\n")
+    assert data == [None] and logged.startswith("[12:25:03 AM]")
+    assert _split_json("no array here [at all]") == ("no array here [at all]", None)
+    assert _split_json('Processing query: x\n[{"name": "a [live]"}]')[1] == [{"name": "a [live]"}]
+    assert failure_text("", "warning\nERROR: first\nERROR:  second  \n") == "second"
+    assert failure_text("", "") == ""
+    assert failure_text("", "only a line\n") == "only a line"
+    boxed = "An error occurred\n╭── Traceback ──╮\n│ x │\n╰──────╯\nKeyError: 'uri'   \n\n"
+    assert failure_text(boxed, "") == "KeyError: 'uri'"
+    assert len(failure_text("", "ERROR: " + "x" * 900)) == 300
+    assert search_failure("Song generated an\nexception: boom\n") == "boom"
+    assert search_failure("Could not find a match for Song") == ""
+    assert is_no_match("No results found for song: Artist - Song")
+    assert not is_no_match("[Errno 104] Connection reset by peer")
+    assert is_final("Playlist not available or not accessible, make sure it is public.")
+    assert is_final("Invalid playlist URL.") and not is_final("Could not get playlist info")
 
 
 def test_match_cancel_kills_spotdl(fake_song_engine):
@@ -241,9 +416,18 @@ FAKE_SPOTDL_PACKAGE = {
         "class Song:\n"
         "    def __init__(self, json):\n"
         "        self.json = json\n"
+        "class PlaylistError(Exception):\n"
+        "    def __init__(self, message, error=None):\n"
+        "        super().__init__(message)\n"
+        "        self.error = error\n"
         "def get_simple_songs(query, **options):\n"
         "    if 'bad' in query[0]:\n"
         "        raise ValueError('Invalid playlist URL.')\n"
+        "    if 'down' in query[0]:\n"
+        "        raise PlaylistError('Could not get playlist info',\n"
+        "                            error='Status Code: 504, Response: upstream timeout')\n"
+        "    if 'gone' in query[0]:\n"
+        "        raise KeyError('artists')\n"
         "    assert SpotifyClient.settings == {'cache_path': '/c'}\n"
         "    return [Song({'name': 'Song %d' % n, 'url': query[0], 'list_position': n})\n"
         "            for n in (1, 2)]\n"
@@ -267,6 +451,38 @@ def test_tracklist_script(tmp_path):
     argv[3] = PLAYLIST.replace("playlist/", "playlist/bad")
     proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30, check=False)
     assert proc.returncode == 1 and "Invalid playlist URL." in proc.stderr
+
+    # the HTTP status spotDL's client keeps next to its message is part of the reason
+    argv[3] = PLAYLIST.replace("playlist/", "playlist/down")
+    proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30, check=False)
+    assert proc.returncode == 1
+    assert proc.stderr.strip() == (
+        "ERROR: Could not get playlist info: Status Code: 504, Response: upstream timeout"
+    )
+    # a KeyError's message is only the key
+    argv[3] = PLAYLIST.replace("playlist/", "playlist/gone")
+    proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30, check=False)
+    assert proc.returncode == 1
+    assert proc.stderr.strip() == (
+        "ERROR: Spotify's answer held no track list (KeyError: 'artists')"
+    )
+
+
+def test_tracklist_script_behind_a_symlink(tmp_path):
+    """Reached through a link (the ``current`` generation), the helper must still import the
+    real spotdl package and not vidpull's own spotdl.py, which sits next to it."""
+    site = tmp_path / "site"
+    for name, text in FAKE_SPOTDL_PACKAGE.items():
+        (site / name).parent.mkdir(parents=True, exist_ok=True)
+        (site / name).write_text(text)
+    (tmp_path / "linked").symlink_to(TRACKLIST_SCRIPT.parent, target_is_directory=True)
+    script = tmp_path / "linked" / TRACKLIST_SCRIPT.name
+    env = {**os.environ, "PYTHONPATH": str(site)}
+    argv = [sys.executable, str(script), "save", PLAYLIST, "--save-file", "-"]
+    argv += ["--headless", "--cache-path", "/c"]
+    proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30, check=False)
+    assert proc.returncode == 0, proc.stderr
+    assert [s["list_position"] for s in json.loads(proc.stdout)] == [1, 2]
 
 
 def test_hidden_playlist_is_refused_before_spotdl_runs(tmp_path, config, paths):

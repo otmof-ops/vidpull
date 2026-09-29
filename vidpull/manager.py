@@ -31,7 +31,15 @@ from vidpull.models import (
     utcnow,
 )
 from vidpull.paths import Paths
-from vidpull.spotdl import ResolveCancelled, ResolveError, SongEngine, tagged_info
+from vidpull.spotdl import (
+    MatchError,
+    ResolveCancelled,
+    ResolveError,
+    SongEngine,
+    brief_note,
+    is_retry_note,
+    tagged_info,
+)
 from vidpull.store import Store
 
 log = logging.getLogger(__name__)
@@ -108,6 +116,7 @@ class DownloadManager:
         self._cancel: dict[int, threading.Event] = {}
         self._delete_after: dict[int, bool] = {}
         self._resolving: dict[int, threading.Event] = {}
+        self._retried: set[int] = set()  # runs whose failed songs had their second pass
         self._stage_timers: dict[int, threading.Timer] = {}
         self._stage_lock = threading.RLock()
         self._stopping = threading.Event()
@@ -241,8 +250,16 @@ class DownloadManager:
         cancel = threading.Event()
         with self._lock:
             self._resolving[group_id] = cancel
+
+        def waiting(message: str) -> None:
+            # the row shows why the list is not there yet; a list that arrives clears it
+            self.store.add_log("warning", message, group_id=group_id)
+            noted = self.store.update_group(group_id, error=message)
+            if noted is not None:
+                self._emit_group(noted)
+
         try:
-            songs = self.song_engine.resolve(group.url, cancel)
+            songs = self.song_engine.resolve(group.url, cancel, waiting)
         except ResolveCancelled:
             return self._finish_group(group_id, GroupStatus.CANCELLED, "cancelled")
         except ResolveError as exc:
@@ -276,23 +293,28 @@ class DownloadManager:
         if resolving is not None:
             resolving.set()  # resolve_group records the cancelled state itself
             return True
+        # under the lock a settling run holds, so it cannot stage songs for another pass
+        # between the songs being cancelled here and the run being marked cancelled
         with self._stage_lock:
             timer = self._stage_timers.pop(group_id, None)
-        if timer is not None:
-            timer.cancel()
-        for job in self.store.list(group_id=group_id):
-            if job.id is None or job.is_terminal:
-                continue
-            with self._lock:
-                event = self._cancel.get(job.id)
-            if event is not None:
-                event.set()  # the worker records the cancel once yt-dlp or spotDL has stopped
-            else:
-                updated = self.store.update(job.id, status=JobStatus.CANCELLED, phase="cancelled")
-                if updated is not None:
-                    self._emit(updated)
-        if not group.is_terminal:
-            self._finish_group(group_id, GroupStatus.CANCELLED, "")
+            if timer is not None:
+                timer.cancel()
+            for job in self.store.list(group_id=group_id):
+                if job.id is None or job.is_terminal:
+                    continue
+                with self._lock:
+                    event = self._cancel.get(job.id)
+                if event is not None:
+                    event.set()  # the worker records the cancel once yt-dlp or spotDL stopped
+                else:
+                    updated = self.store.update(
+                        job.id, status=JobStatus.CANCELLED, phase="cancelled"
+                    )
+                    if updated is not None:
+                        self._emit(updated)
+            group = self.store.get_group(group_id) or group
+            if not group.is_terminal:
+                self._finish_group(group_id, GroupStatus.CANCELLED, "")
         return True
 
     def retry_group(self, group_id: int) -> int:
@@ -334,6 +356,29 @@ class DownloadManager:
             self._settle_group(group_id)  # nothing is live, so this releases the first batch
         return retried
 
+    def reopen_group(self, group_id: int) -> Group | None:
+        """Send a run whose track list never arrived back to fetching it.
+
+        The caller runs ``resolve_group`` next. None when the run has songs (they are
+        what ``retry_group`` is for) or is not over.
+        """
+        group = self.store.get_group(group_id)
+        if group is None or not group.is_terminal or self.store.list(group_id=group_id):
+            return None
+        updated = self.store.update_group(
+            group_id,
+            status=GroupStatus.RESOLVING,
+            error="",
+            cleared_at=None,
+            created_at=utcnow(),  # the row counts the wait from here
+        )
+        self.store.add_log(
+            "info", f"fetching the track list of {group.url} again", group_id=group_id
+        )
+        if updated is not None:
+            self._emit_group(updated)
+        return updated
+
     def delete_group(self, group_id: int, *, delete_files: bool = False) -> bool:
         group = self.store.get_group(group_id)
         if group is None:
@@ -363,8 +408,11 @@ class DownloadManager:
                 progress.pending += 1
             elif job.status == JobStatus.STAGED:
                 progress.staged += 1
-            if job.status.is_active and progress.active is None:
-                progress.active = job
+            if job.status.is_active and (
+                progress.active is None
+                or (is_retry_note(job.phase) and not is_retry_note(progress.active.phase))
+            ):
+                progress.active = job  # one that waits to be asked again is the one to show
         progress.stage_size = self.config.stage_size
         with self._stage_lock:
             progress.resting = group.id in self._stage_timers
@@ -401,6 +449,8 @@ class DownloadManager:
             if statuses == {JobStatus.CANCELLED}:
                 self._finish_group(group_id, GroupStatus.CANCELLED, "")
                 return
+            if self._second_pass(group_id, jobs):
+                return
             failed = sum(1 for j in jobs if j.status == JobStatus.FAILED)
             pending = sum(1 for j in jobs if j.status == JobStatus.PENDING)
             notes = [
@@ -409,6 +459,38 @@ class DownloadManager:
                 if count
             ]
             self._finish_group(group_id, GroupStatus.DONE, ", ".join(notes))
+
+    def _second_pass(self, group_id: int, jobs: list[Job]) -> bool:
+        """Before a run ends with failed songs, try those once more, in batches.
+
+        Most failures are a service not answering for a few minutes, and by the end of
+        a run that is over. Once per run and session (a restarted app gives a run that
+        was interrupted one more); ``retry_group`` is there for more.
+        """
+        failed = [j for j in jobs if j.status == JobStatus.FAILED and j.id is not None]
+        with self._lock:
+            if not failed or group_id in self._retried or self._stopping.is_set():
+                return False
+            self._retried.add(group_id)
+        for job in failed:
+            assert job.id is not None
+            updated = self.store.update(
+                job.id,
+                status=JobStatus.STAGED,
+                error="",
+                phase="",
+                progress=0.0,
+                speed=None,
+                eta=None,
+                worker="",
+            )
+            if updated is not None:
+                self._emit(updated)
+        self.store.add_log(
+            "info", f"{len(failed)} song(s) failed; trying them once more", group_id=group_id
+        )
+        self._schedule_stage(group_id)
+        return True
 
     def _schedule_stage(self, group_id: int) -> None:
         """Release the next batch now, or after ``stage_pause`` seconds."""
@@ -585,9 +667,30 @@ class DownloadManager:
                 self._run(job, name)
             except Exception:  # a worker must never die
                 log.exception("job %s crashed the worker", job.id)
-                self.store.update(
-                    job.id, status=JobStatus.FAILED, error="internal error; see the log"
-                )
+                self._crashed(job)
+
+    def _crashed(self, job: Job) -> None:
+        """Record a job whose run raised, and let its run move on: a run waits for every
+        song to end, and would wait for this one for ever."""
+        assert job.id is not None
+        with self._lock:
+            self._cancel.pop(job.id, None)
+            self._delete_after.pop(job.id, None)
+        try:
+            failed = self.store.update(
+                job.id,
+                status=JobStatus.FAILED,
+                error="internal error; see the log",
+                phase="failed",
+                speed=None,
+                eta=None,
+            )
+            if failed is not None:
+                self._emit(failed)
+            if job.group_id is not None:
+                self._settle_group(job.group_id)
+        except Exception:
+            log.exception("job %s could not be recorded as failed", job.id)
 
     def _run(self, job: Job, worker_name: str) -> None:
         assert job.id is not None
@@ -776,7 +879,21 @@ class DownloadManager:
         matched = job.matched_url
         if not matched:
             on_log("info", f"looking for {song.display_title} on YouTube Music")
-            found = self.song_engine.match(song, cancel)
+            job_id = job.id
+
+            def waiting(message: str) -> None:
+                on_log("warning", message)
+                noted = self.store.update(job_id, phase=brief_note(message))
+                if noted is not None:
+                    self._emit(noted)
+
+            try:
+                found = self.song_engine.match(song, cancel, waiting)
+            except MatchError as exc:
+                if cancel.is_set():
+                    return job, None, DownloadResult(ok=False, cancelled=True), False
+                on_log("error", str(exc))
+                return job, None, DownloadResult(ok=False, error=str(exc)), False
             if cancel.is_set():
                 return job, None, DownloadResult(ok=False, cancelled=True), False
             if found is None:
