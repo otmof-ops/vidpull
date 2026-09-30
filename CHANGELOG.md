@@ -6,6 +6,8 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-30
+
 ### Added
 
 - **A run counts what came, as it goes.** The row of an album or playlist says how many of its
