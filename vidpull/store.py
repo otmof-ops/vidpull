@@ -12,6 +12,7 @@ import contextlib
 import json
 import sqlite3
 import threading
+import zlib
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -181,6 +182,7 @@ class Store:
         self._conn = sqlite3.connect(
             str(path), check_same_thread=False, isolation_level=None, timeout=30
         )
+        self._conn.create_function("vidpull_mark", 1, _mark, deterministic=True)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -245,8 +247,8 @@ class Store:
 
     def take_handed(self) -> list[int]:
         """What was left for the app, taken: another app that asks finds nothing."""
-        if not self.get_meta(HANDED_META):
-            return []  # the usual answer, and it costs no write
+        if not _ids(self.get_meta(HANDED_META) or ""):
+            return []  # the usual answer, asked for once a second: it costs no write
         return self._handed(lambda ids: [])
 
     def _handed(self, change) -> list[int]:  # type: ignore[no-untyped-def]
@@ -434,22 +436,25 @@ class Store:
         return int(row["n"])
 
     def unresolved_mark(self) -> tuple[object, ...]:
-        """Changes whenever what failed or was not found may have: how many there are,
-        which, what they say, and how every run stands. Times are not enough to go by:
-        they are written to the second, and a run is over in the second its last song is.
+        """Changes whenever what failed or was not found has: which they are, what each
+        of them says, and how every run stands. Times are not enough to go by, they are
+        written to the second and a run is over in the second its last song is; nor are
+        counts and lengths, two reasons are as long as each other. So it is a sum over
+        what is shown of each.
         """
         with self._lock:
             jobs = self._conn.execute(
-                "SELECT COUNT(*) AS n, TOTAL(id) AS ids, MAX(updated_at) AS at, "
-                "TOTAL(LENGTH(error) + LENGTH(phase) + LENGTH(title)) AS said FROM jobs "
-                "WHERE status IN (?, ?)",
+                "SELECT COUNT(*) AS n, TOTAL(id) AS ids, "
+                "TOTAL(vidpull_mark(id || char(31) || status || char(31) || title || char(31) "
+                "|| error || char(31) || phase || char(31) || song)) AS said "
+                "FROM jobs WHERE status IN (?, ?)",
                 (str(JobStatus.FAILED), str(JobStatus.PENDING)),
             ).fetchone()
             runs = self._conn.execute(
                 "SELECT GROUP_CONCAT(id || ':' || status || ':' || COALESCE(ended_at, '') "
-                "|| ':' || LENGTH(name), ' ') AS stand FROM groups"
+                "|| ':' || name, char(31)) AS stand FROM groups"
             ).fetchone()
-        return (jobs["n"], jobs["ids"], jobs["at"], jobs["said"], runs["stand"])
+        return (jobs["n"], jobs["ids"], jobs["said"], runs["stand"])
 
     # ------------------------------------------------------------ groups
     def add_group(self, group: Group) -> Group:
@@ -585,6 +590,11 @@ def _encode(column: str, value: object) -> object:
     if column == "is_playlist":
         return 1 if value else 0
     return value
+
+
+def _mark(text: object) -> int:
+    """A number for a text, the same for the same text: what ``unresolved_mark`` sums."""
+    return zlib.crc32(str(text).encode("utf-8", "replace"))
 
 
 def _ids(text: str) -> list[int]:

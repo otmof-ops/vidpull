@@ -1309,7 +1309,8 @@ class VidpullApp(App[PostExit | None]):
 
     def _drop_copied(self, link: str) -> None:
         """The clipboard watcher saw the link when it was copied, and queued it as a
-        download of its own that waits for a format: it was copied for the dialog."""
+        download of its own that waits for a format: it was copied for the dialog. Only
+        the watcher makes a download that waits for a format, so it is one of its."""
         for job in self.store.list([JobStatus.PENDING], cleared=False):
             if job.id is not None and job.song is None and normalize_url(job.url) == link:
                 self.manager.delete(job.id, delete_files=False)
@@ -1361,9 +1362,13 @@ class VidpullApp(App[PostExit | None]):
             self.notify("nothing here to delete", timeout=4)
             return
 
+        asked = {one.job.id for one in found}
+
         def decided(result: tuple[bool, bool] | None) -> None:
             if result and result[0]:
-                left = history.failures(self.store)  # as it is now, not as it was asked about
+                # what was asked about and is still there: not one that was tried again
+                # since and is on its way, not one that failed while the question was up
+                left = [one for one in history.failures(self.store) if one.job.id in asked]
                 for one in left:
                     self._drop_failed(one.job)
                 self.notify(f"deleted {len(left)} failed download(s)", timeout=6)
@@ -1372,8 +1377,7 @@ class VidpullApp(App[PostExit | None]):
         self.push_screen(
             ConfirmScreen(
                 f"Delete all {len(found)} failed downloads? They are deleted for good, from "
-                "the history as well. No file is touched, and a run keeps a line about each "
-                "of its songs in its log.",
+                "the history as well. No file is touched.",
                 danger=True,
                 yes_label="Delete all",
                 focus_no=True,
@@ -1833,9 +1837,12 @@ class VidpullApp(App[PostExit | None]):
                 else:
                     stage = progress.active.status.value if progress.active else "queued"
                 status = stage
-                if progress.stages > 1 and not group.ended_at:
-                    # a run that was over is live for the songs that are tried again:
-                    # they are in no batch
+                if group.ended_at:
+                    # it was over, and is live for what is tried again: the batches were
+                    # those of the whole run
+                    if progress.staged:
+                        status += f" · {progress.staged} waiting"
+                elif progress.stages > 1:
                     status += f" · batch {progress.stage}/{progress.stages}"
             elif group.status == GroupStatus.DONE:
                 status = "done"

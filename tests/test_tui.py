@@ -2363,3 +2363,44 @@ def test_one_that_failed_again_is_back_where_it_was(config, paths, store, video_
         run(flow())
     finally:
         app.manager.stop()
+
+
+def test_delete_all_deletes_what_it_asked_about(config, paths, store, video_info):
+    """Not what failed while the question was up, and not what is on its way again."""
+    engine = FakeEngine(info=video_info)
+    songs = trouble()
+    app = make_app(config, paths, store, engine, song_engine=songs)
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            song = await a_run_that_is_over(app, pilot, store)
+            failed = app.query_one("#failed", DataTable)
+            assert await until(pilot, lambda: failed.row_count == 3)
+            await pilot.press("2")
+            await pilot.click("#fail-delete-all")
+            assert await until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
+            assert app.screen.question.startswith("Delete all 3 failed downloads?")
+            # while it is up: a download fails, and one of the three is tried again
+            chosen = Selection(SelectionKind.PRESET, "best", "Best")
+            late = store.add(Job(url=URL, selection=chosen, status=JobStatus.FAILED, error="boom"))
+            app.manager.pause()
+            assert app.manager.retry(song["Song 6"].id) is not None
+            await pilot.press("y")
+            assert await until(pilot, lambda: store.get(song["Song 2"].id) is None)
+            assert store.get(song["Song 4"].id) is None
+            assert store.get(late.id) is not None  # nobody asked about it
+            assert store.get(song["Song 6"].id).status == JobStatus.QUEUED
+            assert await until(pilot, lambda: [r.value for r in failed.rows] == [str(late.id)])
+            assert "deleted 2 failed download(s)" in [n.message for n in app._notifications]
+            # the run is live for the song that is tried again: it is in no batch
+            jobs = app.query_one("#jobs", DataTable)
+            assert await until(pilot, lambda: cells(jobs, "g1")[3] == "paused")
+            app.manager.resume()
+            assert await until(
+                pilot, lambda: store.get_group(1).status == GroupStatus.DONE, tries=500
+            )
+
+    try:
+        run(flow())
+    finally:
+        app.manager.stop()

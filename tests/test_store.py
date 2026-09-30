@@ -373,6 +373,11 @@ def test_what_is_handed_to_the_app_is_taken_once(store: Store):
     store.hand_over(7)
     assert store.take_handed() == [7, 3]
     assert store.take_handed() == []
+    # asked once a second for as long as the app is open: nothing to take, nothing written
+    written = store._conn.total_changes
+    for _ in range(5):
+        assert store.take_handed() == []
+    assert store._conn.total_changes == written
     for written in ("not json", '{"a": 1}', '[1, "2", null, true, 4.5, 6]'):
         store.set_meta(HANDED_META, written)  # whatever is there: no vidpull stops over it
         store.hand_over(9)
@@ -397,9 +402,12 @@ def test_two_vidpulls_hand_over_at_once_and_nothing_is_lost(paths):
         second.close()
 
 
-def test_the_links_that_wait_for_a_format_and_the_mark_of_what_failed(store: Store):
+def test_the_links_that_wait_for_a_format_and_the_mark_of_what_failed(store: Store, monkeypatch):
+    from vidpull import store as module
     from vidpull.models import Group, GroupStatus, Song
 
+    # everything below is written in one and the same second
+    monkeypatch.setattr(module, "utcnow", lambda: "2026-09-30T00:00:00+00:00")
     chosen = _job().selection
     song = Song(title="Airbag", artists=["Radiohead"])
     run = store.add_group(
@@ -424,14 +432,33 @@ def test_the_links_that_wait_for_a_format_and_the_mark_of_what_failed(store: Sto
     assert store.unresolved_mark() == before
     same_second = store.get_group(run.id).updated_at
     store.update_group(run.id, status=GroupStatus.DONE, ended_at=same_second)
-    assert store.get_group(run.id).updated_at == same_second or True
+    assert store.get_group(run.id).updated_at == same_second == store.get(unfound.id).updated_at
     assert store.unresolved_mark() != before
     before = store.unresolved_mark()
-    store.update(unfound.id, status=JobStatus.FAILED, error="boom")
+    store.update(unfound.id, status=JobStatus.FAILED, error="HTTP Error 403: Forbidden")
     assert store.unresolved_mark() != before
     before = store.unresolved_mark()
-    store.update(unfound.id, error="another reason")
+    store.update(unfound.id, error="HTTP Error 404: Not Found")  # as long as the other
     assert store.unresolved_mark() != before
+    # four downloads, two of them failed: 1 and 4, then 2 and 3. As many, and the same sum
+    ids = [
+        store.add(Job(url=f"https://e/{n}", selection=chosen, status=JobStatus.DONE)).id
+        for n in range(4)
+    ]
+    for one in (ids[0], ids[3]):
+        store.update(one, status=JobStatus.FAILED, error="boom")
+    before = store.unresolved_mark()
+    for one, status in zip(ids, ("done", "failed", "failed", "done"), strict=True):
+        store.update(one, status=JobStatus(status), error="boom")
+    assert ids[0] + ids[3] == ids[1] + ids[2] and store.unresolved_mark() != before
+    before = store.unresolved_mark()
+    store.update_group(run.id, name="Old Name")
+    named = store.unresolved_mark()
+    store.update_group(run.id, name="New Name")
+    assert before != named != store.unresolved_mark()
+    for one in ids:
+        store.delete(one)
+    before = store.unresolved_mark()
     before = store.unresolved_mark()
     store.update(unfound.id, status=JobStatus.DOWNLOADING, progress=50.0)
     assert store.unresolved_mark() != before

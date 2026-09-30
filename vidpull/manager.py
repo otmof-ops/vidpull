@@ -253,6 +253,10 @@ class DownloadManager:
                 if job_id in self._cancel or job_id in self._parked:
                     continue  # it is this manager's already
             if job.group_id is not None:
+                with self._lock:  # as when the run is made live again here
+                    self._retried.add(job.group_id)
+                    self._ended.pop(job.group_id, None)
+                    self._speeds.pop(job.group_id, None)
                 group = self.store.get_group(job.group_id)
                 if group is not None:
                     self._emit_group(group)  # the other vidpull made its run live again
@@ -274,7 +278,7 @@ class DownloadManager:
                 event.set()
             for event in self._resolving.values():
                 event.set()
-            for timer in self._stage_timers.values():
+            for timer in list(self._stage_timers.values()):  # a run may be deleted meanwhile
                 timer.cancel()
             self._stage_timers.clear()
             released, self._released = self._released, True
@@ -457,24 +461,27 @@ class DownloadManager:
         finally:
             with self._lock:
                 self._resolving.pop(group_id, None)
-        updated = self.store.update_group(
-            group_id, name=name, entry_count=len(songs), status=GroupStatus.ACTIVE, error=""
-        )
-        if updated is not None:
-            self._emit_group(updated)
-        wanted = len(songs) - len(skip)
-        size = self.config.stage_size or len(songs)
-        batches = f", {size} at a time" if size < wanted else ""
-        self.store.add_log("info", f"{name}: {len(songs)} songs{batches}", group_id=group_id)
-        released = 0
-        for index, song in enumerate(songs):
-            found = skip.get(index)
-            if found is not None:
-                self.skip_song(song, group.selection, found, group_id=group_id)
-                continue
-            status = JobStatus.QUEUED if released < size else JobStatus.STAGED
-            released += 1
-            self.enqueue_song(song, group.selection, group_id=group_id, status=status)
+        # Under the lock a run is settled and emptied under: between the run being live and
+        # the last of its songs being there, it looked like a run that was through them.
+        with self._stage_lock:
+            updated = self.store.update_group(
+                group_id, name=name, entry_count=len(songs), status=GroupStatus.ACTIVE, error=""
+            )
+            if updated is not None:
+                self._emit_group(updated)
+            wanted = len(songs) - len(skip)
+            size = self.config.stage_size or len(songs)
+            batches = f", {size} at a time" if size < wanted else ""
+            self.store.add_log("info", f"{name}: {len(songs)} songs{batches}", group_id=group_id)
+            released = 0
+            for index, song in enumerate(songs):
+                found = skip.get(index)
+                if found is not None:
+                    self.skip_song(song, group.selection, found, group_id=group_id)
+                    continue
+                status = JobStatus.QUEUED if released < size else JobStatus.STAGED
+                released += 1
+                self.enqueue_song(song, group.selection, group_id=group_id, status=status)
         if not wanted:
             self._settle_group(group_id)  # nothing but duplicates: the run is over already
         return self.store.get_group(group_id)
@@ -759,6 +766,9 @@ class DownloadManager:
             group = self.store.get_group(group_id)
             if group is None or group.status != GroupStatus.ACTIVE:
                 return
+            counts, _, _ = self.store.group_summary(group_id)
+            if any(counts.get(str(status)) for status in (JobStatus.QUEUED, *ACTIVE)):
+                return  # the usual answer, from one query: its songs are not read for it
             jobs = self.store.list(group_id=group_id)
             if any(j.status == JobStatus.QUEUED or j.status.is_active for j in jobs):
                 return
@@ -881,37 +891,51 @@ class DownloadManager:
         return job
 
     def cancel(self, job_id: int) -> bool:
+        waiting = {JobStatus.QUEUED, JobStatus.PENDING, JobStatus.STAGED}
         with self._lock:
             event = self._cancel.get(job_id)
             if event is not None:
                 self._called_off.add(job_id)
+            else:
+                # Written under the lock a worker claims under. It took the job before this,
+                # and is told to stop; or it takes it after, and finds it cancelled. Looked
+                # at and written apart, a song could be cancelled and running at once.
+                job = self.store.get(job_id)
+                if job is None or job.status not in waiting:
+                    return False
+                job = self.store.update(job_id, status=JobStatus.CANCELLED, phase="cancelled")
         if event is not None:
             event.set()
             return True
-        job = self.store.get(job_id)
-        if job is None or job.status not in {JobStatus.QUEUED, JobStatus.PENDING, JobStatus.STAGED}:
-            return False
-        job = self.store.update(job_id, status=JobStatus.CANCELLED, phase="cancelled")
         if job is not None:
             self._emit(job)
             if job.group_id is not None:
-                self._settle_group(job.group_id)  # it may have been the last one live
+                self._settle_own(job.group_id)  # it may have been the last one live
         return True
 
     def delete(self, job_id: int, *, delete_files: bool = False, of_run: bool = False) -> bool:
         """Delete a download. ``of_run``: its whole run is being deleted with it."""
-        job = self.store.get(job_id)
-        if job is None:
-            return False
         with self._lock:
+            job = self.store.get(job_id)
+            if job is None:
+                return False
             event = self._cancel.get(job_id)
             if event is not None:
                 self._delete_after[job_id] = delete_files
+            else:
+                self.store.delete(job_id)  # under the lock, as the cancel is written
         if event is not None:
             event.set()  # the worker finishes the deletion once yt-dlp has stopped
             return True
-        self._finish_delete(job, delete_files, of_run=of_run)
+        self._finish_delete(job, delete_files, of_run=of_run, was_live=_is_live(job))
         return True
+
+    def _settle_own(self, group_id: int) -> None:
+        """Settle a run, when this is the manager that runs it. One that was made for a
+        command in a terminal has no workers: the batch it released, the second pass it
+        gave, would wait in a queue nobody reads. The app settles its runs when it starts."""
+        if self._started:
+            self._settle_group(group_id)
 
     def retry(self, job_id: int) -> Job | None:
         def again(job: Job) -> bool:
@@ -1377,7 +1401,9 @@ class DownloadManager:
                 said = self.song_engine.resolve(song.url, cancel, waiting)
             except ResolveCancelled:
                 return job, None, DownloadResult(ok=False, cancelled=True), False
-            except ResolveError as exc:
+            except Exception as exc:  # it is an extra: whatever goes wrong, the song comes
+                if not isinstance(exc, ResolveError):
+                    log.exception("job %s: reading the song's details failed", job_id)
                 said = []
                 on_log("warning", f"Spotify did not say more of it: {exc}")
             if cancel.is_set():
@@ -1446,18 +1472,23 @@ class DownloadManager:
         return job, tagged_info(raw, song), None, False
 
     # -------------------------------------------------------------- helpers
-    def _finish_delete(self, job: Job, delete_files: bool, *, of_run: bool = False) -> None:
+    def _finish_delete(
+        self, job: Job, delete_files: bool, *, of_run: bool = False, was_live: bool = True
+    ) -> None:
+        """What is left of a delete. ``was_live``: it was queued or on its way, so its run
+        may be through its songs with it gone; one that had failed changes nothing of that."""
         assert job.id is not None
+        self.store.delete(job.id)
         if delete_files:
             self._remove_files(job)
         self._cleanup_temp(job.id)
-        self.store.delete(job.id)
         self._emit(job, kind="removed")
         if job.group_id is not None and not of_run:
             if self._emptied(job.group_id):
                 return
             self._count_again(job.group_id)
-            self._settle_group(job.group_id)  # it may have been the last one live
+            if was_live:
+                self._settle_own(job.group_id)
 
     def _emptied(self, group_id: int) -> bool:
         """The last song of a run was deleted: a run of no songs goes with it."""

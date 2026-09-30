@@ -41,8 +41,8 @@ All notable changes to vidpull are recorded here. The format follows
   were a copied link waiting for a format.
 - `vidpull queue retry` on a song of a run that was over left the run as it was; the run is
   now live again with the song and says how it ended anew.
-- A run whose last live song was cancelled or deleted stayed "active" until vidpull was
-  started again.
+- A run whose last live song was cancelled or deleted in the app stayed "active" until
+  vidpull was started again.
 - Cancelling a run made its songs that were not found "cancelled"; they stay what they are.
 - **Clear list** took a cancelled run off the list while a song of it was downloading again,
   and the folder that download worked in with it.
