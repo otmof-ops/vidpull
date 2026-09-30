@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import FakeEngine, FakeSongEngine
+from tests.helpers import FakeEngine, FakeSongEngine, PickySongEngine
 from vidpull import __version__, cli
 from vidpull.config import Config
 from vidpull.models import Job, Selection, SelectionKind
@@ -535,3 +535,148 @@ def test_queue_clear_history_and_log(capsys, paths):
     assert cli.main(["queue", "history"]) == 0
     assert "nothing has finished yet" in capsys.readouterr().out
     assert [j.title for j in Store(paths.db_file).list()] == ["Waiting"]
+
+
+def test_get_counts_a_run_and_what_failed_is_resolved_from_the_queue(
+    monkeypatch, capsys, paths, video_info
+):
+    from tests.helpers import sample_song
+
+    engine = FakeEngine(info=video_info)
+    songs = [sample_song(title=f"Song {n}", track_number=n) for n in range(1, 6)]
+    for song in songs:
+        song.list_name = "Mix"
+    song_engine = PickySongEngine(songs=songs, fails=("Song 2",), unfound=("Song 4",))
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: engine)
+    monkeypatch.setattr(cli, "SpotdlEngine", lambda *a, **k: song_engine)
+    assert cli.main(["queue", "failed"]) == 0
+    assert capsys.readouterr().out == "nothing has failed\n"  # there is no database yet
+    album = "https://open.spotify.com/album/6dVIqQ8qmQ5GBnJ9shOYGE"
+    assert cli.main(["get", album, "-a", "mp3"]) == 1
+    out = flat(capsys.readouterr().out)
+    assert "Mix: 3/5 downloaded · 1 failed · 1 not found" in out
+    assert "2 left to resolve: vidpull queue failed" in out
+
+    assert cli.main(["queue", "failed"]) == 0
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert len(lines) == 3
+    assert re.fullmatch(
+        r" +2  \[G1\] Carly Rae Jepsen - Song 2 +YouTube refused the upload found for it", lines[0]
+    )
+    assert re.fullmatch(
+        r" +4  \[G1\] Carly Rae Jepsen - Song 4 +no confident match on YouTube Music", lines[1]
+    )
+    assert lines[2].startswith("2 left to resolve: `vidpull queue link ID URL`")
+    assert cli.main(["queue", "failed", "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [(row["id"], row["run"], row["why"]) for row in rows] == [
+        (2, 1, "YouTube refused the upload found for it"),
+        (4, 1, "no confident match on YouTube Music"),
+    ]
+    assert rows[0]["title"] == "Carly Rae Jepsen - Song 2" and rows[0]["from"] == songs[1].url
+
+    # another link: what will not do is said; what will is queued for the app
+    assert cli.main(["queue", "link", "2", "spotify:track:11dFghVXANMlKmJXsNCbNl"]) == 1
+    assert "not its sound" in capsys.readouterr().err
+    assert cli.main(["queue", "link", "2", "words"]) == 1
+    assert "that is not a link" in capsys.readouterr().err
+    assert cli.main(["queue", "link", "1", "https://youtu.be/abcdefghijk"]) == 1
+    assert "only a download that failed" in capsys.readouterr().err
+    assert cli.main(["queue", "link", "99", "https://youtu.be/abcdefghijk"]) == 1
+    assert "that download is gone" in capsys.readouterr().err
+    assert cli.main(["queue", "link", "2", "youtu.be/abcdefghijk"]) == 0
+    out = flat(capsys.readouterr().out)
+    assert "job 2 (Carly Rae Jepsen - Song 2) is queued with the link" in out
+    store = Store(paths.db_file)
+    job, group = store.get(2), store.get_group(1)
+    assert job.status == cli.JobStatus.QUEUED and job.matched_url == "https://youtu.be/abcdefghijk"
+    assert group.status == cli.GroupStatus.ACTIVE and group.ended_at is not None
+    store.close()
+    # the run is live again with that song; the other one is still left to resolve
+    assert cli.main(["queue", "failed"]) == 0
+    out = capsys.readouterr().out
+    assert "Song 4" in out and "Song 2" not in out and "1 left to resolve" in out
+    assert cli.main(["queue", "retry", "4"]) == 0
+    assert "job 4 queued" in capsys.readouterr().out
+    assert cli.main(["queue", "retry", "1"]) == 1  # it came: there is nothing to retry
+    assert "only failed, cancelled or unmatched" in capsys.readouterr().err
+    assert cli.main(["queue", "failed"]) == 0
+    assert capsys.readouterr().out == "nothing has failed\n"
+
+
+def test_get_says_how_a_run_went_when_all_of_it_came(monkeypatch, capsys, paths, video_info):
+    from tests.helpers import sample_song
+
+    engine = FakeEngine(info=video_info)
+    songs = [sample_song(title=f"Song {n}", track_number=n) for n in range(1, 4)]
+    for song in songs:
+        song.list_name = "Mix"
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: engine)
+    monkeypatch.setattr(cli, "SpotdlEngine", lambda *a, **k: PickySongEngine(songs=songs))
+    album = "https://open.spotify.com/album/6dVIqQ8qmQ5GBnJ9shOYGE"
+    assert cli.main(["get", album, "-a", "mp3"]) == 0
+    out = flat(capsys.readouterr().out)
+    assert "Mix: 3/3 downloaded" in out and "left to resolve" not in out
+
+
+def test_json_is_json_when_there_is_no_database(capsys, paths):
+    assert not paths.db_file.exists()
+    assert cli.main(["queue", "failed", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+    assert cli.main(["queue", "history", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+    assert not paths.db_file.exists()  # and asking makes none
+
+
+def test_get_ends_with_the_count_and_a_link_from_a_terminal_is_handed_to_the_app(
+    monkeypatch, capsys, paths, video_info
+):
+    from tests.helpers import sample_song
+
+    engine = FakeEngine(info=video_info)
+    songs = [sample_song(title=f"Song {n}", track_number=n) for n in range(1, 6)]
+    for song in songs:
+        song.list_name = "Mix"
+    song_engine = PickySongEngine(songs=songs, fails=("Song 2",), unfound=("Song 4",))
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: engine)
+    monkeypatch.setattr(cli, "SpotdlEngine", lambda *a, **k: song_engine)
+    album = "https://open.spotify.com/album/6dVIqQ8qmQ5GBnJ9shOYGE"
+    assert cli.main(["get", album, "-a", "mp3"]) == 1
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    # last, where it is still in sight after the songs of a long list
+    assert flat(lines[-2]) == "Mix: 3/5 downloaded · 1 failed · 1 not found"
+    assert flat(lines[-1]) == "2 left to resolve: vidpull queue failed"
+
+    for link, words in (
+        ("https://youtu.be/A\nhttps://youtu.be/B", "that is not a link"),
+        ("https://youtu.be/A https://youtu.be/B", "that is not a link"),
+        ("https://open.spotify.com/artist/4NHQUGzhtTLFvgF5SZesLK", "not its sound"),
+        ("https://spotify.link/AbCdEf", "not its sound"),
+    ):
+        assert cli.main(["queue", "link", "4", link]) == 1
+        assert words in capsys.readouterr().err
+    store = Store(paths.db_file)
+    assert store.get(4).status == cli.JobStatus.PENDING and store.take_handed() == []
+    store.close()
+
+    assert cli.main(["queue", "link", "4", "https://user:secret@example.com/a.mp3"]) == 0
+    out = flat(capsys.readouterr().out)
+    assert "an open vidpull takes it up within a second" in out and "secret" not in out
+    assert cli.main(["queue", "retry", "2"]) == 0
+    assert "an open vidpull takes it up within a second" in flat(capsys.readouterr().out)
+    store = Store(paths.db_file)
+    assert store.take_handed() == [4, 2]
+    logged = [line.message for line in store.job_log(4)]
+    assert "given another link: https://example.com/a.mp3" in logged  # and no word of the login
+    store.close()
+    assert cli.main(["queue", "retry", "1"]) == 1
+    capsys.readouterr()
+    store = Store(paths.db_file)
+    assert store.take_handed() == []  # what was refused is not handed over
+    store.update(2, status=cli.JobStatus.FAILED, error="boom", url="https://u:p@example.com/x")
+    store.update_group(1, status=cli.GroupStatus.DONE)
+    store.close()
+    assert cli.main(["queue", "failed", "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [row["from"] for row in rows] == ["https://example.com/x"]

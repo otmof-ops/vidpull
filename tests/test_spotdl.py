@@ -573,3 +573,31 @@ def test_spotify_visible_reads_the_status(monkeypatch):
     assert spotify_visible("https://open.spotify.com/playlist/hidden") is False
     assert spotify_visible("https://open.spotify.com/playlist/broken") is None
     assert calls[0].startswith("https://open.spotify.com/oembed?url=https%3A%2F%2Fopen.spotify.com")
+
+
+def test_whatever_points_at_spotify_is_no_place_to_download_from():
+    from vidpull.spotdl import is_spotify_address
+
+    for text in (
+        "https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl?si=abc",
+        "spotify:track:11dFghVXANMlKmJXsNCbNl",
+        "spotify:artist:4NHQUGzhtTLFvgF5SZesLK",
+        "https://open.spotify.com/artist/4NHQUGzhtTLFvgF5SZesLK",
+        "https://open.spotify.com/episode/0Q86acNRm6V9GYx55SXKwf",
+        "open.spotify.com/intl-de/track/11dFghVXANMlKmJXsNCbNl",
+        "https://spotify.link/AbCdEf",
+        "https://spotify.app.link/AbCdEf",
+        "HTTPS://OPEN.SPOTIFY.COM/show/xyz",
+        "  https://www.spotify.com/us/  ",
+    ):
+        assert is_spotify_address(text), text
+    for text in (
+        "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+        "https://notspotify.com/track/1",
+        "https://example.com/spotify.com/track/1",
+        "https://spotify.com.example.org/x",
+        "youtu.be/abcdefghijk",
+        "https://[broken",
+        "",
+    ):
+        assert not is_spotify_address(text), text

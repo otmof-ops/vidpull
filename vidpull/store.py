@@ -12,13 +12,25 @@ import contextlib
 import json
 import sqlite3
 import threading
+import zlib
 from collections.abc import Iterable
 from pathlib import Path
 
-from vidpull.models import Group, GroupStatus, Job, JobStatus, LogLine, Selection, Song, utcnow
+from vidpull.models import (
+    SKIPPED,
+    Group,
+    GroupStatus,
+    Job,
+    JobStatus,
+    LogLine,
+    Selection,
+    Song,
+    utcnow,
+)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 LOG_LINES_PER_JOB = 300  # a download's own log is kept with it; this bounds a noisy one
+HANDED_META = "handed_jobs"  # what another vidpull queued for the app, as a JSON list of ids
 
 _GROUPS_TABLE = """
 CREATE TABLE IF NOT EXISTS groups (
@@ -32,7 +44,8 @@ CREATE TABLE IF NOT EXISTS groups (
     error TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    cleared_at TEXT
+    cleared_at TEXT,
+    ended_at TEXT
 );
 """
 
@@ -113,6 +126,7 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         _LOG_TABLE,
         *_LOG_INDEXES,
     ),
+    5: ("ALTER TABLE groups ADD COLUMN ended_at TEXT",),
 }
 
 _COLUMNS = (
@@ -155,6 +169,7 @@ _GROUP_COLUMNS = (
     "created_at",
     "updated_at",
     "cleared_at",
+    "ended_at",
 )
 
 
@@ -167,6 +182,7 @@ class Store:
         self._conn = sqlite3.connect(
             str(path), check_same_thread=False, isolation_level=None, timeout=30
         )
+        self._conn.create_function("vidpull_mark", 1, _mark, deterministic=True)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -223,6 +239,38 @@ class Store:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
+
+    def hand_over(self, job_id: int) -> None:
+        """Leave a download for the app: one that is open takes it up within a second,
+        and one that is started takes up everything that is queued anyway."""
+        self._handed(lambda ids: [*ids, job_id] if job_id not in ids else ids)
+
+    def take_handed(self) -> list[int]:
+        """What was left for the app, taken: another app that asks finds nothing."""
+        if not _ids(self.get_meta(HANDED_META) or ""):
+            return []  # the usual answer, asked for once a second: it costs no write
+        return self._handed(lambda ids: [])
+
+    def _handed(self, change) -> list[int]:  # type: ignore[no-untyped-def]
+        """Read the list and write what ``change`` makes of it, as one step: two
+        vidpulls at it at once do not lose an entry. Returns the list as it was."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT value FROM meta WHERE key = ?", (HANDED_META,)
+                ).fetchone()
+                ids = _ids(row["value"]) if row is not None else []
+                self._conn.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (HANDED_META, json.dumps(change(list(ids)))),
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        return ids
 
     # ------------------------------------------------------------- jobs
     def add(self, job: Job) -> Job:
@@ -376,6 +424,38 @@ class Store:
             ).fetchall()
         return {str(r["status"]): int(r["n"]) for r in rows}
 
+    def copied_links(self) -> int:
+        """How many links wait on the list for a format to be picked. A song that was not
+        found is pending as well, and is none of them."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM jobs "
+                "WHERE status = ? AND song = '' AND cleared_at IS NULL",
+                (str(JobStatus.PENDING),),
+            ).fetchone()
+        return int(row["n"])
+
+    def unresolved_mark(self) -> tuple[object, ...]:
+        """Changes whenever what failed or was not found has: which they are, what each
+        of them says, and how every run stands. Times are not enough to go by, they are
+        written to the second and a run is over in the second its last song is; nor are
+        counts and lengths, two reasons are as long as each other. So it is a sum over
+        what is shown of each.
+        """
+        with self._lock:
+            jobs = self._conn.execute(
+                "SELECT COUNT(*) AS n, TOTAL(id) AS ids, "
+                "TOTAL(vidpull_mark(id || char(31) || status || char(31) || title || char(31) "
+                "|| error || char(31) || phase || char(31) || song)) AS said "
+                "FROM jobs WHERE status IN (?, ?)",
+                (str(JobStatus.FAILED), str(JobStatus.PENDING)),
+            ).fetchone()
+            runs = self._conn.execute(
+                "SELECT GROUP_CONCAT(id || ':' || status || ':' || COALESCE(ended_at, '') "
+                "|| ':' || name, char(31)) AS stand FROM groups"
+            ).fetchone()
+        return (jobs["n"], jobs["ids"], jobs["said"], runs["stand"])
+
     # ------------------------------------------------------------ groups
     def add_group(self, group: Group) -> Group:
         group.created_at = group.created_at or utcnow()
@@ -460,6 +540,24 @@ class Store:
             ).fetchall()
         return [_log_from_row(r) for r in rows]
 
+    def group_summary(self, group_id: int) -> tuple[dict[str, int], int, int]:
+        """A run in three numbers, without reading its songs one by one: its songs by
+        status, how many of the done ones are duplicates that were skipped, and the bytes
+        of what was downloaded."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) AS n, "
+                "SUM(CASE WHEN phase LIKE ? THEN 1 ELSE 0 END) AS skipped, "
+                "SUM(COALESCE(NULLIF(total_bytes, 0), downloaded_bytes, 0)) AS bytes "
+                "FROM jobs WHERE group_id = ? GROUP BY status",
+                (f"{SKIPPED}%", group_id),
+            ).fetchall()
+        counts = {str(r["status"]): int(r["n"]) for r in rows}
+        done = next((r for r in rows if r["status"] == str(JobStatus.DONE)), None)
+        skipped = int(done["skipped"] or 0) if done is not None else 0
+        size = int(done["bytes"] or 0) if done is not None else 0
+        return counts, skipped, size
+
     def group_counts(self, group_id: int) -> dict[str, int]:
         with self._lock:
             rows = self._conn.execute(
@@ -492,6 +590,22 @@ def _encode(column: str, value: object) -> object:
     if column == "is_playlist":
         return 1 if value else 0
     return value
+
+
+def _mark(text: object) -> int:
+    """A number for a text, the same for the same text: what ``unresolved_mark`` sums."""
+    return zlib.crc32(str(text).encode("utf-8", "replace"))
+
+
+def _ids(text: str) -> list[int]:
+    """The ids in a JSON list; whatever else is in it, or in its place, is left out."""
+    try:
+        found = json.loads(text)
+    except ValueError:
+        return []
+    if not isinstance(found, list):
+        return []
+    return [one for one in found if isinstance(one, int) and not isinstance(one, bool)]
 
 
 def _encode_group(column: str, value: object) -> object:
@@ -578,6 +692,7 @@ def _group_to_row(group: Group) -> dict[str, object]:
         "created_at": group.created_at,
         "updated_at": group.updated_at,
         "cleared_at": group.cleared_at,
+        "ended_at": group.ended_at,
     }
 
 
@@ -594,6 +709,7 @@ def _group_from_row(row: sqlite3.Row) -> Group:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         cleared_at=row["cleared_at"],
+        ended_at=row["ended_at"],
     )
 
 

@@ -137,6 +137,7 @@ class FakeEngine:
         self.files = files
         self.probes: list[tuple[str, bool]] = []
         self.json_probes: list[str] = []
+        self.lists: set[str] = set()  # links that are a playlist, not one upload
         self.downloads: list[int | None] = []
         self.infos: list[dict | None] = []
         self.started = threading.Event()
@@ -156,6 +157,8 @@ class FakeEngine:
         self.json_probes.append(url)
         if self.probe_error:
             raise ProbeError(self.probe_error)
+        if url in self.lists:
+            return {"_type": "playlist", "id": "PL1", "title": "A list", "entries": [{}, {}]}
         return {
             "id": "fake",
             "title": f"Fake {url}",
@@ -216,6 +219,108 @@ class FakeEngine:
             target.write_bytes(b"x" * 10)
             produced.append(str(target))
         return DownloadResult(ok=True, files=produced, returncode=0)
+
+
+class PickySongEngine(FakeSongEngine):
+    """Finds every song its own upload, but for the titles in ``fails``, which YouTube
+    refuses, and the ones in ``unfound``, which have no match."""
+
+    REFUSED = "YouTube refused the upload found for it"
+
+    def __init__(
+        self,
+        *,
+        fails: tuple[str, ...] = (),
+        unfound: tuple[str, ...] = (),
+        details: dict[str, Song] | None = None,
+        details_error: str | None = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.fails = tuple(fails)
+        self.unfound = tuple(unfound)
+        self.details = details or {}  # what Spotify says of a track link asked for alone
+        self.details_error = details_error
+
+    def resolve(
+        self,
+        url: str,
+        cancel: threading.Event | None = None,
+        report: Callable[[str], None] | None = None,
+    ) -> list[Song]:
+        from vidpull.spotdl import ResolveError
+
+        if "/track/" not in url:
+            return super().resolve(url, cancel, report)
+        self.resolved.append(url)
+        if self.details_error:
+            raise ResolveError(self.details_error)
+        if url in self.details:
+            return [Song.from_json(self.details[url].to_json())]
+        return [Song.from_json(s.to_json()) for s in self.songs if s.url == url]
+
+    def match(
+        self,
+        song: Song,
+        cancel: threading.Event | None = None,
+        report: Callable[[str], None] | None = None,
+    ) -> Match | None:
+        from vidpull.spotdl import MatchError
+
+        self.matched.append(song.display_title)
+        if song.title in self.fails:
+            raise MatchError(self.REFUSED)
+        if song.title in self.unfound:
+            return None
+        digest = hashlib.sha256(song.title.encode()).hexdigest()
+        return Match(f"https://music.youtube.com/watch?v={digest[:11]}")
+
+
+class StepEngine(FakeEngine):
+    """Every download says it is on its way, at ``speed``, and then waits to be let
+    through: a run can be looked at while it goes."""
+
+    def __init__(self, *, speed: float = 2048.0, **kwargs):
+        super().__init__(**kwargs)
+        self.speed = speed
+        self.gate = threading.Semaphore(0)
+        self.waiting = 0
+
+    def let(self, count: int = 1) -> None:
+        for _ in range(count):
+            self.gate.release()
+
+    def download(
+        self,
+        job: Job,
+        download_dir: Path,
+        temp_dir: Path,
+        on_progress,
+        cancel,
+        on_log,
+        *,
+        info=None,
+    ):
+        on_progress(
+            Progress(
+                status="downloading",
+                downloaded=10,
+                total=100,
+                speed=self.speed,
+                eta=30.0,
+                filename=str(temp_dir / "clip.part"),
+                phase="downloading audio",
+            )
+        )
+        self.waiting += 1
+        try:
+            while not self.gate.acquire(timeout=0.01):
+                if cancel.is_set():
+                    self.downloads.append(job.id)
+                    return DownloadResult(ok=False, cancelled=True)
+        finally:
+            self.waiting -= 1
+        return super().download(job, download_dir, temp_dir, on_progress, cancel, on_log, info=info)
 
 
 def wait_until(predicate, timeout: float = 5.0, interval: float = 0.01) -> bool:
