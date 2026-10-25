@@ -329,13 +329,13 @@ _COOKIE_ROW_LINES = ("skipping cookie file entry", "invalid netscape format cook
 
 
 def _no_cookie_row(line: str) -> str:
-    """A yt-dlp line that quotes a row of a cookies file, value and all, cut before the row."""
+    """A yt-dlp line that quotes a row of a cookies file, value and all, cut right after
+    the words that say so: the reason may quote a field of the row too."""
     lowered = line.lower()
     for lead in _COOKIE_ROW_LINES:
         at = lowered.find(lead)
         if at >= 0:
-            end = lowered.find(":", at + len(lead))
-            return line[: end if end > 0 else at + len(lead)].rstrip() + ": (a cookie row)"
+            return line[: at + len(lead)].rstrip() + " (a cookie row)"
     return line
 
 

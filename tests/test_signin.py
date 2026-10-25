@@ -273,3 +273,82 @@ def test_private_files_are_this_users_only(paths):
     assert stat.S_IMODE(first.parent.stat().st_mode) == 0o700
     assert os.getpid() == int(first.name.split("-")[0])
     json.dumps([str(first), str(second)])  # names are plain
+
+
+def test_cookie_row_lines_are_cut_right_after_the_words():
+    from vidpull.engine import _no_cookie_row
+
+    assert (
+        _no_cookie_row(
+            "skipping cookie file entry due to invalid expires at CANARY-FIELD: '.y\tTRUE'"
+        )
+        == "skipping cookie file entry (a cookie row)"
+    )
+    assert (
+        _no_cookie_row("http.cookiejar.LoadError: invalid Netscape format cookies file 'x': 'ROW'")
+        == "http.cookiejar.LoadError: invalid Netscape format cookies file (a cookie row)"
+    )
+    assert _no_cookie_row("ERROR: plain words") == "ERROR: plain words"
+
+
+def test_many_workers_read_a_bad_cookies_file_without_a_word_on_stderr(tmp_path, capfd):
+    import sys
+    import threading
+
+    jar = netscape_file(tmp_path / "cookies.txt")
+    with jar.open("a") as out:
+        for n in range(300):
+            out.write(f".youtube.com\tTRUE\t/\tTRUE\tnot-a-number\tN{n}\tCANARY-{n}\n")
+    config = Config(signin="file", signin_file=str(jar))
+    before = sys.stderr
+    errors: list[BaseException] = []
+
+    def work() -> None:
+        try:
+            for _ in range(12):
+                signin.load_jar(config)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors and sys.stderr is before
+    assert "CANARY" not in capfd.readouterr().err
+
+
+def test_the_cookies_held_for_spotdl_expire_and_are_forgotten(isolated_home, paths, monkeypatch):
+    firefox_profile(isolated_home / ".mozilla" / "firefox")
+    config = Config(signin="browser", signin_browser="firefox")
+    signin.clear_jar_cache()
+    first = signin._cached_jar(config)
+    assert all(c.domain.endswith("youtube.com") for c in first)  # youtube.com only is held
+    assert signin._cached_jar(config) is first
+    monkeypatch.setattr(signin, "JAR_CACHE_SECONDS", 0)
+    assert signin._cached_jar(config) is not first  # expired: read again, the old one gone
+    assert len(signin._jar_cache) == 1
+    signin.forget_own_copy(paths)
+    assert signin._jar_cache == {}
+
+
+def test_sweep_survives_names_it_did_not_make(paths):
+    folder = paths.temp_dir / "signin"
+    folder.mkdir(parents=True)
+    (folder / "²-x.txt").write_text("x")
+    (folder / ("9" * 30 + "-x.txt")).write_text("x")
+    mine = folder / f"{os.getpid()}-live.txt"
+    mine.write_text("x")
+    made = signin._private(paths, ".txt")
+    assert made.exists() and mine.exists()
+
+
+def test_keyring_probe_writes_nothing_beside_an_odd_folder_name(tmp_path):
+    from tests.cookiejars import chromium_profile
+
+    odd = tmp_path / "odd#dir"
+    db = chromium_profile(odd, keyring=True)
+    assert signin._keyring_used(db) is True
+    assert not (tmp_path / "odd").exists()  # the unquoted URI used to create this file
+    assert sorted(p.name for p in odd.iterdir()) == ["Default"]

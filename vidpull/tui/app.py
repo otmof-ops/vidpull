@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -1745,6 +1746,7 @@ class VidpullApp(App[PostExit | None]):
                 return
             for key in ("signin", "signin_browser", "signin_file", "signin_use"):
                 setattr(self.config, key, getattr(updated, key))
+            signin.clear_jar_cache()
             self.config.save(self.paths.config_file)
             if self.config.signin == "off":
                 self.notify("signed out: downloads are made signed out", timeout=6)
@@ -1774,8 +1776,10 @@ class VidpullApp(App[PostExit | None]):
             return
         self._config_mtime = current
         try:
+            with self.paths.config_file.open("rb") as fh:
+                tomllib.load(fh)  # Config.load would read a half-written file as defaults
             fresh = Config.load(self.paths.config_file)
-        except Exception:  # a half-written file: the next tick reads it again
+        except (OSError, tomllib.TOMLDecodeError):  # the next tick reads it again
             self._config_mtime = None
             return
         keys = ("signin", "signin_browser", "signin_file", "signin_use")
@@ -1783,6 +1787,7 @@ class VidpullApp(App[PostExit | None]):
             return
         for key in keys:
             setattr(self.config, key, getattr(fresh, key))
+        signin.clear_jar_cache()
         self.notify(
             f"sign-in changed in a terminal: {signin.describe(self.config)}"
             if signin.available(self.config)

@@ -108,6 +108,7 @@ def test_a_signed_in_probe_downloads_signed_in(gated, config, paths, tmp_path):
     assert "--cookies-from-browser" in last and "--load-info-json" in last
     written = json.loads((paths.temp_dir / "7" / "info.json").read_text())
     assert SIGNED_IN_KEY not in written and SIGNED_IN_KEY in info
+    assert stat.S_IMODE((paths.temp_dir / "7" / "info.json").stat().st_mode) == 0o600
 
 
 def test_a_cookies_file_goes_as_a_private_copy(gated, config, paths, tmp_path):
@@ -666,3 +667,22 @@ def test_safari_is_refused_on_linux(monkeypatch):
     monkeypatch.setattr(signin.sys, "platform", "linux")
     with pytest.raises(signin.SigninError, match="macOS only"):
         signin.parse_spec("safari")
+
+
+def test_tui_watcher_ignores_a_half_written_config(config, paths, store, tmp_path):
+    jar = netscape_file(tmp_path / "c.txt")
+    config.signin, config.signin_file = "file", str(jar)
+    config.save(paths.config_file)
+    app = make_app(config, paths, store, FakeEngine())
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            await pilot.press("escape")
+            await pilot.pause(0.1)
+            paths.config_file.write_text('signin = "file"\nsignin_file = "')  # half written
+            await pilot.pause(2.6)
+            assert config.signin == "file"  # not signed out by a broken file
+            Config(signin="off").save(paths.config_file)
+            assert await until(pilot, lambda: config.signin == "off", tries=300)
+
+    asyncio.run(flow())

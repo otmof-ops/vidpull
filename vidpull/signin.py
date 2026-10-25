@@ -129,6 +129,7 @@ JAR_CACHE_SECONDS = 120  # a run's export of the browser's jar is reused this lo
 _URL = re.compile(r"https?://\S+")
 _jar_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
 _jar_lock = threading.Lock()
+_quiet_lock = threading.Lock()  # redirecting stderr and warnings is process-wide
 
 
 class SigninError(Exception):
@@ -324,7 +325,7 @@ def _keyring_used(database: Path) -> bool:
     half-way fails, which counts as "no keyring".
     """
     try:
-        con = sqlite3.connect(f"file:{database}?mode=ro&immutable=1", uri=True)
+        con = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro&immutable=1", uri=True)
         try:
             rows = con.execute(
                 "SELECT substr(encrypted_value, 1, 3) FROM cookies "
@@ -332,9 +333,13 @@ def _keyring_used(database: Path) -> bool:
             ).fetchall()
         finally:
             con.close()
-    except (OSError, sqlite3.Error):
+    except (OSError, sqlite3.Error, ValueError):
         return False
-    return any(bytes(row[0]) == b"v11" for row in rows if row[0] is not None)
+    return any(
+        bytes(row[0]) == b"v11"
+        for row in rows
+        if isinstance(row[0], (bytes, bytearray, memoryview))
+    )
 
 
 # ------------------------------------------------------------------ the jar
@@ -389,8 +394,13 @@ def load_jar(config: Config) -> tuple[Any, list[str]]:
         if path is None or not path.is_file():
             raise SigninError(f"the cookies file is missing: {path or '(none)'}")
         jar = YoutubeDLCookieJar(str(path))
-        # a row the reader rejects is echoed, value and all: it stays out of every log
-        with contextlib.redirect_stderr(io.StringIO()), warnings.catch_warnings():
+        # a row the reader rejects is echoed, value and all: it stays out of every log. The
+        # redirect is the process's, so one reader at a time
+        with (
+            _quiet_lock,
+            contextlib.redirect_stderr(io.StringIO()),
+            warnings.catch_warnings(),
+        ):
             warnings.simplefilter("ignore")  # the stdlib reports a rejected row as its own bug
             try:
                 jar.load()
@@ -533,7 +543,8 @@ def _scratch(paths: Paths) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
         folder.chmod(0o700)
-    _sweep(folder)
+    with contextlib.suppress(Exception):  # a stray name in the folder stops no run
+        _sweep(folder)
     return folder
 
 
@@ -541,7 +552,8 @@ def _sweep(folder: Path) -> None:
     now = time.time()
     for left in folder.iterdir():
         pid = left.name.split("-", 1)[0]
-        dead = pid.isdigit() and int(pid) != os.getpid() and not _alive(int(pid))
+        ours = pid.isascii() and pid.isdecimal() and 0 < len(pid) <= 9
+        dead = ours and int(pid) != os.getpid() and not _alive(int(pid))
         old = now - _mtime(left) > STALE_AFTER
         if dead or old:
             with contextlib.suppress(OSError):
@@ -605,17 +617,40 @@ def yt_dlp_args(config: Config, paths: Paths) -> Iterator[list[str]]:
 
 
 def _cached_jar(config: Config) -> Any:
-    """The sign-in's jar, read again after ``JAR_CACHE_SECONDS``: a run of songs signed
-    in from the start would otherwise read the browser's database for every song."""
+    """The sign-in's youtube.com cookies, read again after ``JAR_CACHE_SECONDS``: a run of
+    songs signed in from the start would otherwise read the browser's database for every
+    song. Only the current sign-in's are held, those of youtube.com only, and the reading
+    (which may wait on a keyring) happens outside the lock."""
     key = (config.signin, config.signin_browser, config.signin_file)
     now = time.monotonic()
     with _jar_lock:
         hit = _jar_cache.get(key)
         if hit is not None and now - hit[0] < JAR_CACHE_SECONDS:
             return hit[1]
-        jar, _said = load_jar(config)
-        _jar_cache[key] = (now, jar)
-        return jar
+        _jar_cache.clear()
+    jar, _said = load_jar(config)
+    kept = _only(jar, SPOTDL_DOMAINS)
+    with _jar_lock:
+        _jar_cache.clear()
+        _jar_cache[key] = (now, kept)
+    return kept
+
+
+def clear_jar_cache() -> None:
+    """Forgets the cookies held for spotDL: on sign-out and on every change of sign-in."""
+    with _jar_lock:
+        _jar_cache.clear()
+
+
+def _only(jar: Any, domains: tuple[str, ...]) -> Any:
+    from yt_dlp.cookies import YoutubeDLCookieJar
+
+    kept = YoutubeDLCookieJar()
+    for cookie in jar:
+        domain = (cookie.domain or "").lower().lstrip(".")
+        if any(domain == d or domain.endswith("." + d) for d in domains):
+            kept.set_cookie(cookie)
+    return kept
 
 
 @contextlib.contextmanager
@@ -629,7 +664,7 @@ def cookie_file(config: Config, paths: Paths) -> Iterator[Path | None]:
     jar = _cached_jar(config)
     copy = _private(paths, ".txt")
     try:
-        _write_jar(jar, copy, SPOTDL_DOMAINS)
+        _write_jar(jar, copy)
         yield copy
     finally:
         copy.unlink(missing_ok=True)
@@ -667,10 +702,15 @@ def keep_file(source: Path, paths: Paths) -> Path:
 
 
 def forget_own_copy(paths: Paths) -> None:
-    """Deletes vidpull's copy of a cookies file, and its scratch file, if there."""
+    """Deletes vidpull's copy of a cookies file and its scratch file, if there, forgets
+    the cookies held for spotDL, and sweeps what a dead process left in the scratch
+    folder."""
+    clear_jar_cache()
     for path in (own_copy(paths), own_copy(paths).with_suffix(".tmp")):
         with contextlib.suppress(OSError):
             path.unlink(missing_ok=True)
+    with contextlib.suppress(Exception):
+        _sweep(paths.temp_dir / "signin")
 
 
 def open_youtube() -> bool:

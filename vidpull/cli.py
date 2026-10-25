@@ -1253,6 +1253,7 @@ def cmd_signin(args: argparse.Namespace, ctx: Context) -> int:
                 "" if config.signin_file == str(signin.own_copy(ctx.paths)) else trial.signin_file
             )
         config.__dict__.update(trial.__dict__)
+        signin.clear_jar_cache()
         config.save(ctx.paths.config_file)
         status = signin.check(config) if source is not None else status
     print(f"sign-in: {status.detail}")
