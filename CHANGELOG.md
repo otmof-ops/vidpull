@@ -6,6 +6,8 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-10-25
+
 ### Added
 
 - **Sign in to YouTube.** Age-restricted, private and members-only videos need a signed-in
