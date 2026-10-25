@@ -148,10 +148,14 @@ GroupScreen DataTable {
     margin: 0 1;
 }
 
-SigninScreen VerticalScroll {
-    height: auto;
-    max-height: 1fr;
+SigninScreen #dialog {
+    height: 92%;
+}
+
+SigninScreen #dialog VerticalScroll {
+    height: 1fr;
     min-height: 7;
+    max-height: 100%;
 }
 
 SigninScreen #signin-intro {

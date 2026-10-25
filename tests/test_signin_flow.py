@@ -334,7 +334,7 @@ def test_cli_get_points_at_signin_when_the_age_gate_bites(monkeypatch, capsys, p
     assert "--no-signin made the run signed out" in " ".join(capsys.readouterr().out.split())
     assert cli.main(["get", URL]) == 1
     out = " ".join(capsys.readouterr().out.split())
-    assert "the one set up (Firefox) did not lift it" in out
+    assert "the one set up, Firefox, did not lift it" in out
 
 
 def test_cli_get_resolves_a_bare_browser_name_like_signin(monkeypatch, capsys, paths, video_info):
@@ -590,6 +590,30 @@ def test_tui_failed_tab_points_at_the_sign_in(config, paths, store):
     asyncio.run(flow())
 
 
+@pytest.mark.parametrize("size", [(80, 24), (100, 30), (132, 30), (132, 50)])
+def test_tui_dialog_shows_its_list_and_buttons_at_every_size(
+    config, paths, store, isolated_home, size
+):
+    firefox_profile(isolated_home / ".mozilla" / "firefox")
+    app = make_app(config, paths, store, FakeEngine())
+
+    async def flow():
+        async with app.run_test(size=size) as pilot:
+            await pilot.press("escape")
+            await pilot.press("y")
+            assert await until(pilot, lambda: isinstance(app.screen, SigninScreen))
+            screen = app.screen
+            await pilot.pause(0.1)
+            height = size[1]
+            for widget_id in ("browser-0", "use", "cancel", "signin-result"):
+                region = screen.query_one(f"#{widget_id}").region
+                assert region.height >= 1 and 0 <= region.y < height, (widget_id, region)
+            assert screen.query_one("#signin-intro", Static).display == (height >= 36)
+            await pilot.press("escape")
+
+    asyncio.run(flow())
+
+
 def test_tui_dialog_fits_a_small_terminal_and_tab_moves_the_focus(
     config, paths, store, isolated_home
 ):
@@ -686,3 +710,60 @@ def test_tui_watcher_ignores_a_half_written_config(config, paths, store, tmp_pat
             assert await until(pilot, lambda: config.signin == "off", tries=300)
 
     asyncio.run(flow())
+
+
+def test_tui_a_kept_file_path_does_not_flip_the_dialog_onto_the_file(
+    config, paths, store, isolated_home, tmp_path
+):
+    firefox_profile(isolated_home / ".mozilla" / "firefox")
+    config.signin, config.signin_browser = "browser", "firefox"
+    config.signin_file = str(netscape_file(tmp_path / "old.txt"))  # kept from before
+    app = make_app(config, paths, store, FakeEngine())
+
+    async def flow():
+        async with app.run_test(size=(132, 50)) as pilot:
+            await pilot.press("escape")
+            await pilot.press("y")
+            assert await until(pilot, lambda: isinstance(app.screen, SigninScreen))
+            await pilot.pause(0.2)
+            screen = app.screen
+            assert screen.query_one("#browser-0", RadioButton).value
+            assert not screen.query_one("#file", RadioButton).value
+            await pilot.press("escape")
+
+    asyncio.run(flow())
+
+
+def test_tui_settings_open_across_a_terminal_sign_in_keep_it(config, paths, store, tmp_path):
+    from vidpull.tui.screens.settings import SettingsScreen
+
+    config.save(paths.config_file)
+    app = make_app(config, paths, store, FakeEngine())
+
+    async def flow():
+        async with app.run_test(size=(132, 50)) as pilot:
+            await pilot.press("escape")
+            await pilot.press("s")
+            assert await until(pilot, lambda: isinstance(app.screen, SettingsScreen))
+            jar = netscape_file(tmp_path / "c.txt")
+            assert cli.main(["signin", "--file", str(jar)]) == 0
+            assert await until(pilot, lambda: config.signin == "file", tries=300)
+            app.screen.query_one("#f-rate_limit", Input).value = "1M"
+            app.screen.query_one("#save", Button).press()
+            assert await until(pilot, lambda: not isinstance(app.screen, SettingsScreen))
+            saved = Config.load(paths.config_file)
+            assert saved.signin == "file" and saved.rate_limit == "1M"
+
+    asyncio.run(flow())
+
+
+def test_cli_get_cookies_names_a_folder_and_the_run_flag_in_the_note(
+    monkeypatch, capsys, paths, video_info, tmp_path
+):
+    assert cli.main(["get", URL, "--cookies", str(tmp_path)]) == 2
+    assert "is a folder" in capsys.readouterr().err
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: GatedEngine(info=video_info))
+    jar = netscape_file(tmp_path / "c.txt")
+    assert cli.main(["get", URL, "--cookies", str(jar)]) == 1
+    out = " ".join(capsys.readouterr().out.split())
+    assert "the one given for this run, cookies file, did not lift it" in out

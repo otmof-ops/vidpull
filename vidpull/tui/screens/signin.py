@@ -27,11 +27,8 @@ INTRO = (
 HINT = "Use this keeps the choice once it holds a sign-in · Check only tells · esc cancels"
 USES = (("when a site asks for a sign-in", "when-asked"), ("for every download", "always"))
 USE_NOTE = "YouTube may limit an account that downloads a lot: signed out is the default."
-PLACE_BROWSER = (
-    "firefox · chrome · opera:~/snap/opera/current/.config/opera · firefox:1234abcd.work (a "
-    "profile's folder name) · chrome+kwallet6"
-)
-SHORT_FOR_INTRO = 34  # rows: below this the intro gives its room to the list
+PLACE_BROWSER = "firefox · opera:~/snap/opera/current/.config/opera · firefox:1234abcd.work"
+SHORT_FOR_INTRO = 36  # rows: below this the intro gives its room to the list
 PLACE_FILE = "~/Downloads/cookies.txt, exported from a browser with a cookies.txt extension"
 
 
@@ -224,8 +221,10 @@ class SigninScreen(ModalScreen[Config | None]):
     @on(Input.Changed, "#signin-browser")
     @on(Input.Changed, "#signin-file")
     def _typed(self, event: Input.Changed) -> None:
-        """Typing in a box chooses its button: Use this then means what was typed."""
-        if self._busy or not event.value.strip():
+        """Typing in a box chooses its button: Use this then means what was typed. A box
+        filled in at mount (a file path kept from before) fires this too: only a box with
+        the focus is being typed in."""
+        if self._busy or not event.value.strip() or not event.input.has_focus:
             return
         target = "other" if event.input.id == "signin-browser" else "file"
         self.query_one(f"#{target}", RadioButton).value = True

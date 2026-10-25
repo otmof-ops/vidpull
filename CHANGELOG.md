@@ -28,6 +28,12 @@ All notable changes to vidpull are recorded here. The format follows
 - A choice is kept only once its cookies hold a sign-in: `vidpull signin` and the Sign in
   screen check first and save after, and a working sign-in is never replaced by one that does
   not work; an expired sign-in reads as not signed in.
+- `vidpull get` says what to do when a link asks for a sign-in, at the lookup as well as at
+  the download; `--cookies-from-browser` on `get` finds a browser's install the way `signin`
+  does, a snap's folder spelled out; a link whose lookup took the sign-in is downloaded signed
+  in from the start; an open vidpull window takes up a sign-in made in a terminal.
+- Tab and Shift+Tab move the focus in every dialog (they moved nothing before); the Sign in
+  dialog fits a 24-row terminal.
 
 ### Changed
 

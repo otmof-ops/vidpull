@@ -1797,10 +1797,18 @@ class VidpullApp(App[PostExit | None]):
         self._reload_failed(force=True)
 
     def action_settings(self) -> None:
+        signin_keys = ("signin", "signin_browser", "signin_file", "signin_use")
+        opened = {key: getattr(self.config, key) for key in signin_keys}
+
         def saved(updated: Config | None) -> None:
             if updated is None:
                 return
             needs_restart = updated.concurrency != self.config.concurrency
+            for key in signin_keys:
+                # a sign-in made in a terminal while the form was open stays, unless the
+                # form's own field was changed
+                if getattr(updated, key) == opened[key]:
+                    setattr(updated, key, getattr(self.config, key))
             self.config.__dict__.update(updated.__dict__)
             self.config.save(self.paths.config_file)
             self._config_mtime = _mtime(self.paths.config_file)

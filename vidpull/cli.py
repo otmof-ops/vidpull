@@ -368,6 +368,9 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
             print("error: --cookies needs a file", file=sys.stderr)
             return EXIT_USAGE
         cookies = Path(args.cookies).expanduser().resolve()
+        if cookies.is_dir():
+            print(f"error: --cookies: {cookies} is a folder, not a cookies file", file=sys.stderr)
+            return EXIT_USAGE
         if not cookies.is_file():
             print(f"error: --cookies: no such file: {cookies}", file=sys.stderr)
             return EXIT_USAGE
@@ -1185,9 +1188,15 @@ def _signin_hint(config: Config, error: str, args: argparse.Namespace) -> str:
         )
     from vidpull import signin
 
+    who = signin.describe(config)
+    if getattr(args, "cookies", None) or getattr(args, "cookies_from_browser", None):
+        return (
+            f"this asked for a sign-in and the one given for this run, {who}, did not lift it: "
+            "is that browser or file signed in to YouTube, with an age-verified account?"
+        )
     return (
-        f"this asked for a sign-in and the one set up ({signin.describe(config)}) did not lift "
-        "it: `vidpull signin` says whether it still holds a YouTube sign-in"
+        f"this asked for a sign-in and the one set up, {who}, did not lift it: "
+        "`vidpull signin` says whether it still holds a YouTube sign-in"
     )
 
 
