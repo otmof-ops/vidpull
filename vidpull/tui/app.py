@@ -1777,11 +1777,13 @@ class VidpullApp(App[PostExit | None]):
         self._config_mtime = current
         try:
             with self.paths.config_file.open("rb") as fh:
-                tomllib.load(fh)  # Config.load would read a half-written file as defaults
-            fresh = Config.load(self.paths.config_file)
+                table = tomllib.load(fh)  # Config.load reads a half-written file as defaults
         except (OSError, tomllib.TOMLDecodeError):  # the next tick reads it again
             self._config_mtime = None
             return
+        if "signin" not in table:
+            return  # emptied, or written by something else: no word on the sign-in
+        fresh = Config.load(self.paths.config_file)
         keys = ("signin", "signin_browser", "signin_file", "signin_use")
         if all(getattr(fresh, key) == getattr(self.config, key) for key in keys):
             return

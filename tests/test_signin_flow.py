@@ -278,6 +278,36 @@ def test_an_expired_sign_in_is_named(gated, config, paths, tmp_path):
     assert any("no longer valid" in message for _, message in logs)
     with pytest.raises(ProbeError, match="^YouTube sign-in expired"):
         engine.probe_json(URL)
+    signed = [call for call in calls() if "--cookies-from-browser" in call]
+    assert signed and all("--no-warnings" not in call for call in signed)
+    assert all("--no-warnings" in call for call in calls() if "-J" in call and call not in signed)
+
+
+def test_only_links_that_asked_are_remembered(gated, config):
+    engine, calls = gated
+    config.signin, config.signin_browser, config.signin_use = "browser", "firefox", "always"
+    engine.probe_json(URL)
+    assert engine._asked == set()  # signed in from the start: nothing was asked
+    config.signin_use = "when-asked"
+    engine.probe_json(URL + "&x=1")
+    assert engine._asked == {URL + "&x=1"}
+
+
+def test_tui_watcher_ignores_an_emptied_config(config, paths, store, tmp_path):
+    jar = netscape_file(tmp_path / "c.txt")
+    config.signin, config.signin_file = "file", str(jar)
+    config.save(paths.config_file)
+    app = make_app(config, paths, store, FakeEngine())
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            await pilot.press("escape")
+            await pilot.pause(0.1)
+            paths.config_file.write_text("")
+            await pilot.pause(2.6)
+            assert config.signin == "file"
+
+    asyncio.run(flow())
 
 
 def test_spotdl_looks_again_signed_in_for_an_upload_youtube_refused(tmp_path, config, paths):

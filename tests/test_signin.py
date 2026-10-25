@@ -352,3 +352,27 @@ def test_keyring_probe_writes_nothing_beside_an_odd_folder_name(tmp_path):
     assert signin._keyring_used(db) is True
     assert not (tmp_path / "odd").exists()  # the unquoted URI used to create this file
     assert sorted(p.name for p in odd.iterdir()) == ["Default"]
+
+
+def test_cold_workers_read_the_browser_once_for_spotdl(isolated_home, monkeypatch):
+    import threading
+
+    firefox_profile(isolated_home / ".mozilla" / "firefox")
+    config = Config(signin="browser", signin_browser="firefox")
+    signin.clear_jar_cache()
+    reads = []
+    real = signin.load_jar
+
+    def counted(cfg):
+        reads.append(1)
+        time.sleep(0.05)
+        return real(cfg)
+
+    monkeypatch.setattr(signin, "load_jar", counted)
+    threads = [threading.Thread(target=signin._cached_jar, args=(config,)) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(reads) == 1
+    signin.clear_jar_cache()

@@ -400,16 +400,18 @@ class YtDlpEngine:
         download signs in too.
         """
         use = signin.always(self.config)
+        asked = False
         try:
             data = self._probe_once(url, playlist, use)
         except ProbeError as exc:
             if use or not signin.available(self.config) or not signin.asks_for_signin(str(exc)):
                 raise
-            use = True
+            use = asked = True
             data = self._probe_once(url, playlist, True)
         if use:
             data[SIGNED_IN_KEY] = True
-            self._asked.add(url)
+        if asked:
+            self._asked.add(url)  # bounded by the links that asked, this process
         return data
 
     def _signin_args(self, signed_in: bool) -> contextlib.AbstractContextManager[list[str]]:
@@ -426,7 +428,8 @@ class YtDlpEngine:
                     *cookies,
                     "-J",
                     "--flat-playlist",
-                    "--no-warnings",
+                    # a signed-in probe keeps the warnings: an expired sign-in is one of them
+                    *([] if signed_in else ["--no-warnings"]),
                     "--yes-playlist" if playlist else "--no-playlist",
                     "--",
                     url,

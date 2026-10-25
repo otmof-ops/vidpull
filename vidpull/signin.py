@@ -128,7 +128,8 @@ STALE_AFTER = 86400  # a private copy this old was left by a process that died
 JAR_CACHE_SECONDS = 120  # a run's export of the browser's jar is reused this long
 _URL = re.compile(r"https?://\S+")
 _jar_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
-_jar_lock = threading.Lock()
+_jar_lock = threading.Lock()  # the dictionary
+_fill_lock = threading.Lock()  # one reader fills it; a keyring is asked once, not per worker
 _quiet_lock = threading.Lock()  # redirecting stderr and warnings is process-wide
 
 
@@ -622,18 +623,28 @@ def _cached_jar(config: Config) -> Any:
     song. Only the current sign-in's are held, those of youtube.com only, and the reading
     (which may wait on a keyring) happens outside the lock."""
     key = (config.signin, config.signin_browser, config.signin_file)
-    now = time.monotonic()
-    with _jar_lock:
-        hit = _jar_cache.get(key)
-        if hit is not None and now - hit[0] < JAR_CACHE_SECONDS:
-            return hit[1]
-        _jar_cache.clear()
-    jar, _said = load_jar(config)
-    kept = _only(jar, SPOTDL_DOMAINS)
-    with _jar_lock:
-        _jar_cache.clear()
-        _jar_cache[key] = (now, kept)
-    return kept
+
+    def fresh() -> Any | None:
+        with _jar_lock:
+            hit = _jar_cache.get(key)
+            if hit is not None and time.monotonic() - hit[0] < JAR_CACHE_SECONDS:
+                return hit[1]
+            _jar_cache.clear()
+            return None
+
+    held = fresh()
+    if held is not None:
+        return held
+    with _fill_lock:
+        held = fresh()  # the reader before us may have filled it
+        if held is not None:
+            return held
+        jar, _said = load_jar(config)
+        kept = _only(jar, SPOTDL_DOMAINS)
+        with _jar_lock:
+            _jar_cache.clear()
+            _jar_cache[key] = (time.monotonic(), kept)
+        return kept
 
 
 def clear_jar_cache() -> None:

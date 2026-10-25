@@ -67,7 +67,7 @@ def main(argv: list[str]) -> int:
         print(AGE_GATE.format(id="fake"), file=sys.stderr, flush=True)
         return 1
     if mode() == "expired":  # the sign-in's cookies were rotated: YouTube takes them no more
-        if signed_in(args):
+        if signed_in(args) and "--no-warnings" not in args:  # yt-dlp prints no warning then
             print(EXPIRED, file=sys.stderr, flush=True)
         print(AGE_GATE.format(id="fake"), file=sys.stderr, flush=True)
         return 1
