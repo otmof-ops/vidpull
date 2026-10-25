@@ -21,14 +21,22 @@ All notable changes to vidpull are recorded here. The format follows
   answer is a sign-in request (the age gate, a private or a members-only video); a song whose
   lookup needed the sign-in is downloaded with it. `signin_use = always` signs in for every
   download. spotDL's own lookup of an upload YouTube refused is made once more signed in.
-- The Failed tab says how many of its entries need a YouTube sign-in and where to get one;
-  "The provided YouTube account cookies are no longer valid" reads "YouTube sign-in expired".
+- The Failed tab says how many of its entries need a YouTube sign-in and where to get one.
+  yt-dlp's warning that the account's cookies are no longer valid (rotated by the browser)
+  makes the download's reason "YouTube sign-in expired: sign in again" instead of the age
+  gate it would otherwise show, and the Failed tab says so.
+- A choice is kept only once its cookies hold a sign-in: `vidpull signin` and the Sign in
+  screen check first and save after, and a working sign-in is never replaced by one that does
+  not work; an expired sign-in reads as not signed in.
 
 ### Changed
 
 - A cookies file is handed to each yt-dlp or spotDL run as a private copy (yt-dlp writes the
-  file back when it is done, and two downloads at once would write the same file); the copy
-  and vidpull's own copy of an exported cookies file are readable by this user only.
+  file back when it is done, and two downloads at once would write the same file), written
+  from the parsed jar so that a row yt-dlp would reject is never echoed into a log; the copy,
+  vidpull's own copy of an exported cookies file and a song's `info.json` are readable by this
+  user only, and copies a killed process left behind are swept. spotDL is given the sign-in's
+  youtube.com cookies only.
 - yt-dlp's subprocess sees the desktop session variables it picks a Linux keyring by
   (`XDG_CURRENT_DESKTOP`, `DESKTOP_SESSION`, `KDE_SESSION_VERSION`, `KDE_FULL_SESSION`,
   `GNOME_DESKTOP_SESSION_ID`), so a Chromium-family browser's keyring-locked cookies decrypt

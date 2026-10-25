@@ -16,7 +16,7 @@ write the same file.
 from __future__ import annotations
 
 import contextlib
-import itertools
+import io
 import logging
 import os
 import re
@@ -25,7 +25,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,9 +61,9 @@ LABELS = {
 # the way yt-dlp reads BROWSER[+KEYRING][:PROFILE][::CONTAINER] (yt_dlp/options.py)
 _SPEC = re.compile(
     r"(?P<name>[^+:]+)(?:\s*\+\s*(?P<keyring>[^:]+))?"
-    r"(?:\s*:\s*(?!:)(?P<profile>.+?))?(?:\s*::\s*(?P<container>.+))?",
-    re.DOTALL,
+    r"(?:\s*:\s*(?!:)(?P<profile>.+?))?(?:\s*::\s*(?P<container>.+))?"
 )
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 # where a browser keeps its profiles on Linux: yt-dlp's own places, and the snap and flatpak
 # ones it does not know for the Chromium family ({config} is XDG_CONFIG_HOME)
 _FIREFOX_ROOTS = (
@@ -100,6 +102,7 @@ _CHROMIUM_ROOTS = {
         ("snap", "{home}/snap/vivaldi/current/.config/vivaldi"),
         ("flatpak", "{home}/.var/app/com.vivaldi.Vivaldi/config/vivaldi"),
     ),
+    "whale": (("system", "{config}/naver-whale"),),
 }
 # what YouTube says when a sign-in would help (yt-dlp passes its words on)
 _ASKS = (
@@ -117,10 +120,15 @@ _ASKS = (
     "join this channel",
 )
 # yt-dlp's words for a sign-in that is over: its cookies are not accepted any more
-_EXPIRED = ("cookies are no longer valid", "account cookies are no longer valid")
+_EXPIRED = ("cookies are no longer valid", "sign-in expired")
+EXPIRED_WORDS = "YouTube sign-in expired: sign in again"  # what vidpull says instead
 AUTH_COOKIES = ("SAPISID", "__Secure-1PAPISID", "__Secure-3PAPISID")
-SPOTDL_DOMAINS = ("youtube.com", "google.com")  # what spotDL's own yt-dlp is given
-_counter = itertools.count(1)
+SPOTDL_DOMAINS = ("youtube.com",)  # what spotDL's own yt-dlp is given: the sign-in, no more
+STALE_AFTER = 86400  # a private copy this old was left by a process that died
+JAR_CACHE_SECONDS = 120  # a run's export of the browser's jar is reused this long
+_URL = re.compile(r"https?://\S+")
+_jar_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
+_jar_lock = threading.Lock()
 
 
 class SigninError(Exception):
@@ -166,7 +174,7 @@ def parse_spec(text: str) -> Spec:
     a name or a path.
     """
     text = text.strip()
-    match = _SPEC.fullmatch(text) if text else None
+    match = _SPEC.fullmatch(text) if text and not _CONTROL.search(text) else None
     if match is None:
         raise SigninError("a browser is BROWSER[+KEYRING][:PROFILE][::CONTAINER]")
     name = match.group("name").strip().lower()
@@ -176,8 +184,6 @@ def parse_spec(text: str) -> Spec:
     if keyring is not None and keyring not in KEYRINGS:
         raise SigninError(f"{keyring!r} is no keyring yt-dlp knows; one of: {', '.join(KEYRINGS)}")
     profile = (match.group("profile") or "").strip() or None
-    if profile and "\n" in profile:
-        raise SigninError("a profile is a name or a path")
     container = (match.group("container") or "").strip() or None
     return Spec(name, keyring, profile, container)
 
@@ -311,20 +317,19 @@ def _keyring_used(database: Path) -> bool:
     """Whether a Chromium cookie database holds values the system keyring protects (v11).
 
     A browser started with ``--password-store=basic`` (Opera's snap, for one) writes v10
-    values, which need no keyring. The database is copied first: the browser has it open.
+    values, which need no keyring. The database is read in place, as immutable, so no
+    copy of it is made anywhere; the browser has it open, and a read that meets a write
+    half-way fails, which counts as "no keyring".
     """
     try:
-        with tempfile.TemporaryDirectory(prefix="vidpull-signin-") as tmp:
-            copy = Path(tmp) / "Cookies"
-            shutil.copyfile(database, copy)
-            con = sqlite3.connect(f"file:{copy}?mode=ro", uri=True)
-            try:
-                rows = con.execute(
-                    "SELECT substr(encrypted_value, 1, 3) FROM cookies "
-                    "WHERE length(encrypted_value) > 3 LIMIT 200"
-                ).fetchall()
-            finally:
-                con.close()
+        con = sqlite3.connect(f"file:{database}?mode=ro&immutable=1", uri=True)
+        try:
+            rows = con.execute(
+                "SELECT substr(encrypted_value, 1, 3) FROM cookies "
+                "WHERE length(encrypted_value) > 3 ORDER BY rowid DESC LIMIT 200"
+            ).fetchall()
+        finally:
+            con.close()
     except (OSError, sqlite3.Error):
         return False
     return any(bytes(row[0]) == b"v11" for row in rows if row[0] is not None)
@@ -380,10 +385,16 @@ def load_jar(config: Config) -> tuple[Any, list[str]]:
         if path is None or not path.is_file():
             raise SigninError(f"the cookies file is missing: {path or '(none)'}")
         jar = YoutubeDLCookieJar(str(path))
-        try:
-            jar.load()
-        except Exception as exc:
-            raise SigninError(f"{path} is no Netscape cookies file: {exc}") from exc
+        # a row the reader rejects is echoed, value and all: it stays out of every log
+        with contextlib.redirect_stderr(io.StringIO()), warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # the stdlib reports a rejected row as its own bug
+            try:
+                jar.load()
+            except Exception as exc:
+                raise SigninError(
+                    f"{path} cannot be read as a Netscape cookies file ({type(exc).__name__}): "
+                    "export it again from the browser"
+                ) from exc
         return jar, quiet.lines
     raise SigninError("no sign-in is set up")
 
@@ -453,16 +464,22 @@ def check(config: Config) -> Status:
         tail = f"; {failed}" if failed else ""
         return Status(True, False, f"{where} has no YouTube sign-in ({what}{tail}): {how}", source)
     left = expires_in(jar)
+    if left is not None and left <= 0:
+        return Status(
+            True, False, f"the YouTube sign-in of {source} has expired: sign in again", source
+        )
     when = ""
     if left is not None:
         when = (
-            " (expired: sign in again)"
-            if left <= 0
-            else f", good for {int(left // 86400)} days"
+            f", good for {int(left // 86400)} days"
             if left >= 2 * 86400
-            else f", good for {max(1, int(left // 3600))} hours"
+            else f", good for {_plural(max(1, int(left // 3600)), 'hour')}"
         )
     return Status(True, True, f"signed in to YouTube with {source}{when}", source)
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}" if count == 1 else f"{count} {word}s"
 
 
 def describe(config: Config) -> str:
@@ -491,7 +508,7 @@ def always(config: Config) -> bool:
 def asks_for_signin(text: str) -> bool:
     """Whether an error is the site asking for a sign-in: the age gate, a private or a
     members-only video, the "confirm you're not a bot" check."""
-    lowered = " ".join(text.lower().split())
+    lowered = " ".join(_URL.sub(" ", text).lower().split())  # a link may say "login" too
     return any(sign in lowered for sign in _ASKS)
 
 
@@ -502,35 +519,76 @@ def signin_expired(text: str) -> bool:
 
 # ------------------------------------------------------- what a run is given
 def _scratch(paths: Paths) -> Path:
+    """The folder of the private copies, this user's only. A copy a dead process left
+    behind (killed, powered off) is swept on the way in."""
     folder = paths.temp_dir / "signin"
     folder.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
         folder.chmod(0o700)
+    _sweep(folder)
     return folder
+
+
+def _sweep(folder: Path) -> None:
+    now = time.time()
+    for left in folder.iterdir():
+        pid = left.name.split("-", 1)[0]
+        dead = pid.isdigit() and int(pid) != os.getpid() and not _alive(int(pid))
+        old = now - _mtime(left) > STALE_AFTER
+        if dead or old:
+            with contextlib.suppress(OSError):
+                left.unlink()
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _private(paths: Paths, suffix: str) -> Path:
     """An empty file only this user can read, named for this process and this run."""
-    path = _scratch(paths) / f"{os.getpid()}-{next(_counter)}{suffix}"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    os.close(fd)
-    return path
+    try:
+        fd, name = tempfile.mkstemp(dir=_scratch(paths), prefix=f"{os.getpid()}-", suffix=suffix)
+    except OSError as exc:
+        raise SigninError(f"cannot write a private cookies file: {exc}") from exc
+    os.close(fd)  # mkstemp creates it 0600, O_EXCL, with a name nobody can guess
+    return Path(name)
+
+
+def _write_jar(jar: Any, path: Path, domains: tuple[str, ...] | None = None) -> None:
+    """``jar`` saved as a Netscape file at ``path``, which exists already with its mode;
+    with ``domains``, only the cookies of those sites and their subdomains."""
+    from yt_dlp.cookies import YoutubeDLCookieJar
+
+    kept = YoutubeDLCookieJar(str(path))
+    for cookie in jar:
+        domain = (cookie.domain or "").lower().lstrip(".")
+        if domains is None or any(domain == d or domain.endswith("." + d) for d in domains):
+            kept.set_cookie(cookie)
+    try:
+        kept.save()
+    except OSError as exc:
+        raise SigninError(f"cannot write a private cookies file: {exc}") from exc
 
 
 @contextlib.contextmanager
 def yt_dlp_args(config: Config, paths: Paths) -> Iterator[list[str]]:
     """The flags one yt-dlp run signs in with. A browser is read by yt-dlp itself; a
-    cookies file goes as a private copy that is deleted when the run is over."""
+    cookies file goes as a private copy, written from the parsed jar (a row yt-dlp would
+    reject is echoed into its log, value and all) and deleted when the run is over."""
     if config.signin == "browser" and config.signin_browser:
         yield ["--cookies-from-browser", parse_spec(config.signin_browser).text]
         return
     if config.signin == "file" and config.signin_file:
-        source = Path(config.signin_file).expanduser()
-        if not source.is_file():
-            raise SigninError(f"the cookies file is missing: {source}")
+        jar, _said = load_jar(config)
         copy = _private(paths, ".txt")
         try:
-            shutil.copyfile(source, copy)
+            _write_jar(jar, copy)
             yield ["--cookies", str(copy)]
         finally:
             copy.unlink(missing_ok=True)
@@ -538,42 +596,71 @@ def yt_dlp_args(config: Config, paths: Paths) -> Iterator[list[str]]:
     yield []
 
 
+def _cached_jar(config: Config) -> Any:
+    """The sign-in's jar, read again after ``JAR_CACHE_SECONDS``: a run of songs signed
+    in from the start would otherwise read the browser's database for every song."""
+    key = (config.signin, config.signin_browser, config.signin_file)
+    now = time.monotonic()
+    with _jar_lock:
+        hit = _jar_cache.get(key)
+        if hit is not None and now - hit[0] < JAR_CACHE_SECONDS:
+            return hit[1]
+        jar, _said = load_jar(config)
+        _jar_cache[key] = (now, jar)
+        return jar
+
+
 @contextlib.contextmanager
 def cookie_file(config: Config, paths: Paths) -> Iterator[Path | None]:
     """A Netscape cookies file for one spotDL run, which takes no browser: the sign-in's
-    youtube.com and google.com cookies, in a private file deleted when the run is over.
-    None when no sign-in is set up."""
+    youtube.com cookies, in a private file deleted when the run is over. None when no
+    sign-in is set up."""
     if not available(config):
         yield None
         return
-    jar, _said = load_jar(config)
+    jar = _cached_jar(config)
     copy = _private(paths, ".txt")
     try:
-        kept = type(jar)(str(copy))
-        for cookie in jar:
-            domain = (cookie.domain or "").lower().lstrip(".")
-            if any(domain == d or domain.endswith("." + d) for d in SPOTDL_DOMAINS):
-                kept.set_cookie(cookie)
-        kept.save()
+        _write_jar(jar, copy, SPOTDL_DOMAINS)
         yield copy
     finally:
         copy.unlink(missing_ok=True)
 
 
+def own_copy(paths: Paths) -> Path:
+    """Where vidpull keeps its copy of a cookies file the user pointed at."""
+    return paths.state_dir / COOKIES_NAME
+
+
 def keep_file(source: Path, paths: Paths) -> Path:
     """vidpull's own copy of a cookies file the user points at, in its state folder and
     readable by this user only, so the original may be deleted."""
+    target = own_copy(paths)
+    tmp = target.with_suffix(".tmp")
     if not source.is_file():
         raise SigninError(f"no such file: {source}")
-    target = paths.state_dir / COOKIES_NAME
-    paths.state_dir.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(".tmp")
-    tmp.unlink(missing_ok=True)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as out, source.open("rb") as inp:
-        shutil.copyfileobj(inp, out)
-    tmp.replace(target)
+    if source.resolve() == tmp.resolve():
+        raise SigninError(f"{source} is vidpull's own scratch file")
+    if source.resolve() == target.resolve():
+        return target
+    try:
+        paths.ensure_runtime_dirs()
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as out, source.open("rb") as inp:
+            shutil.copyfileobj(inp, out)
+        tmp.replace(target)
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        raise SigninError(f"cannot keep a copy of {source}: {exc}") from exc
     return target
+
+
+def forget_own_copy(paths: Paths) -> None:
+    """Deletes vidpull's copy of a cookies file, and its scratch file, if there."""
+    for path in (own_copy(paths), own_copy(paths).with_suffix(".tmp")):
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
 
 
 def open_youtube() -> bool:

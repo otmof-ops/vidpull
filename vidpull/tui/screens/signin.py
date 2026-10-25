@@ -26,6 +26,7 @@ INTRO = (
 )
 HINT = "Use this keeps the choice once it holds a sign-in · Check only tells · esc cancels"
 USES = (("when a site asks for a sign-in", "when-asked"), ("for every download", "always"))
+USE_NOTE = "YouTube may limit an account that downloads a lot: signed out is the default."
 PLACE_BROWSER = "firefox · chrome · opera:~/snap/opera/current/.config/opera · chrome+kwallet6"
 PLACE_FILE = "~/Downloads/cookies.txt, exported from a browser with a cookies.txt extension"
 
@@ -96,6 +97,7 @@ class SigninScreen(ModalScreen[Config | None]):
                     yield Select(
                         list(USES), value=config.signin_use, allow_blank=False, id="signin-use"
                     )
+                yield Static(Text(USE_NOTE), classes="hint")
             yield Static(Text(""), id="signin-result")
             with Horizontal(classes="buttons"):
                 yield Button("Use this", id="use", variant="primary")
@@ -108,16 +110,18 @@ class SigninScreen(ModalScreen[Config | None]):
         self.query_one("#signin-choice", RadioSet).focus()
 
     # ------------------------------------------------------------ the choice
-    def _choice(self, *, keep: bool) -> Config | str:
+    def _choice(self, key: str | None = None) -> Config | str:
         """A copy of the config with the choice applied, or what is wrong with the choice.
-        ``keep`` copies a cookies file into vidpull's state folder; a check reads it where
-        it is."""
-        pressed = self.query_one("#signin-choice", RadioSet).pressed_button
-        if pressed is None:
-            return "pick a browser, a cookies file, or off"
+        ``key`` names the radio button to read instead of the pressed one: a key pressed in
+        an input box chooses its button, which the radio set learns of a moment later. A
+        cookies file is read where it is; it is kept once it holds a sign-in."""
+        if key is None:
+            pressed = self.query_one("#signin-choice", RadioSet).pressed_button
+            if pressed is None:
+                return "pick a browser, a cookies file, or off"
+            key = pressed.id or ""
         trial = Config(**self.config.to_dict())
         trial.signin_use = str(self.query_one("#signin-use", Select).value)
-        key = pressed.id or ""
         if key == "off":
             trial.signin = "off"
         elif key == "file":
@@ -127,11 +131,6 @@ class SigninScreen(ModalScreen[Config | None]):
             path = Path(raw).expanduser()
             if not path.is_file():
                 return f"no such file: {path}"
-            if keep and path != self.paths.state_dir / signin.COOKIES_NAME:
-                try:
-                    path = signin.keep_file(path, self.paths)
-                except (SigninError, OSError) as exc:
-                    return str(exc)
             trial.signin, trial.signin_file = "file", str(path)
         elif key == "other":
             raw = self.query_one("#signin-browser", Input).value.strip()
@@ -156,15 +155,18 @@ class SigninScreen(ModalScreen[Config | None]):
         for button_id in ("use", "check"):
             self.query_one(f"#{button_id}", Button).disabled = busy
 
-    def _start(self, *, use: bool) -> None:
+    def _start(self, *, use: bool, key: str | None = None) -> None:
         if self._busy:
             return
-        choice = self._choice(keep=use)
+        choice = self._choice(key)
         if isinstance(choice, str):
             self._say(choice, good=False)
             return
         if choice.signin == "off":
             if use:
+                signin.forget_own_copy(self.paths)
+                if choice.signin_file == str(signin.own_copy(self.paths)):
+                    choice.signin_file = ""
                 self.dismiss(choice)
             else:
                 self._say("off: downloads are made signed out", good=True)
@@ -173,7 +175,10 @@ class SigninScreen(ModalScreen[Config | None]):
         self._say("checking…", good=True)
 
         def work() -> None:
-            status = signin.check(choice)
+            try:
+                status = signin.check(choice)
+            except Exception as exc:  # the check must never take the app down
+                status = Status(False, False, f"cannot check the sign-in: {exc}")
             self.app.call_from_thread(self._checked, choice, status, use)
 
         self.run_worker(work, thread=True, exclusive=True, group="signin-check")
@@ -181,6 +186,16 @@ class SigninScreen(ModalScreen[Config | None]):
     def _checked(self, choice: Config, status: Status, use: bool) -> None:
         self._set_busy(False)
         if status.signed_in and use:
+            if choice.signin == "file":
+                try:  # kept only now, once it holds a sign-in
+                    choice.signin_file = str(signin.keep_file(Path(choice.signin_file), self.paths))
+                except SigninError as exc:
+                    self._say(str(exc), good=False)
+                    return
+            else:
+                signin.forget_own_copy(self.paths)  # a credential nothing points at any more
+                if choice.signin_file == str(signin.own_copy(self.paths)):
+                    choice.signin_file = ""
             self.dismiss(choice)
             return
         self._say(status.detail, good=status.signed_in)
@@ -197,9 +212,11 @@ class SigninScreen(ModalScreen[Config | None]):
     @on(Input.Submitted, "#signin-browser")
     @on(Input.Submitted, "#signin-file")
     def _entered(self, event: Input.Submitted) -> None:
+        """Enter in a box chooses its button and uses it; the radio set learns of the
+        choice a moment later, so the button is named outright."""
         target = "other" if event.input.id == "signin-browser" else "file"
         self.query_one(f"#{target}", RadioButton).value = True
-        self._start(use=True)
+        self._start(use=True, key=target)
 
     @on(Button.Pressed, "#open")
     def _open(self) -> None:

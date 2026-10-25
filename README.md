@@ -198,11 +198,12 @@ youtube.com in your browser to sign in there first. A browser installed as a sna
 flatpak is found too. Then **Retry all** on the Failed tab tries what needed the sign-in.
 
 In a terminal: `vidpull signin` lists the browsers found and says whether the sign-in works,
-`vidpull signin --browser auto` takes the default browser (`--browser firefox`, `opera`,
-`chrome`, `chromium`, `brave`, `edge`, `vivaldi`, or yt-dlp's `BROWSER[+KEYRING][:PROFILE]`),
-`vidpull signin --file ~/Downloads/cookies.txt` takes a cookies file exported from a browser
-(vidpull keeps a private copy of it), and `vidpull signout` forgets it. `vidpull doctor` has a
-`sign-in` row.
+`vidpull signin --browser auto` takes the first browser found that is signed in to YouTube
+(`--browser firefox`, `opera`, `chrome`, `chromium`, `brave`, `edge`, `vivaldi`, or yt-dlp's
+`BROWSER[+KEYRING][:PROFILE]`), `vidpull signin --file ~/Downloads/cookies.txt` takes a cookies
+file exported from a browser (vidpull keeps a private copy of it), and `vidpull signout`
+forgets it. A choice is kept only once its cookies hold a sign-in, so a working sign-in is
+never replaced by one that does not work. `vidpull doctor` has a `sign-in` row.
 
 The sign-in is used only when a site asks for it: a download is made signed out first, and
 again signed in when the answer is "sign in to confirm your age" (or a private or members-only

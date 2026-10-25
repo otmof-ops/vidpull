@@ -195,6 +195,8 @@ class Config:
         if problem:
             log.warning("config: %s; signin is off", problem)
             self.signin = "off"
+            if problem.startswith("signin_browser"):
+                self.signin_browser = ""  # a browser yt-dlp does not read blocks nothing else
         self.stage_size = max(0, min(int(self.stage_size), 1000))
         self.stage_pause = max(0, min(int(self.stage_pause), 3600))
         if self.container not in CONTAINERS:
@@ -221,13 +223,30 @@ class Config:
         if key not in known:
             raise KeyError(key)
         value = _coerce_str(known[key].type, raw, key)
-        if key.startswith("signin"):
+        if key in {"signin", "signin_browser", "signin_file"}:
             trial = Config(**{**self.to_dict(), key: value})
             problem = signin_problem(trial)
             if problem:
                 raise ValueError(problem)
         setattr(self, key, value)
         self.validate()
+
+    def with_changes(self, changes: dict[str, str]) -> Config:
+        """A copy with every change applied from its command-line string, judged
+        together: a form saves its fields at once, and the sign-in's mode is right or
+        wrong only beside its browser or its file."""
+        known = {f.name: f for f in fields(self)}
+        values = self.to_dict()
+        for key, raw in changes.items():
+            if key not in known:
+                raise KeyError(key)
+            values[key] = _coerce_str(known[key].type, raw, key)
+        updated = Config(**values)
+        problem = signin_problem(updated)
+        if problem:
+            raise ValueError(problem)
+        updated.validate()
+        return updated
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

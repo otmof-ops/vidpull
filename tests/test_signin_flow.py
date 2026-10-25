@@ -11,7 +11,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from textual.widgets import Button, RadioButton, Static
+from textual.widgets import Button, Input, RadioButton, Static
 
 from tests.cookiejars import chromium_profile, firefox_profile, netscape_file
 from tests.helpers import FakeEngine
@@ -187,14 +187,42 @@ def test_cli_signin_with_a_file_keeps_a_private_copy(capsys, paths, tmp_path):
     assert "signed in to YouTube with cookies file" in capsys.readouterr().out
     assert cli.main(["signout"]) == 0
     assert not kept.exists() and Config.load(paths.config_file).signin_file == ""
-    assert cli.main(["signin", "--file", str(tmp_path / "none.txt")]) == 1
+    assert cli.main(["signin", "--file", str(tmp_path / "none.txt")]) == 2
 
 
-def test_cli_signin_without_a_sign_in_says_so(capsys, paths, isolated_home):
+def test_cli_signin_keeps_nothing_that_holds_no_sign_in(capsys, paths, isolated_home, tmp_path):
     firefox_profile(isolated_home / ".mozilla" / "firefox", signed_in=False)
     assert cli.main(["signin", "--browser", "firefox"]) == 1
-    assert "has no YouTube sign-in" in capsys.readouterr().out
-    assert Config.load(paths.config_file).signin == "browser"  # sign in there, and it works
+    out = capsys.readouterr().out
+    assert "has no YouTube sign-in" in out and "nothing changed" in out
+    assert not paths.config_file.exists() or Config.load(paths.config_file).signin == "off"
+    # a working sign-in is never replaced by one that does not work
+    working = netscape_file(tmp_path / "ok.txt")
+    assert cli.main(["signin", "--file", str(working)]) == 0
+    assert cli.main(["signin", "--browser", "firefox"]) == 1
+    assert "the sign-in set up before stays" in capsys.readouterr().out
+    saved = Config.load(paths.config_file)
+    assert saved.signin == "file" and (paths.state_dir / "cookies.txt").exists()
+    # auto with nothing signed in names the browsers and keeps nothing
+    assert cli.main(["signin", "--browser", "auto"]) == 1
+    assert "none of the browsers found here (Firefox) is signed in" in capsys.readouterr().err
+    assert Config.load(paths.config_file).signin == "file"
+    # switching to a browser drops the kept copy, a credential nothing points at any more
+    firefox_profile(isolated_home / ".mozilla" / "firefox", signed_in=True)
+    assert cli.main(["signin", "--browser", "firefox"]) == 0
+    saved = Config.load(paths.config_file)
+    assert saved.signin == "browser" and saved.signin_file == ""
+    assert not (paths.state_dir / "cookies.txt").exists()
+
+
+def test_cli_signin_use_alone_needs_a_sign_in(capsys, paths, isolated_home):
+    assert cli.main(["signin", "--always"]) == 2
+    assert "choose --browser or --file first" in capsys.readouterr().err
+    firefox_profile(isolated_home / ".mozilla" / "firefox")
+    assert cli.main(["signin", "--browser", "firefox"]) == 0
+    assert cli.main(["signin", "--always"]) == 0
+    assert Config.load(paths.config_file).signin_use == "always"
+    assert "for every download" in capsys.readouterr().out
 
 
 def test_cli_get_flags_hold_for_the_run(monkeypatch, capsys, paths, video_info, tmp_path):
@@ -222,6 +250,53 @@ def test_cli_get_flags_hold_for_the_run(monkeypatch, capsys, paths, video_info, 
     Config(signin="browser", signin_browser="firefox").save(paths.config_file)
     assert cli.main(["get", URL, "--no-signin"]) == 0
     assert seen["signin"] == "off"
+    with pytest.raises(SystemExit) as stop:  # one session per run
+        cli.main(["get", URL, "--no-signin", "--cookies", str(jar)])
+    assert stop.value.code == 2
+
+
+def test_an_expired_sign_in_is_named(gated, config, paths, tmp_path):
+    engine, calls = gated
+    (Path(engine.python).parent / "mode").write_text("expired")
+    config.signin, config.signin_browser = "browser", "firefox"
+    result, logs = _run(engine, paths, tmp_path / "dl")
+    assert not result.ok and result.error.startswith("YouTube sign-in expired: sign in again")
+    assert "confirm your age" in result.error and len(calls()) == 2
+    assert brief_reason(result.error) == "YouTube sign-in expired: sign in again"
+    assert any("no longer valid" in message for _, message in logs)
+    with pytest.raises(ProbeError, match="^YouTube sign-in expired"):
+        engine.probe_json(URL)
+
+
+def test_spotdl_looks_again_signed_in_for_an_upload_youtube_refused(tmp_path, config, paths):
+    import json as _json
+    import shutil as _shutil
+
+    from vidpull.spotdl import SpotdlEngine, song_from_spotdl
+
+    script_dir = tmp_path / "fake-spotdl"
+    script_dir.mkdir()
+    _shutil.copy(Path(__file__).parent / "fake_spotdl.py", script_dir / "fake_spotdl.py")
+    _shutil.copytree(FIXTURES, script_dir / "fixtures")
+    (script_dir / "fake_spotdl.py").chmod(0o755)
+    (script_dir / "mode").write_text("refused")
+    config.signin, config.signin_file = "file", str(netscape_file(tmp_path / "c.txt"))
+    engine = SpotdlEngine(
+        config,
+        paths,
+        python=str(script_dir / "fake_spotdl.py"),
+        visibility=lambda link: True,
+        match_delays=(0, 0, 0),
+    )
+    song = song_from_spotdl(_json.loads((FIXTURES / "spotdl_track.json").read_text())[0])
+    notes: list[str] = []
+    match = engine.match(song, report=notes.append)
+    assert match is not None and match.url.startswith("https://")
+    assert (script_dir / "runs").read_text() == "2"  # signed out, then signed in: no third
+    assert notes == ["YouTube refused the upload: trying again signed in with cookies file"]
+    args = _json.loads((script_dir / "last-args.json").read_text())
+    assert "--cookie-file" in args and not Path(args[args.index("--cookie-file") + 1]).exists()
+    assert (script_dir / "cookie-hosts").read_text().splitlines() == [".youtube.com"]
 
 
 class GatedEngine(FakeEngine):
@@ -243,17 +318,18 @@ def test_doctor_row(isolated_home):
     firefox_profile(isolated_home / ".mozilla" / "firefox")
     row = _signin_check(Config(signin="browser", signin_browser="firefox"))
     assert row.status == "ok" and "signed in to YouTube with Firefox" in row.detail
-    assert _signin_check(Config(signin="browser", signin_browser="chrome")).status == "fail"
     firefox_profile(isolated_home / ".mozilla" / "firefox", signed_in=False)
     assert _signin_check(Config(signin="browser", signin_browser="firefox")).status == "warn"
 
 
 def test_brief_reason_for_an_expired_sign_in():
-    text = (
-        "ERROR: [youtube] x: The provided YouTube account cookies are no longer valid. "
-        "They have likely been rotated in the browser as a security measure."
-    )
+    text = f"YouTube sign-in expired: sign in again. [youtube] x: {AGE_GATE}"
     assert brief_reason(text) == "YouTube sign-in expired: sign in again"
+    assert brief_reason(f"[youtube] x: {AGE_GATE}") == "age-restricted: needs a YouTube sign-in"
+
+
+def test_doctor_row_warns_but_never_fails(isolated_home):
+    assert _signin_check(Config(signin="browser", signin_browser="chrome")).status == "warn"
 
 
 # --------------------------------------------------------------------- TUI
@@ -284,7 +360,7 @@ def test_tui_signs_in_with_a_found_browser_and_out_again(
     async def flow():
         async with app.run_test(size=(132, 50)) as pilot:
             await pilot.press("escape")
-            assert "not signed in (y)" in _text(app.query_one("#status", Static))
+            assert "sign-in: off (y)" in _text(app.query_one("#status", Static))
             app.query_one("#signin", Button).press()
             assert await until(pilot, lambda: isinstance(app.screen, SigninScreen))
             screen = app.screen
@@ -298,7 +374,7 @@ def test_tui_signs_in_with_a_found_browser_and_out_again(
             assert (config.signin, config.signin_browser) == ("browser", "firefox")
             assert Config.load(paths.config_file).signin == "browser"
             assert await until(
-                pilot, lambda: "signed in: Firefox" in _text(app.query_one("#status", Static))
+                pilot, lambda: "sign-in: Firefox" in _text(app.query_one("#status", Static))
             )
             await pilot.press("y")
             assert await until(pilot, lambda: isinstance(app.screen, SigninScreen))
@@ -308,8 +384,95 @@ def test_tui_signs_in_with_a_found_browser_and_out_again(
             assert await until(pilot, lambda: not isinstance(app.screen, SigninScreen))
             assert config.signin == "off"
             assert await until(
-                pilot, lambda: "not signed in (y)" in _text(app.query_one("#status", Static))
+                pilot, lambda: "sign-in: off (y)" in _text(app.query_one("#status", Static))
             )
+
+    asyncio.run(flow())
+
+
+def test_tui_enter_in_a_box_uses_that_box(config, paths, store, isolated_home, tmp_path):
+    """Enter in the browser box or the file box chooses that box, not the radio button
+    that was selected before (the first browser is preselected)."""
+    firefox_profile(isolated_home / ".mozilla" / "firefox")
+    good = netscape_file(tmp_path / "good.txt")
+    app = make_app(config, paths, store, FakeEngine())
+
+    async def flow():
+        async with app.run_test(size=(132, 50)) as pilot:
+            await pilot.press("escape")
+            await pilot.press("y")
+            assert await until(pilot, lambda: isinstance(app.screen, SigninScreen))
+            screen = app.screen
+            result = screen.query_one("#signin-result", Static)
+            box = screen.query_one("#signin-browser", Input)
+            box.value = "netscape"
+            box.focus()
+            await pilot.press("enter")
+            assert await until(pilot, lambda: "no browser yt-dlp reads" in _text(result))
+            assert isinstance(app.screen, SigninScreen) and config.signin == "off"
+            missing = screen.query_one("#signin-file", Input)
+            missing.value = str(tmp_path / "none.txt")
+            missing.focus()
+            await pilot.press("enter")
+            assert await until(pilot, lambda: "no such file" in _text(result))
+            assert not (paths.state_dir / "cookies.txt").exists()
+            missing.value = str(good)
+            await pilot.press("enter")
+            assert await until(pilot, lambda: not isinstance(app.screen, SigninScreen))
+            kept = paths.state_dir / "cookies.txt"
+            assert config.signin == "file" and config.signin_file == str(kept) and kept.exists()
+            assert stat.S_IMODE(kept.stat().st_mode) == 0o600
+
+    asyncio.run(flow())
+
+
+def test_tui_a_file_that_fails_its_check_is_not_kept(config, paths, store, tmp_path):
+    out = netscape_file(tmp_path / "out.txt", signed_in=False)
+    app = make_app(config, paths, store, FakeEngine())
+
+    async def flow():
+        async with app.run_test(size=(132, 50)) as pilot:
+            await pilot.press("escape")
+            await pilot.press("y")
+            assert await until(pilot, lambda: isinstance(app.screen, SigninScreen))
+            screen = app.screen
+            screen.query_one("#file", RadioButton).value = True
+            screen.query_one("#signin-file", Input).value = str(out)
+            screen.query_one("#use", Button).press()
+            result = screen.query_one("#signin-result", Static)
+            assert await until(pilot, lambda: "has no YouTube sign-in" in _text(result))
+            assert not (paths.state_dir / "cookies.txt").exists() and config.signin == "off"
+            await pilot.press("escape")
+
+    asyncio.run(flow())
+
+
+def test_tui_settings_turn_the_sign_in_off_in_one_save(config, paths, store):
+    from textual.widgets import Select
+
+    from vidpull.tui.screens.settings import SettingsScreen
+
+    config.signin, config.signin_browser = "browser", "firefox"
+    app = make_app(config, paths, store, FakeEngine())
+
+    async def flow():
+        async with app.run_test(size=(132, 50)) as pilot:
+            await pilot.press("escape")
+            await pilot.press("s")
+            assert await until(pilot, lambda: isinstance(app.screen, SettingsScreen))
+            screen = app.screen
+            screen.query_one("#f-signin", Select).value = "off"
+            screen.query_one("#f-signin_browser", Input).value = ""
+            screen.query_one("#save", Button).press()
+            assert await until(pilot, lambda: not isinstance(app.screen, SettingsScreen))
+            assert config.signin == "off" and config.signin_browser == ""
+            await pilot.press("s")
+            assert await until(pilot, lambda: isinstance(app.screen, SettingsScreen))
+            app.screen.query_one("#f-signin", Select).value = "browser"
+            app.screen.query_one("#save", Button).press()
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, SettingsScreen)  # refused: no browser named
+            await pilot.press("escape")
 
     asyncio.run(flow())
 
@@ -360,5 +523,15 @@ def test_tui_failed_tab_points_at_the_sign_in(config, paths, store):
             config.signin_browser = "opera:/x/snap/opera/current/.config/opera"
             app._reload_failed(force=True)
             assert "signed in with Opera (snap)" in _text(hint)
+            store.add(
+                Job(
+                    url=URL + "2",
+                    selection=Selection(SelectionKind.PRESET, "best", "Best"),
+                    status=JobStatus.FAILED,
+                    error=f"YouTube sign-in expired: sign in again. [youtube] x: {AGE_GATE}",
+                )
+            )
+            app._reload_failed(force=True)
+            assert "sign-in expired for 1: y signs in again" in _text(hint)
 
     asyncio.run(flow())

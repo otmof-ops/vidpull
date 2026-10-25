@@ -472,6 +472,7 @@ class SpotdlEngine:
                 # own yt-dlp reads the upload's page when it has found it, and an
                 # age-restricted upload needs the sign-in there too
                 signed = True
+                number += 1  # the signed attempt counts: the same two attempts as before
                 who = describe(self.config)
                 _tell(report, f"YouTube refused the upload: trying again signed in with {who}")
                 continue

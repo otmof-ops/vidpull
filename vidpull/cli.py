@@ -146,16 +146,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     get.add_argument("-o", "--output-dir", metavar="DIR", help="download directory for this run")
     get.add_argument("-j", "--jobs", type=int, metavar="N", help="parallel downloads for this run")
-    get.add_argument(
+    session = get.add_mutually_exclusive_group()
+    session.add_argument(
         "--cookies-from-browser",
         metavar="BROWSER",
         help="sign in with this browser's session for this run (BROWSER[+KEYRING][:PROFILE]); "
         "`vidpull signin` keeps one",
     )
-    get.add_argument(
+    session.add_argument(
         "--cookies", metavar="FILE", help="sign in with this Netscape cookies.txt for this run"
     )
-    get.add_argument(
+    session.add_argument(
         "--no-signin", action="store_true", help="download signed out, whatever is set up"
     )
     get.set_defaults(func=cmd_get)
@@ -170,7 +171,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--browser",
         metavar="BROWSER",
         help="a browser you are signed in to YouTube with: firefox, chrome, chromium, brave, "
-        "edge, opera, vivaldi, or BROWSER[+KEYRING][:PROFILE]; 'auto' takes the default one",
+        "edge, opera, vivaldi, or BROWSER[+KEYRING][:PROFILE]; 'auto' takes the first browser "
+        "found here that holds a YouTube sign-in",
     )
     way.add_argument(
         "--file",
@@ -364,7 +366,7 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
         ctx.config.signin, ctx.config.signin_browser = "browser", spec.text
         ctx.config.signin_use = "always"
     if args.cookies:
-        cookies = Path(args.cookies).expanduser()
+        cookies = Path(args.cookies).expanduser().resolve()
         if not cookies.is_file():
             print(f"error: --cookies: no such file: {cookies}", file=sys.stderr)
             return EXIT_USAGE
@@ -1169,39 +1171,65 @@ def cmd_queue_log(args: argparse.Namespace, ctx: Context) -> int:
 
 def cmd_signin(args: argparse.Namespace, ctx: Context) -> int:
     """Set up the sign-in, or report on it: `vidpull signin` alone says whether the cookies
-    hold a YouTube sign-in and lists the browsers found on this machine."""
+    hold a YouTube sign-in and lists the browsers found on this machine. A choice is kept
+    only once its cookies hold a sign-in: a working sign-in is never replaced by one that
+    does not work."""
     from vidpull import signin
 
     config = ctx.config
-    changing = bool(args.browser or args.file or args.always or args.when_asked)
+    choosing = bool(args.browser or args.file)
+    if not choosing and (args.always or args.when_asked) and config.signin == "off":
+        print("error: choose --browser or --file first", file=sys.stderr)
+        return EXIT_USAGE
+    trial = Config(**config.to_dict())
+    if args.always:
+        trial.signin_use = "always"
+    elif args.when_asked:
+        trial.signin_use = "when-asked"
+    source: Path | None = None
     if args.browser:
         spec = _browser_spec(args.browser)
         if spec is None:
             return EXIT_FAILURE
-        config.signin, config.signin_browser = "browser", spec
+        trial.signin, trial.signin_browser = "browser", spec
     elif args.file:
-        try:
-            kept = signin.keep_file(Path(args.file).expanduser(), ctx.paths)
-        except (SigninError, OSError) as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return EXIT_FAILURE
-        config.signin, config.signin_file = "file", str(kept)
-    if args.always:
-        config.signin_use = "always"
-    elif args.when_asked:
-        config.signin_use = "when-asked"
-    if changing:
-        problem = signin_problem(config)
-        if problem:
-            print(f"error: {problem}", file=sys.stderr)
+        source = Path(args.file).expanduser()
+        if not source.is_file():
+            print(f"error: --file: no such file: {source}", file=sys.stderr)
             return EXIT_USAGE
+        trial.signin, trial.signin_file = "file", str(source)  # checked where it is
+    problem = signin_problem(trial)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_USAGE
+    status = signin.check(trial)
+    if choosing and not status.signed_in:
+        print(f"sign-in: {status.detail}")
+        print(
+            "nothing changed"
+            + (": the sign-in set up before stays" if config.signin != "off" else "")
+        )
+        return EXIT_FAILURE
+    if choosing or args.always or args.when_asked:
+        if source is not None:
+            try:
+                trial.signin_file = str(signin.keep_file(source, ctx.paths))
+            except SigninError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return EXIT_FAILURE
+        elif trial.signin != "file":
+            signin.forget_own_copy(ctx.paths)  # a credential nothing points at any more
+            trial.signin_file = (
+                "" if config.signin_file == str(signin.own_copy(ctx.paths)) else trial.signin_file
+            )
+        config.__dict__.update(trial.__dict__)
         config.save(ctx.paths.config_file)
-    status = signin.check(config)
+        status = signin.check(config) if source is not None else status
     print(f"sign-in: {status.detail}")
     if config.signin != "off":
         when = "for every download" if config.signin_use == "always" else "when a site asks for one"
         print(f"used: {when}")
-    if not changing:
+    if not choosing:
         found = signin.found_browsers()
         if found:
             print("browsers on this machine:")
@@ -1221,9 +1249,8 @@ def cmd_signin(args: argparse.Namespace, ctx: Context) -> int:
 
 def _browser_spec(given: str) -> str | None:
     """The spec for `--browser`: 'auto' is the first browser found here that is signed in
-    to YouTube (the default browser when none is); a bare name takes the install of that
-    browser found here (a snap's folder spelled out); anything else is handed on as it
-    is, once yt-dlp would accept it."""
+    to YouTube; a bare name takes the install of that browser found here (a snap's folder
+    spelled out); anything else is handed on as it is, once yt-dlp would accept it."""
     from vidpull import signin
 
     found = signin.found_browsers()
@@ -1234,12 +1261,17 @@ def _browser_spec(given: str) -> str | None:
                 file=sys.stderr,
             )
             return None
-        # the first browser that holds a YouTube sign-in; the default browser otherwise
         for browser in found:
             trial = Config(signin="browser", signin_browser=browser.spec)
             if signin.check(trial).signed_in:
                 return browser.spec
-        return found[0].spec
+        names = ", ".join(browser.label for browser in found)
+        print(
+            f"error: none of the browsers found here ({names}) is signed in to YouTube: open "
+            "youtube.com in one, sign in, then run this again",
+            file=sys.stderr,
+        )
+        return None
     try:
         spec = parse_spec(given)
     except SigninError as exc:
@@ -1251,20 +1283,19 @@ def _browser_spec(given: str) -> str | None:
         if browser.name == spec.name:
             return browser.spec
     print(
-        f"note: no {spec.label} profile was found where yt-dlp looks; it is set anyway",
+        f"note: no {spec.label} profile was found where yt-dlp looks; it is tried anyway",
         file=sys.stderr,
     )
     return spec.text
 
 
 def cmd_signout(args: argparse.Namespace, ctx: Context) -> int:
-    from vidpull.signin import COOKIES_NAME
+    from vidpull import signin
 
     config = ctx.config
-    own = ctx.paths.state_dir / COOKIES_NAME
-    if config.signin_file and Path(config.signin_file).expanduser() == own:
-        own.unlink(missing_ok=True)  # vidpull's copy of the cookies: a credential
+    if config.signin_file == str(signin.own_copy(ctx.paths)):
         config.signin_file = ""
+    signin.forget_own_copy(ctx.paths)  # vidpull's copy of the cookies: a credential
     config.signin = "off"
     config.save(ctx.paths.config_file)
     print("signed out: downloads are made signed out")

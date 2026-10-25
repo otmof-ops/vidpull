@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -30,7 +32,7 @@ def test_parse_spec_the_way_yt_dlp_reads_it():
     assert (
         parse_spec("brave:/home/x/.var/app/com.brave.Browser/config/x").label == "Brave (flatpak)"
     )
-    for bad in ("", "firefox; rm -rf /", "netscape", "chrome+foo", "+kwallet"):
+    for bad in ("", "firefox; rm -rf /", "netscape", "chrome+foo", "+kwallet", "firefox::a\nb"):
         with pytest.raises(SigninError):
             parse_spec(bad)
 
@@ -100,7 +102,7 @@ def test_check_names_what_is_wrong(isolated_home, tmp_path):
     bad = tmp_path / "bad.txt"
     bad.write_text("not a cookie file\n")
     broken = signin.check(Config(signin="file", signin_file=str(bad)))
-    assert not broken.ok and "no Netscape cookies file" in broken.detail
+    assert not broken.ok and "cannot be read as a Netscape cookies file" in broken.detail
 
 
 def test_check_reads_a_cookies_file(tmp_path):
@@ -124,7 +126,9 @@ def test_yt_dlp_args_hand_a_browser_on_and_copy_a_file(paths, tmp_path):
         assert (
             args[0] == "--cookies" and copy != master and copy.parent == paths.temp_dir / "signin"
         )
-        assert stat.S_IMODE(copy.stat().st_mode) == 0o600 and copy.read_text() == before
+        assert stat.S_IMODE(copy.stat().st_mode) == 0o600
+        rows = lambda text: sorted(line for line in text.splitlines() if line and line[0] != "#")  # noqa: E731
+        assert rows(copy.read_text()) == rows(before)  # written from the parsed jar: same rows
         copy.write_text("rotated by yt-dlp\n")
     assert not copy.exists() and master.read_text() == before
     gone = Config(signin="file", signin_file=str(tmp_path / "x"))
@@ -139,8 +143,67 @@ def test_cookie_file_for_spotdl_keeps_google_and_youtube_only(isolated_home, pat
     with signin.cookie_file(Config(signin="browser", signin_browser="firefox"), paths) as path:
         assert path is not None and stat.S_IMODE(path.stat().st_mode) == 0o600
         text = path.read_text()
-        assert "LOGIN_INFO" in text and ".google.com" in text and "example.com" not in text
+        assert "LOGIN_INFO" in text and ".youtube.com" in text
+        assert ".google.com" not in text and "example.com" not in text  # the sign-in, no more
     assert not path.exists()
+
+
+def test_a_cookies_file_row_the_reader_rejects_stays_out_of_every_word(paths, tmp_path, capsys):
+    """yt-dlp echoes a row it rejects, value and all: the copy a run gets is written from
+    the parsed jar, and the reason for an unreadable file names no row."""
+    jar = netscape_file(tmp_path / "cookies.txt")
+    with jar.open("a") as out:
+        out.write(".youtube.com\tTRUE\t/\tTRUE\tnot-a-number\tSECRETNAME\tCANARY-VALUE-123\n")
+    config = Config(signin="file", signin_file=str(jar))
+    with signin.yt_dlp_args(config, paths) as args:
+        copy = Path(args[1]).read_text()
+        assert "LOGIN_INFO" in copy and "CANARY-VALUE-123" not in copy
+    broken = tmp_path / "broken.txt"
+    broken.write_text(
+        "# Netscape HTTP Cookie File\nyoutube.com\tTRUE\t/\tTRUE\t0\tX\tCANARY-VALUE-456\n"
+    )
+    status = signin.check(Config(signin="file", signin_file=str(broken)))
+    assert not status.ok and "CANARY" not in status.detail
+    assert "CANARY" not in capsys.readouterr().err
+
+
+def test_an_expired_sign_in_is_not_one(tmp_path):
+    jar = netscape_file(tmp_path / "old.txt")
+    text = jar.read_text().splitlines()
+    old = str(int(time.time()) - 3600)
+    jar.write_text("\n".join(re.sub(r"\t\d{10}\t", f"\t{old}\t", line) for line in text) + "\n")
+    status = signin.check(Config(signin="file", signin_file=str(jar)))
+    assert status.ok and not status.signed_in and "has expired: sign in again" in status.detail
+
+
+def test_private_copies_of_dead_processes_are_swept(paths, monkeypatch):
+    folder = paths.temp_dir / "signin"
+    folder.mkdir(parents=True)
+    dead = folder / "999999-abc.txt"
+    dead.write_text("x")
+    old = folder / "notapid.txt"
+    old.write_text("x")
+    os.utime(old, (time.time() - 2 * 86400, time.time() - 2 * 86400))
+    mine = signin._private(paths, ".txt")
+    assert mine.exists() and not dead.exists() and not old.exists()
+    assert stat.S_IMODE(mine.stat().st_mode) == 0o600
+
+
+def test_asks_for_signin_ignores_links():
+    assert not signin.asks_for_signin("HTTP Error 404: https://example.com/login/next")
+    assert signin.asks_for_signin("Sign in to confirm you're not a bot. https://x/y")
+
+
+def test_keep_file_refuses_its_own_scratch_file(paths, tmp_path):
+    source = netscape_file(tmp_path / "exported.txt")
+    kept = signin.keep_file(source, paths)
+    scratch = kept.with_suffix(".tmp")
+    scratch.write_text("half")
+    with pytest.raises(SigninError, match="scratch"):
+        signin.keep_file(scratch, paths)
+    assert kept.read_text() == source.read_text()
+    signin.forget_own_copy(paths)
+    assert not kept.exists() and not scratch.exists()
 
 
 def test_keep_file_makes_a_private_copy(paths, tmp_path):

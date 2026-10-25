@@ -102,18 +102,17 @@ class SettingsScreen(ModalScreen[Config | None]):
 
     @on(Button.Pressed, "#save")
     def _save(self) -> None:
-        updated = Config(**self.config.to_dict())
-        # the sign-in mode is judged against its browser or file: those go first
-        for key in sorted(TEXT_FIELDS, key=lambda name: name == "signin"):
+        changes: dict[str, str] = {}
+        for key in TEXT_FIELDS:
             widget = self.query_one(f"#f-{key}")
-            raw = str(widget.value) if isinstance(widget, (Input, Select)) else ""
-            try:
-                updated.set(key, raw)
-            except ValueError as exc:
-                self.notify(str(exc), title=key, severity="error")
-                return
+            changes[key] = str(widget.value) if isinstance(widget, (Input, Select)) else ""
         for key in SWITCH_FIELDS:
-            updated.set(key, "true" if self.query_one(f"#f-{key}", Switch).value else "false")
+            changes[key] = "true" if self.query_one(f"#f-{key}", Switch).value else "false"
+        try:
+            updated = self.config.with_changes(changes)  # judged together, saved together
+        except ValueError as exc:
+            self.notify(str(exc), title="settings", severity="error")
+            return
         self.dismiss(updated)
 
     @on(Button.Pressed, "#cancel")

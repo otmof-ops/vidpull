@@ -130,6 +130,7 @@ REASON_READ = 600  # a reason is in the first lines of what was said, however mu
 SENTENCE_MIN = 12
 # said in the words of yt-dlp and spotDL, which are about their own options and workings
 _PLAIN_WORDS = (
+    ("sign-in expired", "YouTube sign-in expired: sign in again"),
     ("cookies are no longer valid", "YouTube sign-in expired: sign in again"),
     ("sign in to confirm your age", "age-restricted: needs a YouTube sign-in"),
     ("yt-dlp download error", "YouTube refused the upload (age-restricted or removed?)"),

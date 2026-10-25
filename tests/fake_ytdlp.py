@@ -41,6 +41,14 @@ AGE_GATE = (
 )
 
 
+EXPIRED = (
+    "WARNING: [youtube] fake: The provided YouTube account cookies are no longer valid. They "
+    "have likely been rotated in the browser as a security measure. For tips on how to "
+    "effectively export YouTube cookies, refer to  https://github.com/yt-dlp/yt-dlp/wiki/"
+    "Extractors#exporting-youtube-cookies ."
+)
+
+
 def signed_in(args: list[str]) -> bool:
     return "--cookies" in args or "--cookies-from-browser" in args
 
@@ -56,6 +64,11 @@ def main(argv: list[str]) -> int:
     if signed_in(args):
         print("[Cookies] Extracted 3 cookies from fake", file=sys.stderr, flush=True)
     if mode() == "agegate" and not signed_in(args):
+        print(AGE_GATE.format(id="fake"), file=sys.stderr, flush=True)
+        return 1
+    if mode() == "expired":  # the sign-in's cookies were rotated: YouTube takes them no more
+        if signed_in(args):
+            print(EXPIRED, file=sys.stderr, flush=True)
         print(AGE_GATE.format(id="fake"), file=sys.stderr, flush=True)
         return 1
     info_file = opt(args, "--load-info-json")

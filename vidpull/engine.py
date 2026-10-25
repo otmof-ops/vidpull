@@ -325,6 +325,20 @@ def download_args(
     return args
 
 
+_COOKIE_ROW_LINES = ("skipping cookie file entry", "invalid netscape format cookies file")
+
+
+def _no_cookie_row(line: str) -> str:
+    """A yt-dlp line that quotes a row of a cookies file, value and all, cut before the row."""
+    lowered = line.lower()
+    for lead in _COOKIE_ROW_LINES:
+        at = lowered.find(lead)
+        if at >= 0:
+            end = lowered.find(":", at + len(lead))
+            return line[: end if end > 0 else at + len(lead)].rstrip() + ": (a cookie row)"
+    return line
+
+
 # ------------------------------------------------------------------- engine
 class YtDlpEngine:
     def __init__(
@@ -423,9 +437,12 @@ class YtDlpEngine:
         except OSError as exc:
             raise ProbeError(f"cannot run yt-dlp: {exc}") from exc
         if proc.returncode != 0 or not proc.stdout.strip():
-            raise ProbeError(
+            error = _no_cookie_row(
                 last_error(proc.stderr) or f"yt-dlp exited with code {proc.returncode}"
             )
+            if signed_in and signin.signin_expired(proc.stderr):
+                error = f"{signin.EXPIRED_WORDS}. {error}"
+            raise ProbeError(error)
         try:
             data = json.loads(proc.stdout)
         except ValueError as exc:
@@ -456,9 +473,17 @@ class YtDlpEngine:
         result = self._download_signed(
             use, job, download_dir, temp_dir, on_progress, cancel, on_log, info
         )
-        if use or result.ok or result.cancelled or result.files or cancel.is_set():
-            return result
         if not signin.available(self.config) or not signin.asks_for_signin(result.error):
+            return result
+        if not use and result.ok and result.files and job.selection.playlist:
+            # a playlist's entries come in one run: the ones that asked are not made again
+            on_log(
+                "warning",
+                "some entries asked for a sign-in and were not tried again: set signin_use "
+                "to always (vidpull signin --always) and retry the playlist",
+            )
+            return result
+        if use or result.ok or result.cancelled or result.files or cancel.is_set():
             return result
         on_log(
             "info",
@@ -514,7 +539,11 @@ class YtDlpEngine:
         if info is not None:
             info_path = temp_dir / INFO_JSON_NAME
             try:
-                info_path.write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
+                # this user's only: a signed-in document may carry a site's cookies per format
+                info_path.unlink(missing_ok=True)
+                fd = os.open(info_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as out:
+                    out.write(json.dumps(info, ensure_ascii=False))
             except OSError as exc:
                 return DownloadResult(ok=False, error=f"cannot write the info JSON: {exc}")
         argv = [
@@ -543,6 +572,7 @@ class YtDlpEngine:
 
         files: list[str] = []
         errors: list[str] = []
+        expired = False  # yt-dlp's warning that the sign-in's cookies are not accepted
         entry = {"index": None, "count": None}
 
         def place(name: str) -> None:
@@ -609,12 +639,16 @@ class YtDlpEngine:
                 if parsed is not None:
                     handle(*parsed)
                 elif line.startswith("ERROR:"):
-                    errors.append(line[len("ERROR:") :].strip())
+                    errors.append(_no_cookie_row(line[len("ERROR:") :].strip()))
                     on_log("error", errors[-1])
                 elif line.startswith("WARNING:"):
-                    on_log("warning", line[len("WARNING:") :].strip())
+                    warning = _no_cookie_row(line[len("WARNING:") :].strip())
+                    if signin.signin_expired(warning):
+                        nonlocal expired
+                        expired = True
+                    on_log("warning", warning)
                 elif line.strip():
-                    on_log("info", line.strip())
+                    on_log("info", _no_cookie_row(line.strip()))
 
         def watch_cancel() -> None:
             while proc.poll() is None:
@@ -659,12 +693,10 @@ class YtDlpEngine:
                 returncode=returncode,
                 error=f"{summary}: {errors[-1]}" if errors else summary,
             )
-        return DownloadResult(
-            ok=False,
-            error=errors[-1] if errors else f"yt-dlp exited with code {returncode}",
-            files=safe_files,
-            returncode=returncode,
-        )
+        error = errors[-1] if errors else f"yt-dlp exited with code {returncode}"
+        if expired and cookies:
+            error = f"{signin.EXPIRED_WORDS}. {error}"
+        return DownloadResult(ok=False, error=error, files=safe_files, returncode=returncode)
 
 
 def _terminate(proc: subprocess.Popen[str], on_log: Callable[[str, str], None]) -> None:

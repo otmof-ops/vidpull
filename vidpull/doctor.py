@@ -241,11 +241,9 @@ def _signin_check(config: Config) -> Check:
     """Whether the sign-in is set up and its cookies hold a YouTube sign-in, read offline."""
     from vidpull.signin import check
 
-    status = check(config)
     if config.signin == "off":
         return Check("sign-in", "ok", "off: age-restricted videos need one (vidpull signin)")
-    if not status.ok:
-        return Check("sign-in", "fail", status.detail)
+    status = check(config)  # reads the browser's cookies: only when one is set up
     return Check("sign-in", "ok" if status.signed_in else "warn", status.detail)
 
 

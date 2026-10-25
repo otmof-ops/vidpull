@@ -1281,6 +1281,9 @@ class VidpullApp(App[PostExit | None]):
     def _failed_hint(self, found: list[history.Failure]) -> str:
         """The Failed tab's hint, with the way to a sign-in when some of what failed asked
         for one."""
+        expired = sum(1 for one in found if signin.signin_expired(one.why))
+        if expired:
+            return f"{FAILED_HINT} · the YouTube sign-in expired for {expired}: y signs in again"
         asked = sum(1 for one in found if signin.asks_for_signin(one.why))
         if not asked:
             return FAILED_HINT
@@ -1995,9 +1998,9 @@ class VidpullApp(App[PostExit | None]):
             parts.append(f"{counts['failed']} failed")
         parts.append("clipboard " + ("on" if self._watcher else "off"))
         parts.append(
-            f"signed in: {signin.describe(self.config)}"
+            f"sign-in: {signin.describe(self.config)}"
             if signin.available(self.config)
-            else "not signed in (y)"
+            else "sign-in: off (y)"
         )
         self._check_stale()
         if self._stale_gen:
