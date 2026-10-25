@@ -8,6 +8,7 @@ import json
 import shutil
 import stat
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -540,11 +541,13 @@ def test_tui_settings_turn_the_sign_in_off_in_one_save(config, paths, store):
             await pilot.press("s")
             assert await until(pilot, lambda: isinstance(app.screen, SettingsScreen))
             screen = app.screen
+            signin._jar_cache[("browser", "firefox", "")] = (time.monotonic(), object())
             screen.query_one("#f-signin", Select).value = "off"
             screen.query_one("#f-signin_browser", Input).value = ""
             screen.query_one("#save", Button).press()
             assert await until(pilot, lambda: not isinstance(app.screen, SettingsScreen))
             assert config.signin == "off" and config.signin_browser == ""
+            assert signin._jar_cache == {}  # the cookies held for spotDL went with it
             await pilot.press("s")
             assert await until(pilot, lambda: isinstance(app.screen, SettingsScreen))
             app.screen.query_one("#f-signin", Select).value = "browser"

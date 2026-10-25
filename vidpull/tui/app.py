@@ -1811,6 +1811,8 @@ class VidpullApp(App[PostExit | None]):
                 # form's own field was changed
                 if getattr(updated, key) == opened[key]:
                     setattr(updated, key, getattr(self.config, key))
+            if any(getattr(updated, key) != getattr(self.config, key) for key in signin_keys):
+                signin.clear_jar_cache()  # the cookies held for spotDL go with the sign-in
             self.config.__dict__.update(updated.__dict__)
             self.config.save(self.paths.config_file)
             self._config_mtime = _mtime(self.paths.config_file)

@@ -376,3 +376,28 @@ def test_cold_workers_read_the_browser_once_for_spotdl(isolated_home, monkeypatc
         t.join()
     assert len(reads) == 1
     signin.clear_jar_cache()
+
+
+def test_a_sign_out_during_a_read_leaves_nothing_held(isolated_home, monkeypatch):
+    import threading
+
+    firefox_profile(isolated_home / ".mozilla" / "firefox")
+    config = Config(signin="browser", signin_browser="firefox")
+    signin.clear_jar_cache()
+    reading = threading.Event()
+    go_on = threading.Event()
+    real = signin.load_jar
+
+    def slow(cfg):
+        reading.set()
+        go_on.wait(5)
+        return real(cfg)
+
+    monkeypatch.setattr(signin, "load_jar", slow)
+    worker = threading.Thread(target=signin._cached_jar, args=(config,))
+    worker.start()
+    assert reading.wait(5)
+    signin.clear_jar_cache()  # the sign-out, while the browser is still being read
+    go_on.set()
+    worker.join(5)
+    assert signin._jar_cache == {}

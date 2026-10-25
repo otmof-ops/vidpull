@@ -128,6 +128,7 @@ STALE_AFTER = 86400  # a private copy this old was left by a process that died
 JAR_CACHE_SECONDS = 120  # a run's export of the browser's jar is reused this long
 _URL = re.compile(r"https?://\S+")
 _jar_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
+_jar_generation = [0]  # bumped by every clear: a read that began before one stores nothing
 _jar_lock = threading.Lock()  # the dictionary
 _fill_lock = threading.Lock()  # one reader fills it; a keyring is asked once, not per worker
 _quiet_lock = threading.Lock()  # redirecting stderr and warnings is process-wide
@@ -639,11 +640,14 @@ def _cached_jar(config: Config) -> Any:
         held = fresh()  # the reader before us may have filled it
         if held is not None:
             return held
+        with _jar_lock:
+            began = _jar_generation[0]
         jar, _said = load_jar(config)
         kept = _only(jar, SPOTDL_DOMAINS)
         with _jar_lock:
-            _jar_cache.clear()
-            _jar_cache[key] = (time.monotonic(), kept)
+            if _jar_generation[0] == began:  # no sign-out while the browser was being read
+                _jar_cache.clear()
+                _jar_cache[key] = (time.monotonic(), kept)
         return kept
 
 
@@ -651,6 +655,7 @@ def clear_jar_cache() -> None:
     """Forgets the cookies held for spotDL: on sign-out and on every change of sign-in."""
     with _jar_lock:
         _jar_cache.clear()
+        _jar_generation[0] += 1
 
 
 def _only(jar: Any, domains: tuple[str, ...]) -> Any:
