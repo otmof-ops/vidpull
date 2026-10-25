@@ -95,7 +95,7 @@ from vidpull.urls import extract_urls, normalize_url
 log = logging.getLogger(__name__)
 
 COLUMNS = ("#", "Title", "Format", "Status", "Progress", "Speed", "ETA", "Size")
-BAR_HINT = "Pause (space) stops the downloads until you resume · Clear list (f): to History"
+BAR_HINT = "Pause (space) stops the downloads · Clear list (f): to History · Sign in (y)"
 BAR_PAUSED = "PAUSED: nothing downloads until you press Resume, or space"
 HISTORY_COLUMNS = ("Ended", "Title", "Format", "Result", "Size", "On list")
 FAILED_COLUMNS = ("#", "Title", "From", "Why")
@@ -363,6 +363,7 @@ class VidpullApp(App[PostExit | None]):
         self._history_view = "download"  # which log the History tab shows
         self._status: Static | None = None
         self._url_box: UrlInput | None = None
+        self._config_mtime: float | None = _mtime(paths.config_file)  # what this window read
 
     @property
     def table(self) -> DataTable:
@@ -453,8 +454,9 @@ class VidpullApp(App[PostExit | None]):
         )
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Main-screen actions stay inert while a modal screen is up."""
-        return not (self._modal_open() and action != "quit")
+        """Main-screen actions stay inert while a modal screen is up; moving the focus
+        (tab, shift+tab) is the dialog's own business and stays."""
+        return not (self._modal_open() and action not in {"quit", "focus_next", "focus_previous"})
 
     # -------------------------------------------------------------- layout
     def compose(self) -> ComposeResult:
@@ -510,6 +512,7 @@ class VidpullApp(App[PostExit | None]):
         self._show_pause()
         self._fill_list()
         self.set_interval(1.0, self._refresh_status)
+        self.set_interval(2.0, self._watch_config)
         self._refresh_status()
         self.load_engine_version()
         if self.config.clipboard_watch:
@@ -1287,11 +1290,12 @@ class VidpullApp(App[PostExit | None]):
         asked = sum(1 for one in found if signin.asks_for_signin(one.why))
         if not asked:
             return FAILED_HINT
+        need = "needs" if asked == 1 else "need"
         if not signin.available(self.config):
-            return f"{FAILED_HINT} · {asked} need a YouTube sign-in: y signs in, then Retry all"
+            return f"{FAILED_HINT} · {asked} {need} a YouTube sign-in: y signs in, then Retry all"
         return (
             f"{FAILED_HINT} · {asked} asked for a sign-in: Retry all tries them signed in "
-            f"with {signin.describe(self.config)}"
+            f"with {signin.describe(self.config)}; if that fails too, y checks the sign-in"
         )
 
     def _failed_job(self) -> Job | None:
@@ -1728,6 +1732,7 @@ class VidpullApp(App[PostExit | None]):
                 return
             self.config.clipboard_watch = True
         self.config.save(self.paths.config_file)
+        self._config_mtime = _mtime(self.paths.config_file)
         self._refresh_status()
 
     @on(Button.Pressed, "#signin")
@@ -1748,15 +1753,43 @@ class VidpullApp(App[PostExit | None]):
                     1 for one in history.failures(self.store) if signin.asks_for_signin(one.why)
                 )
                 tail = (
-                    f": Retry all on the Failed tab (2) tries the {asked} that needed it"
+                    f": the Failed tab (2) has {asked} that asked for one, r tries one again "
+                    "and Retry all tries them all"
                     if asked
                     else ""
                 )
                 self.notify(f"signed in with {signin.describe(self.config)}{tail}", timeout=10)
+            self._config_mtime = _mtime(self.paths.config_file)
             self._reload_failed(force=True)
             self._refresh_status()
 
         self.push_screen(SigninScreen(self.config, self.paths), callback=applied)
+
+    def _watch_config(self) -> None:
+        """A sign-in made in a terminal (`vidpull signin`) while this window is open is
+        taken up: the config file's sign-in fields are read again when the file changed
+        under the window, and nothing of what the window saved itself is undone."""
+        current = _mtime(self.paths.config_file)
+        if current == self._config_mtime:
+            return
+        self._config_mtime = current
+        try:
+            fresh = Config.load(self.paths.config_file)
+        except Exception:  # a half-written file: the next tick reads it again
+            self._config_mtime = None
+            return
+        keys = ("signin", "signin_browser", "signin_file", "signin_use")
+        if all(getattr(fresh, key) == getattr(self.config, key) for key in keys):
+            return
+        for key in keys:
+            setattr(self.config, key, getattr(fresh, key))
+        self.notify(
+            f"sign-in changed in a terminal: {signin.describe(self.config)}"
+            if signin.available(self.config)
+            else "signed out in a terminal",
+            timeout=6,
+        )
+        self._reload_failed(force=True)
 
     def action_settings(self) -> None:
         def saved(updated: Config | None) -> None:
@@ -1765,6 +1798,7 @@ class VidpullApp(App[PostExit | None]):
             needs_restart = updated.concurrency != self.config.concurrency
             self.config.__dict__.update(updated.__dict__)
             self.config.save(self.paths.config_file)
+            self._config_mtime = _mtime(self.paths.config_file)
             self.manager.download_dir = self.config.resolved_download_dir(self.paths)
             if self.config.clipboard_watch and self._watcher is None:
                 self._start_watcher()
@@ -1996,12 +2030,12 @@ class VidpullApp(App[PostExit | None]):
             parts.append(f"{self._failed_count} failed (press 2)")
         elif counts.get("failed"):
             parts.append(f"{counts['failed']} failed")
-        parts.append("clipboard " + ("on" if self._watcher else "off"))
         parts.append(
             f"sign-in: {signin.describe(self.config)}"
             if signin.available(self.config)
             else "sign-in: off (y)"
         )
+        parts.append("clipboard " + ("on" if self._watcher else "off"))
         self._check_stale()
         if self._stale_gen:
             parts.append(f"RESTART to run {self._stale_gen} (u)")
@@ -2075,6 +2109,13 @@ def _bar(job: Job) -> str:
     if job.status in {JobStatus.PENDING, JobStatus.QUEUED}:
         return ""
     return _bar_percent(job.progress)
+
+
+def _mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
 
 
 def list_widths(width: int) -> tuple[int, int, int]:

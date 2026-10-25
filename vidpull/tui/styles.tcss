@@ -147,3 +147,13 @@ GroupScreen DataTable {
     height: 1fr;
     margin: 0 1;
 }
+
+SigninScreen VerticalScroll {
+    height: auto;
+    max-height: 1fr;
+    min-height: 7;
+}
+
+SigninScreen #signin-intro {
+    margin-bottom: 1;
+}

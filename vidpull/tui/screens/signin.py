@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from rich.text import Text
-from textual import on
+from textual import events, on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -27,7 +27,11 @@ INTRO = (
 HINT = "Use this keeps the choice once it holds a sign-in · Check only tells · esc cancels"
 USES = (("when a site asks for a sign-in", "when-asked"), ("for every download", "always"))
 USE_NOTE = "YouTube may limit an account that downloads a lot: signed out is the default."
-PLACE_BROWSER = "firefox · chrome · opera:~/snap/opera/current/.config/opera · chrome+kwallet6"
+PLACE_BROWSER = (
+    "firefox · chrome · opera:~/snap/opera/current/.config/opera · firefox:1234abcd.work (a "
+    "profile's folder name) · chrome+kwallet6"
+)
+SHORT_FOR_INTRO = 34  # rows: below this the intro gives its room to the list
 PLACE_FILE = "~/Downloads/cookies.txt, exported from a browser with a cookies.txt extension"
 
 
@@ -108,6 +112,14 @@ class SigninScreen(ModalScreen[Config | None]):
 
     def on_mount(self) -> None:
         self.query_one("#signin-choice", RadioSet).focus()
+        self._fit(self.app.size.height)
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._fit(event.size.height)
+
+    def _fit(self, height: int) -> None:
+        """A short terminal shows the choices rather than the introduction."""
+        self.query_one("#signin-intro", Static).display = height >= SHORT_FOR_INTRO
 
     # ------------------------------------------------------------ the choice
     def _choice(self, key: str | None = None) -> Config | str:
@@ -209,11 +221,22 @@ class SigninScreen(ModalScreen[Config | None]):
     def _check(self) -> None:
         self._start(use=False)
 
+    @on(Input.Changed, "#signin-browser")
+    @on(Input.Changed, "#signin-file")
+    def _typed(self, event: Input.Changed) -> None:
+        """Typing in a box chooses its button: Use this then means what was typed."""
+        if self._busy or not event.value.strip():
+            return
+        target = "other" if event.input.id == "signin-browser" else "file"
+        self.query_one(f"#{target}", RadioButton).value = True
+
     @on(Input.Submitted, "#signin-browser")
     @on(Input.Submitted, "#signin-file")
     def _entered(self, event: Input.Submitted) -> None:
         """Enter in a box chooses its button and uses it; the radio set learns of the
         choice a moment later, so the button is named outright."""
+        if self._busy:
+            return  # a check is on its way: nothing flips under it
         target = "other" if event.input.id == "signin-browser" else "file"
         self.query_one(f"#{target}", RadioButton).value = True
         self._start(use=True, key=target)

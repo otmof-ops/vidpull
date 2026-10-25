@@ -354,6 +354,7 @@ class YtDlpEngine:
         self._python = python or engine_python(paths)
         self._version: tuple[float, str] | None = None
         self.extra_args = list(extra_args or [])
+        self._asked: set[str] = set()  # links whose probe took the sign-in, this process
 
     @property
     def python(self) -> str:
@@ -408,6 +409,7 @@ class YtDlpEngine:
             data = self._probe_once(url, playlist, True)
         if use:
             data[SIGNED_IN_KEY] = True
+            self._asked.add(url)
         return data
 
     def _signin_args(self, signed_in: bool) -> contextlib.AbstractContextManager[list[str]]:
@@ -470,6 +472,8 @@ class YtDlpEngine:
             info = {key: value for key, value in info.items() if key != SIGNED_IN_KEY}
             signed = True
         use = signed or signin.always(self.config)
+        if not use and job.url in self._asked and signin.available(self.config):
+            use = True  # its probe took the sign-in: no doomed signed-out attempt first
         result = self._download_signed(
             use, job, download_dir, temp_dir, on_progress, cancel, on_log, info
         )

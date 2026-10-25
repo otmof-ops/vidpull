@@ -121,6 +121,17 @@ def test_a_cookies_file_goes_as_a_private_copy(gated, config, paths, tmp_path):
     assert copy != master and copy.parent == paths.temp_dir / "signin" and not copy.exists()
 
 
+def test_a_link_whose_probe_took_the_sign_in_downloads_signed_in_at_once(
+    gated, config, paths, tmp_path
+):
+    engine, calls = gated
+    config.signin, config.signin_browser = "browser", "firefox"
+    engine.probe_json(URL)  # signed out, then signed in: two calls
+    result, logs = _run(engine, paths, tmp_path / "dl")
+    assert result.ok and len(calls()) == 3 and "--cookies-from-browser" in calls()[-1]
+    assert not any(level == "error" for level, _ in logs)  # no doomed signed-out attempt
+
+
 def test_other_errors_are_not_retried(gated, config):
     engine, calls = gated
     (Path(engine.python).parent / "mode").write_text("error")
@@ -157,7 +168,7 @@ def test_cli_signin_with_a_browser(capsys, paths, isolated_home, monkeypatch):
     )
     assert cli.main(["signin", "--always"]) == 0
     assert Config.load(paths.config_file).signin_use == "always"
-    assert cli.main(["signin", "--browser", "netscape"]) == 1
+    assert cli.main(["signin", "--browser", "netscape"]) == 2
     assert "no browser yt-dlp reads" in capsys.readouterr().err
     assert cli.main(["signout"]) == 0
     assert Config.load(paths.config_file).signin == "off"
@@ -309,6 +320,43 @@ def test_cli_get_points_at_signin_when_the_age_gate_bites(monkeypatch, capsys, p
     assert cli.main(["get", URL]) == 1
     out = " ".join(capsys.readouterr().out.split())  # rich wraps long lines
     assert "confirm your age" in out and "vidpull signin --browser auto" in out
+    # at the probe too, where an age-restricted link fails first
+    gate = f"[youtube] aqz-KE-bpKQ: {AGE_GATE}"
+    monkeypatch.setattr(cli, "YtDlpEngine", lambda *a, **k: FakeEngine(probe_error=gate))
+    assert cli.main(["get", URL]) == 1
+    out = " ".join(capsys.readouterr().out.split())
+    assert "vidpull signin --browser auto" in out
+    assert cli.main(["get", URL, "--list"]) == 1
+    assert "vidpull signin --browser auto" in " ".join(capsys.readouterr().out.split())
+    Config(signin="browser", signin_browser="firefox").save(paths.config_file)
+    assert cli.main(["get", URL, "--no-signin"]) == 1
+    assert "--no-signin made the run signed out" in " ".join(capsys.readouterr().out.split())
+    assert cli.main(["get", URL]) == 1
+    out = " ".join(capsys.readouterr().out.split())
+    assert "the one set up (Firefox) did not lift it" in out
+
+
+def test_cli_get_resolves_a_bare_browser_name_like_signin(monkeypatch, capsys, paths, video_info):
+    root = Path("/x/snap/opera/current/.config/opera")
+    found = [signin.Browser("opera", "snap", root, root / "Default/Cookies", 0.0, f"opera:{root}")]
+    monkeypatch.setattr(signin, "found_browsers", lambda: found)
+    seen: dict[str, str] = {}
+
+    def make(config, paths, **kwargs):
+        seen["browser"] = config.signin_browser
+        return FakeEngine(info=video_info)
+
+    monkeypatch.setattr(cli, "YtDlpEngine", make)
+    assert cli.main(["get", URL, "--cookies-from-browser", "opera"]) == 0
+    assert seen["browser"] == f"opera:{root}"
+    assert cli.main(["get", URL, "--cookies-from-browser", ""]) == 2
+    assert cli.main(["get", URL, "--cookies", ""]) == 2
+    assert cli.main(["get", URL, "--cookies-from-browser", "bogus"]) == 2
+    assert cli.main(["signin", "--browser", "bogus"]) == 2
+    assert cli.main(["signin", "--browser", ""]) == 2
+    assert cli.main(["signin", "--file", ""]) == 2
+    assert cli.main(["signin", "--file", str(paths.state_dir)]) == 2
+    assert "is a folder" in capsys.readouterr().err
 
 
 # -------------------------------------------------------- doctor, history
@@ -518,7 +566,7 @@ def test_tui_failed_tab_points_at_the_sign_in(config, paths, store):
             await pilot.press("escape")
             await pilot.press("2")
             hint = app.query_one("#failed-hint", Static)
-            assert await until(pilot, lambda: "1 need a YouTube sign-in" in _text(hint))
+            assert await until(pilot, lambda: "1 needs a YouTube sign-in" in _text(hint))
             config.signin = "browser"
             config.signin_browser = "opera:/x/snap/opera/current/.config/opera"
             app._reload_failed(force=True)
@@ -533,5 +581,88 @@ def test_tui_failed_tab_points_at_the_sign_in(config, paths, store):
             )
             app._reload_failed(force=True)
             assert "sign-in expired for 1: y signs in again" in _text(hint)
+            # the bar's hint fits beside three buttons at 132 columns
+            from vidpull.tui.app import BAR_HINT
+
+            assert len(BAR_HINT) <= 76
 
     asyncio.run(flow())
+
+
+def test_tui_dialog_fits_a_small_terminal_and_tab_moves_the_focus(
+    config, paths, store, isolated_home
+):
+    firefox_profile(isolated_home / ".mozilla" / "firefox")
+    app = make_app(config, paths, store, FakeEngine())
+
+    async def flow():
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.press("escape")
+            await pilot.press("y")
+            assert await until(pilot, lambda: isinstance(app.screen, SigninScreen))
+            screen = app.screen
+            await pilot.pause(0.1)
+            first = screen.query_one("#browser-0", RadioButton)
+            assert first.region.height >= 1 and screen.query_one("#use", Button).region.height >= 1
+            assert not screen.query_one("#signin-intro", Static).display
+            focused = []
+            for _ in range(6):
+                await pilot.press("tab")
+                focused.append(getattr(screen.focused, "id", None))
+            assert "signin-browser" in focused and "use" in focused
+            await pilot.press("escape")
+
+    asyncio.run(flow())
+
+
+def test_tui_typing_in_a_box_chooses_it(config, paths, store, isolated_home):
+    firefox_profile(isolated_home / ".mozilla" / "firefox")
+    app = make_app(config, paths, store, FakeEngine())
+
+    async def flow():
+        async with app.run_test(size=(132, 50)) as pilot:
+            await pilot.press("escape")
+            await pilot.press("y")
+            assert await until(pilot, lambda: isinstance(app.screen, SigninScreen))
+            screen = app.screen
+            box = screen.query_one("#signin-browser", Input)
+            box.focus()
+            await pilot.press("b", "r", "a", "v", "e")
+            await pilot.pause(0.1)
+            assert screen.query_one("#other", RadioButton).value
+            screen.query_one("#use", Button).press()
+            result = screen.query_one("#signin-result", Static)
+            assert await until(pilot, lambda: "could not find brave" in _text(result))
+            assert config.signin == "off"
+            await pilot.press("escape")
+
+    asyncio.run(flow())
+
+
+def test_tui_takes_up_a_sign_in_made_in_a_terminal(config, paths, store, tmp_path):
+    config.save(paths.config_file)
+    app = make_app(config, paths, store, FakeEngine())
+
+    async def flow():
+        async with app.run_test(size=(132, 40)) as pilot:
+            await pilot.press("escape")
+            status = app.query_one("#status", Static)
+            assert "sign-in: off (y)" in _text(status)
+            await pilot.pause(0.1)
+            jar = netscape_file(tmp_path / "c.txt")
+            assert cli.main(["signin", "--file", str(jar)]) == 0  # another process, in effect
+            assert await until(pilot, lambda: config.signin == "file", tries=300)
+            assert await until(pilot, lambda: "sign-in: cookies file" in _text(status))
+            await pilot.press("s")
+            await pilot.pause(0.2)
+            app.screen.query_one("#save", Button).press()
+            await pilot.pause(0.2)
+            assert Config.load(paths.config_file).signin == "file"  # the save kept it
+
+    asyncio.run(flow())
+
+
+def test_safari_is_refused_on_linux(monkeypatch):
+    monkeypatch.setattr(signin.sys, "platform", "linux")
+    with pytest.raises(signin.SigninError, match="macOS only"):
+        signin.parse_spec("safari")

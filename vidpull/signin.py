@@ -180,6 +180,8 @@ def parse_spec(text: str) -> Spec:
     name = match.group("name").strip().lower()
     if name not in BROWSERS:
         raise SigninError(f"{name!r} is no browser yt-dlp reads; one of: {', '.join(BROWSERS)}")
+    if name == "safari" and sys.platform != "darwin":
+        raise SigninError("safari's cookies can be read on macOS only")
     keyring = (match.group("keyring") or "").strip().lower() or None
     if keyring is not None and keyring not in KEYRINGS:
         raise SigninError(f"{keyring!r} is no keyring yt-dlp knows; one of: {', '.join(KEYRINGS)}")
@@ -382,6 +384,8 @@ def load_jar(config: Config) -> tuple[Any, list[str]]:
         return jar, quiet.lines
     if config.signin == "file":
         path = Path(config.signin_file).expanduser() if config.signin_file else None
+        if path is not None and path.is_dir():
+            raise SigninError(f"{path} is a folder, not a cookies file")
         if path is None or not path.is_file():
             raise SigninError(f"the cookies file is missing: {path or '(none)'}")
         jar = YoutubeDLCookieJar(str(path))
@@ -455,11 +459,15 @@ def check(config: Config) -> Status:
     if not signed_in(jar):
         where = source if config.signin == "browser" else "the cookies file"
         how = (
-            f"open youtube.com in {source}, sign in, then check again"
+            f"open youtube.com in {source}, sign in, then check again (vidpull signin)"
             if config.signin == "browser"
             else "export the cookies again while signed in to youtube.com"
         )
-        what = f"{yt} youtube.com cookies of {count}" if count else "no cookies could be read"
+        what = (
+            f"{yt} of its {count} cookies are youtube.com's"
+            if count
+            else "no cookies could be read"
+        )
         failed = next((s for s in said if "could not be decrypted" in s), "")
         tail = f"; {failed}" if failed else ""
         return Status(True, False, f"{where} has no YouTube sign-in ({what}{tail}): {how}", source)
@@ -637,6 +645,8 @@ def keep_file(source: Path, paths: Paths) -> Path:
     readable by this user only, so the original may be deleted."""
     target = own_copy(paths)
     tmp = target.with_suffix(".tmp")
+    if source.is_dir():
+        raise SigninError(f"{source} is a folder, not a cookies file")
     if not source.is_file():
         raise SigninError(f"no such file: {source}")
     if source.resolve() == tmp.resolve():
