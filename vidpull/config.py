@@ -21,6 +21,8 @@ CONTAINERS = ("auto", "mp4", "mkv", "webm")
 JS_RUNTIMES = ("auto", "deno", "node", "bun", "quickjs", "none")
 MP3_QUALITIES = ("320", "256", "192", "160", "128", "0")  # "0" = VBR best (LAME V0)
 DUPLICATES = ("ask", "skip", "download")  # what happens to a link that was downloaded before
+SIGNINS = ("off", "browser", "file")  # how yt-dlp signs in to a site that asks for it
+SIGNIN_USES = ("when-asked", "always")  # when the sign-in is used
 
 PRESETS: dict[str, str] = {
     "best": "bestvideo*+bestaudio/best",
@@ -49,6 +51,16 @@ FIELD_HELP: dict[str, str] = {
     "stage_pause": "Seconds to wait between batches of a run.",
     "duplicates": "A link that was downloaded before (its file is still there), is on the list "
     "already or comes twice: ask (skip or download again, with 'apply to all'), skip, download.",
+    "signin": "Sign in to YouTube (and any site that asks for one) for age-restricted, private "
+    "and members-only videos: off, browser (the session of a browser you are signed in with), "
+    "file (a Netscape cookies.txt). `vidpull signin` sets it up.",
+    "signin_browser": "The browser whose sign-in is used, as yt-dlp names it: firefox, chrome, "
+    "chromium, brave, edge, opera, vivaldi; BROWSER[+KEYRING][:PROFILE] for a profile or a "
+    "snap/flatpak install's folder, such as opera:~/snap/opera/current/.config/opera.",
+    "signin_file": "The cookies.txt used when signin is file.",
+    "signin_use": "when-asked: a download is made signed in only when the site asks for a "
+    "sign-in (YouTube offers more formats, and sees less of you, signed out). always: every "
+    "download is made signed in (private playlists).",
     "song_format": "Audio preset for songs from Spotify links: "
     + ", ".join(p for p in PRESETS if p.startswith("audio-"))
     + ".",
@@ -92,6 +104,10 @@ class Config:
     stage_size: int = 10
     stage_pause: int = 0
     duplicates: str = "ask"
+    signin: str = "off"
+    signin_browser: str = ""
+    signin_file: str = ""
+    signin_use: str = "when-asked"
     default_preset: str = "best"
     container: str = "auto"
     codec_preference: list[str] = field(default_factory=lambda: ["avc1", "av01", "vp9"])
@@ -169,6 +185,18 @@ class Config:
         if self.duplicates not in DUPLICATES:
             log.warning("config: duplicates %r unknown; using 'ask'", self.duplicates)
             self.duplicates = "ask"
+        if self.signin not in SIGNINS:
+            log.warning("config: signin %r unknown; using 'off'", self.signin)
+            self.signin = "off"
+        if self.signin_use not in SIGNIN_USES:
+            log.warning("config: signin_use %r unknown; using 'when-asked'", self.signin_use)
+            self.signin_use = "when-asked"
+        problem = signin_problem(self)
+        if problem:
+            log.warning("config: %s; signin is off", problem)
+            self.signin = "off"
+            if problem.startswith("signin_browser"):
+                self.signin_browser = ""  # a browser yt-dlp does not read blocks nothing else
         self.stage_size = max(0, min(int(self.stage_size), 1000))
         self.stage_pause = max(0, min(int(self.stage_pause), 3600))
         if self.container not in CONTAINERS:
@@ -194,8 +222,31 @@ class Config:
         known = {f.name: f for f in fields(self)}
         if key not in known:
             raise KeyError(key)
-        setattr(self, key, _coerce_str(known[key].type, raw, key))
+        value = _coerce_str(known[key].type, raw, key)
+        if key in {"signin", "signin_browser", "signin_file"}:
+            trial = Config(**{**self.to_dict(), key: value})
+            problem = signin_problem(trial)
+            if problem:
+                raise ValueError(problem)
+        setattr(self, key, value)
         self.validate()
+
+    def with_changes(self, changes: dict[str, str]) -> Config:
+        """A copy with every change applied from its command-line string, judged
+        together: a form saves its fields at once, and the sign-in's mode is right or
+        wrong only beside its browser or its file."""
+        known = {f.name: f for f in fields(self)}
+        values = self.to_dict()
+        for key, raw in changes.items():
+            if key not in known:
+                raise KeyError(key)
+            values[key] = _coerce_str(known[key].type, raw, key)
+        updated = Config(**values)
+        problem = signin_problem(updated)
+        if problem:
+            raise ValueError(problem)
+        updated.validate()
+        return updated
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -203,6 +254,25 @@ class Config:
     @staticmethod
     def field_names() -> list[str]:
         return [f.name for f in fields(Config)]
+
+
+def signin_problem(config: Config) -> str:
+    """What is wrong with the sign-in settings together, or nothing: a mode needs its
+    browser or its file, and a browser must be one yt-dlp reads."""
+    from vidpull.signin import SigninError, parse_spec
+
+    if config.signin not in SIGNINS or config.signin_use not in SIGNIN_USES:
+        return ""  # validate() resets those by themselves
+    if config.signin_browser.strip():
+        try:
+            parse_spec(config.signin_browser)
+        except SigninError as exc:
+            return f"signin_browser: {exc}"
+    if config.signin == "browser" and not config.signin_browser.strip():
+        return "signin = browser needs signin_browser (vidpull signin --browser NAME)"
+    if config.signin == "file" and not config.signin_file.strip():
+        return "signin = file needs signin_file (vidpull signin --file PATH)"
+    return ""
 
 
 def _coerce(annotation: Any, value: Any, key: str) -> Any:

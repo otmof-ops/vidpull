@@ -34,11 +34,13 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import parse_qs, urlsplit
 
+from vidpull import signin
 from vidpull.config import Config
 from vidpull.formats import parse_formats
 from vidpull.models import Job, MediaInfo
 from vidpull.paths import Paths
 from vidpull.procs import clean_env, last_error, run, which
+from vidpull.signin import SIGNED_IN_KEY, SigninError
 
 log = logging.getLogger(__name__)
 
@@ -323,6 +325,20 @@ def download_args(
     return args
 
 
+_COOKIE_ROW_LINES = ("skipping cookie file entry", "invalid netscape format cookies file")
+
+
+def _no_cookie_row(line: str) -> str:
+    """A yt-dlp line that quotes a row of a cookies file, value and all, cut right after
+    the words that say so: the reason may quote a field of the row too."""
+    lowered = line.lower()
+    for lead in _COOKIE_ROW_LINES:
+        at = lowered.find(lead)
+        if at >= 0:
+            return line[: at + len(lead)].rstrip() + " (a cookie row)"
+    return line
+
+
 # ------------------------------------------------------------------- engine
 class YtDlpEngine:
     def __init__(
@@ -338,6 +354,7 @@ class YtDlpEngine:
         self._python = python or engine_python(paths)
         self._version: tuple[float, str] | None = None
         self.extra_args = list(extra_args or [])
+        self._asked: set[str] = set()  # links whose probe took the sign-in, this process
 
     @property
     def python(self) -> str:
@@ -375,27 +392,62 @@ class YtDlpEngine:
         return media_info_from_dict(url, self.probe_json(url, playlist=playlist))
 
     def probe_json(self, url: str, *, playlist: bool = False) -> dict[str, Any]:
-        """yt-dlp's ``-J`` document for ``url``: what ``--load-info-json`` reads back."""
-        args = [
-            *self.prefix(),
-            *self.common_args(),
-            "-J",
-            "--flat-playlist",
-            "--no-warnings",
-            "--yes-playlist" if playlist else "--no-playlist",
-            "--",
-            url,
-        ]
+        """yt-dlp's ``-J`` document for ``url``: what ``--load-info-json`` reads back.
+
+        Made signed out, then once more with the sign-in when the site asks for one and a
+        sign-in is set up (signed in from the start when ``signin_use`` is ``always``). A
+        document that took the sign-in says so under ``SIGNED_IN_KEY``, so that its
+        download signs in too.
+        """
+        use = signin.always(self.config)
+        asked = False
         try:
-            proc = run(args, timeout=PROBE_TIMEOUT, env=self.env())
+            data = self._probe_once(url, playlist, use)
+        except ProbeError as exc:
+            if use or not signin.available(self.config) or not signin.asks_for_signin(str(exc)):
+                raise
+            use = asked = True
+            data = self._probe_once(url, playlist, True)
+        if use:
+            data[SIGNED_IN_KEY] = True
+        if asked:
+            self._asked.add(url)  # bounded by the links that asked, this process
+        return data
+
+    def _signin_args(self, signed_in: bool) -> contextlib.AbstractContextManager[list[str]]:
+        if not signed_in:
+            return contextlib.nullcontext([])
+        return signin.yt_dlp_args(self.config, self.paths)
+
+    def _probe_once(self, url: str, playlist: bool, signed_in: bool) -> dict[str, Any]:
+        try:
+            with self._signin_args(signed_in) as cookies:
+                args = [
+                    *self.prefix(),
+                    *self.common_args(),
+                    *cookies,
+                    "-J",
+                    "--flat-playlist",
+                    # a signed-in probe keeps the warnings: an expired sign-in is one of them
+                    *([] if signed_in else ["--no-warnings"]),
+                    "--yes-playlist" if playlist else "--no-playlist",
+                    "--",
+                    url,
+                ]
+                proc = run(args, timeout=PROBE_TIMEOUT, env=self.env())
+        except SigninError as exc:
+            raise ProbeError(f"cannot sign in: {exc}") from exc
         except subprocess.TimeoutExpired as exc:
             raise ProbeError("yt-dlp did not answer within the probe timeout") from exc
         except OSError as exc:
             raise ProbeError(f"cannot run yt-dlp: {exc}") from exc
         if proc.returncode != 0 or not proc.stdout.strip():
-            raise ProbeError(
+            error = _no_cookie_row(
                 last_error(proc.stderr) or f"yt-dlp exited with code {proc.returncode}"
             )
+            if signed_in and signin.signin_expired(proc.stderr):
+                error = f"{signin.EXPIRED_WORDS}. {error}"
+            raise ProbeError(error)
         try:
             data = json.loads(proc.stdout)
         except ValueError as exc:
@@ -415,6 +467,70 @@ class YtDlpEngine:
         *,
         info: dict[str, Any] | None = None,
     ) -> DownloadResult:
+        """One download. A song whose probe took the sign-in is downloaded with it; anything
+        else is downloaded signed out and once more signed in when the site asks for a
+        sign-in (or signed in from the start when ``signin_use`` is ``always``)."""
+        signed = False
+        if info is not None and info.get(SIGNED_IN_KEY):
+            info = {key: value for key, value in info.items() if key != SIGNED_IN_KEY}
+            signed = True
+        use = signed or signin.always(self.config)
+        if not use and job.url in self._asked and signin.available(self.config):
+            use = True  # its probe took the sign-in: no doomed signed-out attempt first
+        result = self._download_signed(
+            use, job, download_dir, temp_dir, on_progress, cancel, on_log, info
+        )
+        if not signin.available(self.config) or not signin.asks_for_signin(result.error):
+            return result
+        if not use and result.ok and result.files and job.selection.playlist:
+            # a playlist's entries come in one run: the ones that asked are not made again
+            on_log(
+                "warning",
+                "some entries asked for a sign-in and were not tried again: set signin_use "
+                "to always (vidpull signin --always) and retry the playlist",
+            )
+            return result
+        if use or result.ok or result.cancelled or result.files or cancel.is_set():
+            return result
+        on_log(
+            "info",
+            f"the site asks for a sign-in: trying again signed in with "
+            f"{signin.describe(self.config)}",
+        )
+        return self._download_signed(
+            True, job, download_dir, temp_dir, on_progress, cancel, on_log, info
+        )
+
+    def _download_signed(
+        self,
+        signed_in: bool,
+        job: Job,
+        download_dir: Path,
+        temp_dir: Path,
+        on_progress: Callable[[Progress], None],
+        cancel: threading.Event,
+        on_log: Callable[[str, str], None],
+        info: dict[str, Any] | None,
+    ) -> DownloadResult:
+        try:
+            with self._signin_args(signed_in) as cookies:
+                return self._download_once(
+                    job, download_dir, temp_dir, on_progress, cancel, on_log, info, cookies
+                )
+        except SigninError as exc:
+            return DownloadResult(ok=False, error=f"cannot sign in: {exc}")
+
+    def _download_once(
+        self,
+        job: Job,
+        download_dir: Path,
+        temp_dir: Path,
+        on_progress: Callable[[Progress], None],
+        cancel: threading.Event,
+        on_log: Callable[[str, str], None],
+        info: dict[str, Any] | None,
+        cookies: list[str],
+    ) -> DownloadResult:
         if cancel.is_set():
             return DownloadResult(ok=False, cancelled=True)
         playlist = job.selection.playlist
@@ -430,12 +546,17 @@ class YtDlpEngine:
         if info is not None:
             info_path = temp_dir / INFO_JSON_NAME
             try:
-                info_path.write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
+                # this user's only: a signed-in document may carry a site's cookies per format
+                info_path.unlink(missing_ok=True)
+                fd = os.open(info_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as out:
+                    out.write(json.dumps(info, ensure_ascii=False))
             except OSError as exc:
                 return DownloadResult(ok=False, error=f"cannot write the info JSON: {exc}")
         argv = [
             *self.prefix(),
             *self.common_args(),
+            *cookies,
             *download_args(
                 job, self.config, staging, temp_dir, playlist=playlist, info_path=info_path
             ),
@@ -458,6 +579,7 @@ class YtDlpEngine:
 
         files: list[str] = []
         errors: list[str] = []
+        expired = False  # yt-dlp's warning that the sign-in's cookies are not accepted
         entry = {"index": None, "count": None}
 
         def place(name: str) -> None:
@@ -524,12 +646,16 @@ class YtDlpEngine:
                 if parsed is not None:
                     handle(*parsed)
                 elif line.startswith("ERROR:"):
-                    errors.append(line[len("ERROR:") :].strip())
+                    errors.append(_no_cookie_row(line[len("ERROR:") :].strip()))
                     on_log("error", errors[-1])
                 elif line.startswith("WARNING:"):
-                    on_log("warning", line[len("WARNING:") :].strip())
+                    warning = _no_cookie_row(line[len("WARNING:") :].strip())
+                    if signin.signin_expired(warning):
+                        nonlocal expired
+                        expired = True
+                    on_log("warning", warning)
                 elif line.strip():
-                    on_log("info", line.strip())
+                    on_log("info", _no_cookie_row(line.strip()))
 
         def watch_cancel() -> None:
             while proc.poll() is None:
@@ -574,12 +700,10 @@ class YtDlpEngine:
                 returncode=returncode,
                 error=f"{summary}: {errors[-1]}" if errors else summary,
             )
-        return DownloadResult(
-            ok=False,
-            error=errors[-1] if errors else f"yt-dlp exited with code {returncode}",
-            files=safe_files,
-            returncode=returncode,
-        )
+        error = errors[-1] if errors else f"yt-dlp exited with code {returncode}"
+        if expired and cookies:
+            error = f"{signin.EXPIRED_WORDS}. {error}"
+        return DownloadResult(ok=False, error=error, files=safe_files, returncode=returncode)
 
 
 def _terminate(proc: subprocess.Popen[str], on_log: Callable[[str, str], None]) -> None:

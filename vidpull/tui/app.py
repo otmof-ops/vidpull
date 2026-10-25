@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -33,7 +34,7 @@ from textual.widgets import (
     TabPane,
 )
 
-from vidpull import CREDIT, REPO_URL, __version__, history
+from vidpull import CREDIT, REPO_URL, __version__, history, signin
 from vidpull.clipboard import ClipboardWatcher, available_reader, read_clipboard
 from vidpull.config import Config
 from vidpull.duplicates import Duplicate, Finder, settle
@@ -76,6 +77,7 @@ from vidpull.tui.screens.link import LinkScreen
 from vidpull.tui.screens.logview import LogScreen
 from vidpull.tui.screens.picker import FormatPicker, Pick
 from vidpull.tui.screens.settings import SettingsScreen
+from vidpull.tui.screens.signin import SigninScreen
 from vidpull.tui.screens.uninstall import UninstallScreen
 from vidpull.tui.screens.update import UpdateScreen
 from vidpull.tui.widgets import UrlInput, write_row
@@ -94,7 +96,7 @@ from vidpull.urls import extract_urls, normalize_url
 log = logging.getLogger(__name__)
 
 COLUMNS = ("#", "Title", "Format", "Status", "Progress", "Speed", "ETA", "Size")
-BAR_HINT = "Pause (space) stops the downloads until you resume · Clear list (f): to History"
+BAR_HINT = "Pause (space) stops the downloads · Clear list (f): to History · Sign in (y)"
 BAR_PAUSED = "PAUSED: nothing downloads until you press Resume, or space"
 HISTORY_COLUMNS = ("Ended", "Title", "Format", "Result", "Size", "On list")
 FAILED_COLUMNS = ("#", "Title", "From", "Why")
@@ -142,6 +144,8 @@ o      open the download folder              f  clear the list: what is finished
 h      History: every finished download with its own log, the app log, the update log
        (r brings one back onto the list, d deletes it for good, esc returns to the list)
 w      toggle the clipboard watcher          s  settings
+y      sign in to YouTube with a browser you are signed in with (or a cookies.txt), for the
+       age-restricted, private and members-only videos that need one; used when a site asks
 u      update vidpull / yt-dlp               x  uninstall
 l      this session's log                    q  quit (running downloads resume next time)
 
@@ -295,6 +299,7 @@ class VidpullApp(App[PostExit | None]):
         Binding("3", "show_tab('tab-history')", "History", show=False),
         Binding("w", "toggle_watch", "Clipboard", show=False),
         Binding("s", "settings", "Settings"),
+        Binding("y", "signin", "Sign in", show=False),  # the button says it
         Binding("u", "update", "Update"),
         Binding("x", "uninstall", "Uninstall", show=False),
         Binding("l", "logs", "Log", show=False),
@@ -359,6 +364,7 @@ class VidpullApp(App[PostExit | None]):
         self._history_view = "download"  # which log the History tab shows
         self._status: Static | None = None
         self._url_box: UrlInput | None = None
+        self._config_mtime: float | None = _mtime(paths.config_file)  # what this window read
 
     @property
     def table(self) -> DataTable:
@@ -449,8 +455,9 @@ class VidpullApp(App[PostExit | None]):
         )
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Main-screen actions stay inert while a modal screen is up."""
-        return not (self._modal_open() and action != "quit")
+        """Main-screen actions stay inert while a modal screen is up; moving the focus
+        (tab, shift+tab) is the dialog's own business and stays."""
+        return not (self._modal_open() and action not in {"quit", "focus_next", "focus_previous"})
 
     # -------------------------------------------------------------- layout
     def compose(self) -> ComposeResult:
@@ -466,6 +473,7 @@ class VidpullApp(App[PostExit | None]):
                     with Horizontal(classes="bar"):
                         yield Button("Pause", id="pause-queue", compact=True)
                         yield Button("Clear list", id="clear-list", compact=True)
+                        yield Button("Sign in", id="signin", compact=True)
                         yield Static(BAR_HINT, id="bar-hint", classes="bar-hint")
                     yield DataTable(id="jobs", cursor_type="row", zebra_stripes=True)
                 with TabPane("Failed", id="tab-failed"):
@@ -505,6 +513,7 @@ class VidpullApp(App[PostExit | None]):
         self._show_pause()
         self._fill_list()
         self.set_interval(1.0, self._refresh_status)
+        self.set_interval(2.0, self._watch_config)
         self._refresh_status()
         self.load_engine_version()
         if self.config.clipboard_watch:
@@ -1269,7 +1278,26 @@ class VidpullApp(App[PostExit | None]):
         label = f"Failed ({len(rows)})" if rows else "Failed"
         with contextlib.suppress(Exception):
             self.views.get_tab("tab-failed").label = label
-            self.query_one("#failed-hint", Static).update(FAILED_HINT if rows else FAILED_NONE)
+            self.query_one("#failed-hint", Static).update(
+                self._failed_hint(found) if rows else FAILED_NONE
+            )
+
+    def _failed_hint(self, found: list[history.Failure]) -> str:
+        """The Failed tab's hint, with the way to a sign-in when some of what failed asked
+        for one."""
+        expired = sum(1 for one in found if signin.signin_expired(one.why))
+        if expired:
+            return f"{FAILED_HINT} · the YouTube sign-in expired for {expired}: y signs in again"
+        asked = sum(1 for one in found if signin.asks_for_signin(one.why))
+        if not asked:
+            return FAILED_HINT
+        need = "needs" if asked == 1 else "need"
+        if not signin.available(self.config):
+            return f"{FAILED_HINT} · {asked} {need} a YouTube sign-in: y signs in, then Retry all"
+        return (
+            f"{FAILED_HINT} · {asked} asked for a sign-in: Retry all tries them signed in "
+            f"with {signin.describe(self.config)}; if that fails too, y checks the sign-in"
+        )
 
     def _failed_job(self) -> Job | None:
         job_id = self._failed_id()
@@ -1705,15 +1733,92 @@ class VidpullApp(App[PostExit | None]):
                 return
             self.config.clipboard_watch = True
         self.config.save(self.paths.config_file)
+        self._config_mtime = _mtime(self.paths.config_file)
         self._refresh_status()
 
+    @on(Button.Pressed, "#signin")
+    def _signin_pressed(self) -> None:
+        self.action_signin()
+
+    def action_signin(self) -> None:
+        def applied(updated: Config | None) -> None:
+            if updated is None:
+                return
+            for key in ("signin", "signin_browser", "signin_file", "signin_use"):
+                setattr(self.config, key, getattr(updated, key))
+            signin.clear_jar_cache()
+            self.config.save(self.paths.config_file)
+            if self.config.signin == "off":
+                self.notify("signed out: downloads are made signed out", timeout=6)
+            else:
+                asked = sum(
+                    1 for one in history.failures(self.store) if signin.asks_for_signin(one.why)
+                )
+                tail = (
+                    f": the Failed tab (2) has {asked} that asked for one, r tries one again "
+                    "and Retry all tries them all"
+                    if asked
+                    else ""
+                )
+                self.notify(f"signed in with {signin.describe(self.config)}{tail}", timeout=10)
+            self._config_mtime = _mtime(self.paths.config_file)
+            self._reload_failed(force=True)
+            self._refresh_status()
+
+        self.push_screen(SigninScreen(self.config, self.paths), callback=applied)
+
+    def _watch_config(self) -> None:
+        """A sign-in made in a terminal (`vidpull signin`) while this window is open is
+        taken up: the config file's sign-in fields are read again when the file changed
+        under the window, and nothing of what the window saved itself is undone."""
+        current = _mtime(self.paths.config_file)
+        if current == self._config_mtime:
+            return
+        self._config_mtime = current
+        try:
+            with self.paths.config_file.open("rb") as fh:
+                table = tomllib.load(fh)  # Config.load reads a half-written file as defaults
+        except (OSError, tomllib.TOMLDecodeError):  # the next tick reads it again
+            self._config_mtime = None
+            return
+        if "signin" not in table:
+            return  # emptied, or written by something else: no word on the sign-in
+        fresh = Config.load(self.paths.config_file)
+        keys = ("signin", "signin_browser", "signin_file", "signin_use")
+        if all(getattr(fresh, key) == getattr(self.config, key) for key in keys):
+            return
+        for key in keys:
+            setattr(self.config, key, getattr(fresh, key))
+        signin.clear_jar_cache()
+        self.notify(
+            f"sign-in changed in a terminal: {signin.describe(self.config)}"
+            if signin.available(self.config)
+            else "signed out in a terminal",
+            timeout=6,
+        )
+        self._reload_failed(force=True)
+
     def action_settings(self) -> None:
+        signin_keys = ("signin", "signin_browser", "signin_file", "signin_use")
+        opened = {key: getattr(self.config, key) for key in signin_keys}
+
         def saved(updated: Config | None) -> None:
             if updated is None:
                 return
             needs_restart = updated.concurrency != self.config.concurrency
+            for key in signin_keys:
+                # a sign-in made in a terminal while the form was open stays, unless the
+                # form's own field was changed
+                if getattr(updated, key) == opened[key]:
+                    setattr(updated, key, getattr(self.config, key))
+            if any(getattr(updated, key) != getattr(self.config, key) for key in signin_keys):
+                signin.clear_jar_cache()  # the cookies held for spotDL go with the sign-in
+            if updated.signin != "file" and updated.signin_file == str(signin.own_copy(self.paths)):
+                signin.forget_own_copy(self.paths)  # a credential nothing points at any more
+                updated.signin_file = ""
             self.config.__dict__.update(updated.__dict__)
             self.config.save(self.paths.config_file)
+            self._config_mtime = _mtime(self.paths.config_file)
             self.manager.download_dir = self.config.resolved_download_dir(self.paths)
             if self.config.clipboard_watch and self._watcher is None:
                 self._start_watcher()
@@ -1945,6 +2050,11 @@ class VidpullApp(App[PostExit | None]):
             parts.append(f"{self._failed_count} failed (press 2)")
         elif counts.get("failed"):
             parts.append(f"{counts['failed']} failed")
+        parts.append(
+            f"sign-in: {signin.describe(self.config)}"
+            if signin.available(self.config)
+            else "sign-in: off (y)"
+        )
         parts.append("clipboard " + ("on" if self._watcher else "off"))
         self._check_stale()
         if self._stale_gen:
@@ -2019,6 +2129,13 @@ def _bar(job: Job) -> str:
     if job.status in {JobStatus.PENDING, JobStatus.QUEUED}:
         return ""
     return _bar_percent(job.progress)
+
+
+def _mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
 
 
 def list_widths(width: int) -> tuple[int, int, int]:

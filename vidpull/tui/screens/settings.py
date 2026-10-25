@@ -16,12 +16,18 @@ from vidpull.config import (
     JS_RUNTIMES,
     MP3_QUALITIES,
     PRESETS,
+    SIGNIN_USES,
+    SIGNINS,
     Config,
 )
 
 TEXT_FIELDS = (
     "download_dir",
     "duplicates",
+    "signin",
+    "signin_browser",
+    "signin_file",
+    "signin_use",
     "default_preset",
     "container",
     "mp3_quality",
@@ -49,6 +55,8 @@ SWITCH_FIELDS = (
 )
 SELECT_OPTIONS = {
     "duplicates": list(DUPLICATES),
+    "signin": list(SIGNINS),
+    "signin_use": list(SIGNIN_USES),
     "default_preset": list(PRESETS),
     "container": list(CONTAINERS),
     "mp3_quality": list(MP3_QUALITIES),
@@ -94,17 +102,17 @@ class SettingsScreen(ModalScreen[Config | None]):
 
     @on(Button.Pressed, "#save")
     def _save(self) -> None:
-        updated = Config(**self.config.to_dict())
+        changes: dict[str, str] = {}
         for key in TEXT_FIELDS:
             widget = self.query_one(f"#f-{key}")
-            raw = str(widget.value) if isinstance(widget, (Input, Select)) else ""
-            try:
-                updated.set(key, raw)
-            except ValueError as exc:
-                self.notify(str(exc), title=key, severity="error")
-                return
+            changes[key] = str(widget.value) if isinstance(widget, (Input, Select)) else ""
         for key in SWITCH_FIELDS:
-            updated.set(key, "true" if self.query_one(f"#f-{key}", Switch).value else "false")
+            changes[key] = "true" if self.query_one(f"#f-{key}", Switch).value else "false"
+        try:
+            updated = self.config.with_changes(changes)  # judged together, saved together
+        except ValueError as exc:
+            self.notify(str(exc), title="settings", severity="error")
+            return
         self.dismiss(updated)
 
     @on(Button.Pressed, "#cancel")

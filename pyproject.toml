@@ -21,7 +21,7 @@ classifiers = [
   "Topic :: Multimedia :: Sound/Audio",
 ]
 dependencies = [
-  "yt-dlp[default]>=2026.8.19",
+  "yt-dlp[default,secretstorage]>=2026.8.19",  # secretstorage: a GNOME keyring's cookies
   "textual>=8,<9",
 ]
 

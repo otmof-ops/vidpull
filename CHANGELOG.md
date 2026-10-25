@@ -6,6 +6,50 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Sign in to YouTube.** Age-restricted, private and members-only videos need a signed-in
+  account; a song from a Spotify link whose only upload is age-restricted failed with "Sign in
+  to confirm your age". A **Sign in** button above the list (and `y`) picks a browser you are
+  signed in to YouTube with, or a cookies.txt exported from one; vidpull reads the browser's
+  own cookies the way yt-dlp does, finds browsers installed as snaps and flatpaks (which
+  yt-dlp does not look for), and tells whether they hold a YouTube sign-in before saving
+  anything. `vidpull signin [--browser NAME|auto] [--file PATH] [--always]`, `vidpull signout`,
+  the settings `signin`, `signin_browser`, `signin_file` and `signin_use`, a `sign-in` row in
+  `vidpull doctor`, and `vidpull get --cookies FILE` and `--no-signin` for one run.
+- **Used when a site asks.** A download is made signed out, and again signed in when the
+  answer is a sign-in request (the age gate, a private or a members-only video); a song whose
+  lookup needed the sign-in is downloaded with it. `signin_use = always` signs in for every
+  download. spotDL's own lookup of an upload YouTube refused is made once more signed in.
+- The Failed tab says how many of its entries need a YouTube sign-in and where to get one.
+  yt-dlp's warning that the account's cookies are no longer valid (rotated by the browser)
+  makes the download's reason "YouTube sign-in expired: sign in again" instead of the age
+  gate it would otherwise show, and the Failed tab says so.
+- A choice is kept only once its cookies hold a sign-in: `vidpull signin` and the Sign in
+  screen check first and save after, and a working sign-in is never replaced by one that does
+  not work; an expired sign-in reads as not signed in.
+- `vidpull get` says what to do when a link asks for a sign-in, at the lookup as well as at
+  the download; `--cookies-from-browser` on `get` finds a browser's install the way `signin`
+  does, a snap's folder spelled out; a link whose lookup took the sign-in is downloaded signed
+  in from the start; an open vidpull window takes up a sign-in made in a terminal.
+- Tab and Shift+Tab move the focus in every dialog (they moved nothing before); the Sign in
+  dialog fits a 24-row terminal.
+
+### Changed
+
+- A cookies file is handed to each yt-dlp or spotDL run as a private copy (yt-dlp writes the
+  file back when it is done, and two downloads at once would write the same file), written
+  from the parsed jar so that a row yt-dlp would reject is never echoed into a log; the copy,
+  vidpull's own copy of an exported cookies file and a song's `info.json` are readable by this
+  user only, and copies a killed process left behind are swept. spotDL is given the sign-in's
+  youtube.com cookies only.
+- yt-dlp's subprocess sees the desktop session variables it picks a Linux keyring by
+  (`XDG_CURRENT_DESKTOP`, `DESKTOP_SESSION`, `KDE_SESSION_VERSION`, `KDE_FULL_SESSION`,
+  `GNOME_DESKTOP_SESSION_ID`), so a Chromium-family browser's keyring-locked cookies decrypt
+  the way they do in a terminal; `secretstorage` is installed for GNOME keyrings.
+- `--cookies-from-browser` on `vidpull get` is checked as yt-dlp reads it (`BROWSER[+KEYRING]
+  [:PROFILE][::CONTAINER]`, a profile may be a path) instead of by a character class.
+
 ## [1.6.0] - 2026-09-30
 
 ### Added

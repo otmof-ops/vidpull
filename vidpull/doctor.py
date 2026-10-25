@@ -44,6 +44,7 @@ def run_checks(
     checks.append(_js_runtime_check(engine))
     checks.append(_ffmpeg_check(engine))
     checks.append(_spotdl_check(config, paths, engine))
+    checks.append(_signin_check(config))
     checks.extend(_dir_checks(config, paths))
     checks.append(_db_check(paths))
     checks.append(_clipboard_check())
@@ -234,6 +235,16 @@ def _update_log_check(paths: Paths) -> Check:
         "ok" if ok else "warn",
         f"{paths.update_log} ({count} transaction(s); last: {action} at {when}, {outcome})",
     )
+
+
+def _signin_check(config: Config) -> Check:
+    """Whether the sign-in is set up and its cookies hold a YouTube sign-in, read offline."""
+    from vidpull.signin import check
+
+    if config.signin == "off":
+        return Check("sign-in", "ok", "off: age-restricted videos need one (vidpull signin)")
+    status = check(config)  # reads the browser's cookies: only when one is set up
+    return Check("sign-in", "ok" if status.signed_in else "warn", status.detail)
 
 
 def _online_probe(engine: YtDlpEngine) -> Check:

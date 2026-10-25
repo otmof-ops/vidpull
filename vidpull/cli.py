@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from vidpull import APP_NAME, AUTHOR, CREDIT, REPO_URL, __version__, history
-from vidpull.config import DUPLICATES, PRESETS, Config
+from vidpull.config import DUPLICATES, PRESETS, Config, signin_problem
 from vidpull.doctor import format_report, run_checks, worst
 from vidpull.duplicates import Duplicate, Finder, describe
 from vidpull.engine import ProbeError, YtDlpEngine
@@ -33,6 +33,8 @@ from vidpull.models import SKIPPED, GroupEvent, GroupStatus, JobEvent, JobStatus
 from vidpull.paths import Paths
 from vidpull.procs import redact_url
 from vidpull.semver import Version
+from vidpull.signin import SigninError, asks_for_signin, parse_spec
+from vidpull.signin import available as signin_available
 from vidpull.spotdl import (
     InstallError,
     ResolveError,
@@ -61,7 +63,6 @@ EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_USAGE = 2
 
-COOKIE_SPEC = re.compile(r"^[A-Za-z0-9_.:+-]{1,80}$")
 AUDIO_CODECS = ("mp3", "m4a", "opus", "flac", "wav", "best")
 COMMANDS = frozenset(
     {
@@ -73,6 +74,8 @@ COMMANDS = frozenset(
         "version",
         "queue",
         "config",
+        "signin",
+        "signout",
         "_finalize-install",
     }
 )
@@ -143,12 +146,52 @@ def build_parser() -> argparse.ArgumentParser:
     )
     get.add_argument("-o", "--output-dir", metavar="DIR", help="download directory for this run")
     get.add_argument("-j", "--jobs", type=int, metavar="N", help="parallel downloads for this run")
-    get.add_argument(
+    session = get.add_mutually_exclusive_group()
+    session.add_argument(
         "--cookies-from-browser",
         metavar="BROWSER",
-        help="pass browser cookies to yt-dlp for this run only",
+        help="sign in with this browser's session for this run (BROWSER[+KEYRING][:PROFILE]); "
+        "`vidpull signin` keeps one",
+    )
+    session.add_argument(
+        "--cookies", metavar="FILE", help="sign in with this Netscape cookies.txt for this run"
+    )
+    session.add_argument(
+        "--no-signin", action="store_true", help="download signed out, whatever is set up"
     )
     get.set_defaults(func=cmd_get)
+
+    signin_cmd = sub.add_parser(
+        "signin",
+        help="sign in to YouTube with a browser's session or a cookies file, for the "
+        "age-restricted, private and members-only videos that need one",
+    )
+    way = signin_cmd.add_mutually_exclusive_group()
+    way.add_argument(
+        "--browser",
+        metavar="BROWSER",
+        help="a browser you are signed in to YouTube with: firefox, chrome, chromium, brave, "
+        "edge, opera, vivaldi, or BROWSER[+KEYRING][:PROFILE]; 'auto' takes the first browser "
+        "found here that holds a YouTube sign-in",
+    )
+    way.add_argument(
+        "--file",
+        metavar="PATH",
+        help="a cookies.txt exported from a browser (vidpull keeps its own private copy)",
+    )
+    when = signin_cmd.add_mutually_exclusive_group()
+    when.add_argument(
+        "--always", action="store_true", help="sign in for every download, not only when asked"
+    )
+    when.add_argument(
+        "--when-asked",
+        action="store_true",
+        help="sign in only when a site asks for a sign-in (the default)",
+    )
+    signin_cmd.set_defaults(func=cmd_signin)
+
+    signout = sub.add_parser("signout", help="forget the sign-in: downloads are made signed out")
+    signout.set_defaults(func=cmd_signout)
 
     update = sub.add_parser("update", help="update vidpull and yt-dlp to the latest release")
     update.add_argument(
@@ -311,16 +354,29 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
     console = Console()
     ctx.paths.ensure_runtime_dirs()
     setup_logging(ctx.paths)
-    extra: list[str] = []
-    if args.cookies_from_browser:
-        if not COOKIE_SPEC.match(args.cookies_from_browser):
-            print(
-                "error: --cookies-from-browser accepts BROWSER[+KEYRING][:PROFILE] only",
-                file=sys.stderr,
-            )
+    # for this run only; the file keeps its settings
+    if args.no_signin:
+        ctx.config.signin = "off"
+    if args.cookies_from_browser is not None:
+        spec, code = _browser_spec(args.cookies_from_browser)
+        if spec is None:
+            return code
+        ctx.config.signin, ctx.config.signin_browser = "browser", spec
+        ctx.config.signin_use = "always"
+    if args.cookies is not None:
+        if not args.cookies.strip():
+            print("error: --cookies needs a file", file=sys.stderr)
             return EXIT_USAGE
-        extra = ["--cookies-from-browser", args.cookies_from_browser]
-    engine = YtDlpEngine(ctx.config, ctx.paths, extra_args=extra)
+        cookies = Path(args.cookies).expanduser().resolve()
+        if cookies.is_dir():
+            print(f"error: --cookies: {cookies} is a folder, not a cookies file", file=sys.stderr)
+            return EXIT_USAGE
+        if not cookies.is_file():
+            print(f"error: --cookies: no such file: {cookies}", file=sys.stderr)
+            return EXIT_USAGE
+        ctx.config.signin, ctx.config.signin_file = "file", str(cookies)
+        ctx.config.signin_use = "always"
+    engine = YtDlpEngine(ctx.config, ctx.paths)
     download_dir = Path(args.output_dir).expanduser() if args.output_dir else None
     if args.duplicates:
         ctx.config.duplicates = args.duplicates  # for this run; the file keeps its setting
@@ -354,6 +410,9 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
                 info = engine.probe(url)
             except ProbeError as exc:
                 console.print(f"[red]error:[/] {exc}")
+                hint = _signin_hint(ctx.config, str(exc), args)
+                if hint:
+                    console.print(f"[yellow]note[/] {hint}", markup=True, highlight=False)
                 return EXIT_FAILURE
             _print_menu(console, Table, info, build_menu(info, ctx.config))
         return EXIT_OK
@@ -492,6 +551,9 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
                     info = engine.probe(url, playlist=args.playlist)
                 except ProbeError as exc:
                     console.print(f"[red]error:[/] {redact_url(url)}: {exc}")
+                    hint = _signin_hint(ctx.config, str(exc), args)
+                    if hint:
+                        console.print(f"[yellow]note[/] {hint}", markup=True, highlight=False)
                     continue
                 # and after it, when the page the link leads to and its id are known
                 after = asked is not None and before is None
@@ -531,6 +593,9 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
         else:
             failures += 1
             console.print(f"[red]{job.status}[/] {redact_url(job.url)}: {job.error}")
+            hint = _signin_hint(ctx.config, job.error or "", args)
+            if hint:
+                console.print(f"[yellow]note[/] {hint}", markup=True, highlight=False)
     for group_id in runs:  # last, where it is still in sight after a long list
         group = store.get_group(group_id)
         if group is None:
@@ -1108,6 +1173,181 @@ def cmd_queue_log(args: argparse.Namespace, ctx: Context) -> int:
     store.close()
     print("\n".join(lines), file=sys.stdout if found is not None else sys.stderr)
     return EXIT_OK if found is not None else EXIT_FAILURE
+
+
+def _signin_hint(config: Config, error: str, args: argparse.Namespace) -> str:
+    """What to do about an error that asked for a sign-in, or nothing."""
+    if not asks_for_signin(error):
+        return ""
+    if getattr(args, "no_signin", False):
+        return "this needs a YouTube sign-in, and --no-signin made the run signed out"
+    if not signin_available(config):
+        return (
+            "this needs a YouTube sign-in: `vidpull signin --browser auto` uses the session of "
+            "your browser, then `vidpull get` it again"
+        )
+    from vidpull import signin
+
+    who = signin.describe(config)
+    if getattr(args, "cookies", None) or getattr(args, "cookies_from_browser", None):
+        return (
+            f"this asked for a sign-in and the one given for this run, {who}, did not lift it: "
+            "is that browser or file signed in to YouTube, with an age-verified account?"
+        )
+    return (
+        f"this asked for a sign-in and the one set up, {who}, did not lift it: "
+        "`vidpull signin` says whether it still holds a YouTube sign-in"
+    )
+
+
+def cmd_signin(args: argparse.Namespace, ctx: Context) -> int:
+    """Set up the sign-in, or report on it: `vidpull signin` alone says whether the cookies
+    hold a YouTube sign-in and lists the browsers found on this machine. A choice is kept
+    only once its cookies hold a sign-in: a working sign-in is never replaced by one that
+    does not work."""
+    from vidpull import signin
+
+    config = ctx.config
+    if (args.browser is not None and not args.browser.strip()) or (
+        args.file is not None and not args.file.strip()
+    ):
+        print("error: --browser needs a name and --file a path", file=sys.stderr)
+        return EXIT_USAGE
+    choosing = bool(args.browser or args.file)
+    if not choosing and (args.always or args.when_asked) and config.signin == "off":
+        print("error: choose --browser or --file first", file=sys.stderr)
+        return EXIT_USAGE
+    trial = Config(**config.to_dict())
+    if args.always:
+        trial.signin_use = "always"
+    elif args.when_asked:
+        trial.signin_use = "when-asked"
+    source: Path | None = None
+    if args.browser:
+        spec, code = _browser_spec(args.browser)
+        if spec is None:
+            return code
+        trial.signin, trial.signin_browser = "browser", spec
+    elif args.file:
+        source = Path(args.file).expanduser()
+        if source.is_dir():
+            print(f"error: --file: {source} is a folder, not a cookies file", file=sys.stderr)
+            return EXIT_USAGE
+        if not source.is_file():
+            print(f"error: --file: no such file: {source}", file=sys.stderr)
+            return EXIT_USAGE
+        trial.signin, trial.signin_file = "file", str(source)  # checked where it is
+    problem = signin_problem(trial)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_USAGE
+    status = signin.check(trial)
+    if choosing and not status.signed_in:
+        print(f"sign-in: {status.detail}")
+        print(
+            "nothing changed"
+            + (": the sign-in set up before stays" if config.signin != "off" else "")
+        )
+        return EXIT_FAILURE
+    if choosing or args.always or args.when_asked:
+        if source is not None:
+            try:
+                trial.signin_file = str(signin.keep_file(source, ctx.paths))
+            except SigninError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return EXIT_FAILURE
+        elif trial.signin != "file":
+            signin.forget_own_copy(ctx.paths)  # a credential nothing points at any more
+            trial.signin_file = (
+                "" if config.signin_file == str(signin.own_copy(ctx.paths)) else trial.signin_file
+            )
+        config.__dict__.update(trial.__dict__)
+        signin.clear_jar_cache()
+        config.save(ctx.paths.config_file)
+        status = signin.check(config) if source is not None else status
+    print(f"sign-in: {status.detail}")
+    if config.signin != "off":
+        when = (
+            "for every download"
+            if config.signin_use == "always"
+            else "only when a site asks for a sign-in"
+        )
+        print(f"used: {when}")
+    if not choosing:
+        found = signin.found_browsers()
+        if found:
+            print("browsers on this machine:")
+            for browser in found:
+                mark = "  (default)" if browser.default else ""
+                print(
+                    f"  {browser.label:<18} {browser.age:<18} "
+                    f"vidpull signin --browser {browser.spec}{mark}"
+                )
+        else:
+            print(
+                "no browser with a cookie database was found; export a cookies.txt from your "
+                "browser and run `vidpull signin --file PATH`"
+            )
+    return EXIT_OK if config.signin == "off" or status.signed_in else EXIT_FAILURE
+
+
+def _browser_spec(given: str) -> tuple[str | None, int]:
+    """The spec for a browser given on the command line, and the exit code when there is
+    none: 'auto' is the first browser found here that is signed in to YouTube; a bare name
+    takes the install of that browser found here (a snap's folder spelled out); anything
+    else is handed on as it is, once yt-dlp would accept it."""
+    from vidpull import signin
+
+    if not given.strip():
+        print("error: a browser is needed: firefox, chrome, opera, … or auto", file=sys.stderr)
+        return None, EXIT_USAGE
+    found = signin.found_browsers()
+    if given.strip().lower() == "auto":
+        if not found:
+            print(
+                "error: no browser with a cookie database was found; name one, or use --file",
+                file=sys.stderr,
+            )
+            return None, EXIT_FAILURE
+        for browser in found:
+            trial = Config(signin="browser", signin_browser=browser.spec)
+            if signin.check(trial).signed_in:
+                return browser.spec, EXIT_OK
+        names = ", ".join(browser.label for browser in found)
+        print(
+            f"error: none of the browsers found here ({names}) is signed in to YouTube: open "
+            "youtube.com in one, sign in, then run this again",
+            file=sys.stderr,
+        )
+        return None, EXIT_FAILURE
+    try:
+        spec = parse_spec(given)
+    except SigninError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return None, EXIT_USAGE
+    if spec.profile or spec.keyring or spec.container:
+        return spec.text, EXIT_OK
+    for browser in found:
+        if browser.name == spec.name:
+            return browser.spec, EXIT_OK
+    print(
+        f"note: no {spec.label} profile was found where yt-dlp looks; it is tried anyway",
+        file=sys.stderr,
+    )
+    return spec.text, EXIT_OK
+
+
+def cmd_signout(args: argparse.Namespace, ctx: Context) -> int:
+    from vidpull import signin
+
+    config = ctx.config
+    if config.signin_file == str(signin.own_copy(ctx.paths)):
+        config.signin_file = ""
+    signin.forget_own_copy(ctx.paths)  # vidpull's copy of the cookies: a credential
+    config.signin = "off"
+    config.save(ctx.paths.config_file)
+    print("signed out: downloads are made signed out")
+    return EXIT_OK
 
 
 def cmd_config_list(args: argparse.Namespace, ctx: Context) -> int:

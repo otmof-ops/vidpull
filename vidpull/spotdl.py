@@ -38,6 +38,7 @@ from vidpull.config import Config
 from vidpull.models import Song
 from vidpull.paths import Paths
 from vidpull.procs import clean_env, last_error, run
+from vidpull.signin import SigninError, always, available, cookie_file, describe
 
 log = logging.getLogger(__name__)
 
@@ -457,14 +458,24 @@ class SpotdlEngine:
         started = time.monotonic()
         tries = len(self._match_delays) + 1
         number = 1
+        signed = always(self.config)
         while True:
             try:
-                return self._match_once(argv, song, cancel)
+                return self._match_signed(argv, song, cancel, signed)
             except _TryAgain as exc:
                 reason = str(exc)
             if cancel is not None and cancel.is_set():
                 return None
             spent = time.monotonic() - started
+            if is_refused(reason) and not signed and available(self.config):
+                # YouTube would not let the upload be read: once more, signed in. spotDL's
+                # own yt-dlp reads the upload's page when it has found it, and an
+                # age-restricted upload needs the sign-in there too
+                signed = True
+                number += 1  # the signed attempt counts: the same two attempts as before
+                who = describe(self.config)
+                _tell(report, f"YouTube refused the upload: trying again signed in with {who}")
+                continue
             # an upload YouTube refuses is asked for once more, in case it was the network
             last = min(tries, REFUSED_ATTEMPTS) if is_refused(reason) else tries
             if number >= last or spent + self._match_delays[number - 1] > RETRY_DEADLINE:
@@ -474,6 +485,21 @@ class SpotdlEngine:
             _tell(report, _retry_note(reason, delay, number, tries))
             if _cancelled_during(delay, cancel):
                 return None
+
+    def _match_signed(
+        self, argv: list[str], song: Song, cancel: threading.Event | None, signed: bool
+    ) -> Match | None:
+        """``_match_once``, with the sign-in's cookies in a private file when ``signed``:
+        spotDL takes a cookies file (``--cookie-file``) and no browser."""
+        if not signed:
+            return self._match_once(argv, song, cancel)
+        try:
+            with cookie_file(self.config, self.paths) as cookies:
+                if cookies is None:
+                    return self._match_once(argv, song, cancel)
+                return self._match_once([*argv, "--cookie-file", str(cookies)], song, cancel)
+        except SigninError as exc:
+            raise MatchError(f"cannot sign in: {exc}") from exc
 
     def _match_once(
         self, argv: list[str], song: Song, cancel: threading.Event | None

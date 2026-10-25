@@ -110,12 +110,16 @@ def main(argv: list[str]) -> int:
             print("found for song: Carly Rae Jepsen - Cut To The Feeling")
             print(json.dumps([None], indent=4))
             return 0
-        if mode() == "refused":
+        if mode() == "refused" and "--cookie-file" not in args:
             # an upload was found, and yt-dlp could not read it (age-restricted, removed)
             print("Carly Rae Jepsen - Cut To The Feeling generated an exception: YT-DLP")
             print("download error - https://www.youtube.com/watch?v=Jg4bxoyywyA")
             print(json.dumps([None], indent=4))
             return 0
+        if "--cookie-file" in args:  # signed in: what the file held, by domain, for the test
+            rows = Path(args[args.index("--cookie-file") + 1]).read_text().splitlines()
+            hosts = sorted({r.split("\t")[0] for r in rows if r and not r.startswith("#")})
+            (HERE / "cookie-hosts").write_text("\n".join(hosts))
         if mode() == "searchfail":
             # spotDL logs on stdout, wrapped at 80 columns, brackets and all
             print("Carly Rae Jepsen - Cut To The Feeling generated an exception: [Errno 104]")

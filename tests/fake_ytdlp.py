@@ -3,7 +3,9 @@
 
 Invoked by tests through YtDlpEngine(python=<this file>). The first two argv
 entries are ``-m yt_dlp`` and are ignored. Behaviour comes from a ``mode`` file
-next to this script: ``ok`` (default), ``error``, ``hang`` or ``partial``.
+next to this script: ``ok`` (default), ``error``, ``hang``, ``partial`` or
+``agegate`` (YouTube's age gate until a sign-in comes along: ``--cookies`` or
+``--cookies-from-browser``). Every call's argv is appended to ``calls.jsonl``.
 """
 
 from __future__ import annotations
@@ -32,12 +34,43 @@ def opt(args: list[str], name: str) -> str | None:
     return None
 
 
+AGE_GATE = (
+    "ERROR: [youtube] {id}: Sign in to confirm your age. Use --cookies-from-browser or "
+    "--cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ"
+    "#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies"
+)
+
+
+EXPIRED = (
+    "WARNING: [youtube] fake: The provided YouTube account cookies are no longer valid. They "
+    "have likely been rotated in the browser as a security measure. For tips on how to "
+    "effectively export YouTube cookies, refer to  https://github.com/yt-dlp/yt-dlp/wiki/"
+    "Extractors#exporting-youtube-cookies ."
+)
+
+
+def signed_in(args: list[str]) -> bool:
+    return "--cookies" in args or "--cookies-from-browser" in args
+
+
 def main(argv: list[str]) -> int:
     args = [a for a in argv[1:] if a not in ("-m", "yt_dlp")]
     (HERE / "last-args.json").write_text(json.dumps(args))
+    with (HERE / "calls.jsonl").open("a") as calls:
+        calls.write(json.dumps(args) + "\n")
     if "--version" in args:
         print("2026.08.19")
         return 0
+    if signed_in(args):
+        print("[Cookies] Extracted 3 cookies from fake", file=sys.stderr, flush=True)
+    if mode() == "agegate" and not signed_in(args):
+        print(AGE_GATE.format(id="fake"), file=sys.stderr, flush=True)
+        return 1
+    if mode() == "expired":  # the sign-in's cookies were rotated: YouTube takes them no more
+        if signed_in(args) and "--no-warnings" not in args:  # yt-dlp prints no warning then
+            print(EXPIRED, file=sys.stderr, flush=True)
+        print(AGE_GATE.format(id="fake"), file=sys.stderr, flush=True)
+        return 1
     info_file = opt(args, "--load-info-json")
     if info_file is not None:  # a song job: the URL comes from the info JSON, not argv
         url = str(json.loads(Path(info_file).read_text()).get("original_url") or "info")
