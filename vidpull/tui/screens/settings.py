@@ -16,12 +16,18 @@ from vidpull.config import (
     JS_RUNTIMES,
     MP3_QUALITIES,
     PRESETS,
+    SIGNIN_USES,
+    SIGNINS,
     Config,
 )
 
 TEXT_FIELDS = (
     "download_dir",
     "duplicates",
+    "signin",
+    "signin_browser",
+    "signin_file",
+    "signin_use",
     "default_preset",
     "container",
     "mp3_quality",
@@ -49,6 +55,8 @@ SWITCH_FIELDS = (
 )
 SELECT_OPTIONS = {
     "duplicates": list(DUPLICATES),
+    "signin": list(SIGNINS),
+    "signin_use": list(SIGNIN_USES),
     "default_preset": list(PRESETS),
     "container": list(CONTAINERS),
     "mp3_quality": list(MP3_QUALITIES),
@@ -95,7 +103,8 @@ class SettingsScreen(ModalScreen[Config | None]):
     @on(Button.Pressed, "#save")
     def _save(self) -> None:
         updated = Config(**self.config.to_dict())
-        for key in TEXT_FIELDS:
+        # the sign-in mode is judged against its browser or file: those go first
+        for key in sorted(TEXT_FIELDS, key=lambda name: name == "signin"):
             widget = self.query_one(f"#f-{key}")
             raw = str(widget.value) if isinstance(widget, (Input, Select)) else ""
             try:

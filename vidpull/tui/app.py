@@ -33,7 +33,7 @@ from textual.widgets import (
     TabPane,
 )
 
-from vidpull import CREDIT, REPO_URL, __version__, history
+from vidpull import CREDIT, REPO_URL, __version__, history, signin
 from vidpull.clipboard import ClipboardWatcher, available_reader, read_clipboard
 from vidpull.config import Config
 from vidpull.duplicates import Duplicate, Finder, settle
@@ -76,6 +76,7 @@ from vidpull.tui.screens.link import LinkScreen
 from vidpull.tui.screens.logview import LogScreen
 from vidpull.tui.screens.picker import FormatPicker, Pick
 from vidpull.tui.screens.settings import SettingsScreen
+from vidpull.tui.screens.signin import SigninScreen
 from vidpull.tui.screens.uninstall import UninstallScreen
 from vidpull.tui.screens.update import UpdateScreen
 from vidpull.tui.widgets import UrlInput, write_row
@@ -142,6 +143,8 @@ o      open the download folder              f  clear the list: what is finished
 h      History: every finished download with its own log, the app log, the update log
        (r brings one back onto the list, d deletes it for good, esc returns to the list)
 w      toggle the clipboard watcher          s  settings
+y      sign in to YouTube with a browser you are signed in with (or a cookies.txt), for the
+       age-restricted, private and members-only videos that need one; used when a site asks
 u      update vidpull / yt-dlp               x  uninstall
 l      this session's log                    q  quit (running downloads resume next time)
 
@@ -295,6 +298,7 @@ class VidpullApp(App[PostExit | None]):
         Binding("3", "show_tab('tab-history')", "History", show=False),
         Binding("w", "toggle_watch", "Clipboard", show=False),
         Binding("s", "settings", "Settings"),
+        Binding("y", "signin", "Sign in", show=False),  # the button says it
         Binding("u", "update", "Update"),
         Binding("x", "uninstall", "Uninstall", show=False),
         Binding("l", "logs", "Log", show=False),
@@ -466,6 +470,7 @@ class VidpullApp(App[PostExit | None]):
                     with Horizontal(classes="bar"):
                         yield Button("Pause", id="pause-queue", compact=True)
                         yield Button("Clear list", id="clear-list", compact=True)
+                        yield Button("Sign in", id="signin", compact=True)
                         yield Static(BAR_HINT, id="bar-hint", classes="bar-hint")
                     yield DataTable(id="jobs", cursor_type="row", zebra_stripes=True)
                 with TabPane("Failed", id="tab-failed"):
@@ -1269,7 +1274,22 @@ class VidpullApp(App[PostExit | None]):
         label = f"Failed ({len(rows)})" if rows else "Failed"
         with contextlib.suppress(Exception):
             self.views.get_tab("tab-failed").label = label
-            self.query_one("#failed-hint", Static).update(FAILED_HINT if rows else FAILED_NONE)
+            self.query_one("#failed-hint", Static).update(
+                self._failed_hint(found) if rows else FAILED_NONE
+            )
+
+    def _failed_hint(self, found: list[history.Failure]) -> str:
+        """The Failed tab's hint, with the way to a sign-in when some of what failed asked
+        for one."""
+        asked = sum(1 for one in found if signin.asks_for_signin(one.why))
+        if not asked:
+            return FAILED_HINT
+        if not signin.available(self.config):
+            return f"{FAILED_HINT} · {asked} need a YouTube sign-in: y signs in, then Retry all"
+        return (
+            f"{FAILED_HINT} · {asked} asked for a sign-in: Retry all tries them signed in "
+            f"with {signin.describe(self.config)}"
+        )
 
     def _failed_job(self) -> Job | None:
         job_id = self._failed_id()
@@ -1707,6 +1727,34 @@ class VidpullApp(App[PostExit | None]):
         self.config.save(self.paths.config_file)
         self._refresh_status()
 
+    @on(Button.Pressed, "#signin")
+    def _signin_pressed(self) -> None:
+        self.action_signin()
+
+    def action_signin(self) -> None:
+        def applied(updated: Config | None) -> None:
+            if updated is None:
+                return
+            for key in ("signin", "signin_browser", "signin_file", "signin_use"):
+                setattr(self.config, key, getattr(updated, key))
+            self.config.save(self.paths.config_file)
+            if self.config.signin == "off":
+                self.notify("signed out: downloads are made signed out", timeout=6)
+            else:
+                asked = sum(
+                    1 for one in history.failures(self.store) if signin.asks_for_signin(one.why)
+                )
+                tail = (
+                    f": Retry all on the Failed tab (2) tries the {asked} that needed it"
+                    if asked
+                    else ""
+                )
+                self.notify(f"signed in with {signin.describe(self.config)}{tail}", timeout=10)
+            self._reload_failed(force=True)
+            self._refresh_status()
+
+        self.push_screen(SigninScreen(self.config, self.paths), callback=applied)
+
     def action_settings(self) -> None:
         def saved(updated: Config | None) -> None:
             if updated is None:
@@ -1946,6 +1994,11 @@ class VidpullApp(App[PostExit | None]):
         elif counts.get("failed"):
             parts.append(f"{counts['failed']} failed")
         parts.append("clipboard " + ("on" if self._watcher else "off"))
+        parts.append(
+            f"signed in: {signin.describe(self.config)}"
+            if signin.available(self.config)
+            else "not signed in (y)"
+        )
         self._check_stale()
         if self._stale_gen:
             parts.append(f"RESTART to run {self._stale_gen} (u)")

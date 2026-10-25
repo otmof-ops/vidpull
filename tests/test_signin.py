@@ -1,0 +1,212 @@
+"""The sign-in module: yt-dlp's browser spec, the browsers found on a machine, whether a jar
+holds a YouTube sign-in, and the private copies a run is given."""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+from pathlib import Path
+
+import pytest
+
+from tests.cookiejars import chromium_profile, firefox_profile, netscape_file
+from vidpull import signin
+from vidpull.config import Config, signin_problem
+from vidpull.signin import SigninError, parse_spec
+
+
+def test_parse_spec_the_way_yt_dlp_reads_it():
+    assert parse_spec("firefox").text == "firefox"
+    assert parse_spec("opera:/home/x/snap/opera/current/.config/opera").label == "Opera (snap)"
+    spec = parse_spec("chrome+KWallet6:Profile 1::work")
+    assert (spec.name, spec.keyring, spec.profile, spec.container) == (
+        "chrome",
+        "kwallet6",
+        "Profile 1",
+        "work",
+    )
+    assert spec.text == "chrome+kwallet6:Profile 1::work"
+    assert (
+        parse_spec("brave:/home/x/.var/app/com.brave.Browser/config/x").label == "Brave (flatpak)"
+    )
+    for bad in ("", "firefox; rm -rf /", "netscape", "chrome+foo", "+kwallet"):
+        with pytest.raises(SigninError):
+            parse_spec(bad)
+
+
+def test_found_browsers_sees_system_snap_and_flatpak_installs(isolated_home, monkeypatch):
+    monkeypatch.setattr(signin, "default_browser", lambda: "opera")
+    assert signin.found_browsers() == []
+    firefox_profile(isolated_home / ".mozilla" / "firefox")
+    chromium_profile(isolated_home / "snap" / "opera" / "current" / ".config" / "opera")
+    chromium_profile(isolated_home / ".config" / "google-chrome", keyring=True)
+    found = signin.found_browsers()
+    by_name = {b.name: b for b in found}
+    assert set(by_name) == {"firefox", "opera", "chrome"}
+    assert found[0].name == "opera" and found[0].default  # the default browser comes first
+    opera = by_name["opera"]
+    assert opera.kind == "snap" and opera.spec == f"opera:{opera.root}" and not opera.keyring
+    assert by_name["firefox"].spec == "firefox" and by_name["firefox"].kind == "system"
+    chrome = by_name["chrome"]
+    assert chrome.kind == "system" and chrome.spec == "chrome" and chrome.keyring
+    assert "used" in opera.age and opera.label == "Opera (snap)" and chrome.label == "Chrome"
+
+
+def test_two_firefox_installs_spell_the_profile_out(isolated_home, monkeypatch):
+    monkeypatch.setattr(signin, "default_browser", lambda: None)
+    firefox_profile(isolated_home / ".mozilla" / "firefox")
+    snap = firefox_profile(isolated_home / "snap/firefox/common/.mozilla/firefox", name="s.default")
+    specs = {b.kind: b.spec for b in signin.found_browsers() if b.name == "firefox"}
+    assert specs["snap"] == f"firefox:{snap}" and specs["system"].startswith("firefox:")
+
+
+def test_check_reads_a_firefox_sign_in_the_way_yt_dlp_does(isolated_home):
+    firefox_profile(isolated_home / ".mozilla" / "firefox")
+    config = Config(signin="browser", signin_browser="firefox")
+    status = signin.check(config)
+    assert status.ok and status.signed_in, status.detail
+    assert status.detail.startswith("signed in to YouTube with Firefox") and "days" in status.detail
+    assert signin.describe(config) == "Firefox" and signin.available(config)
+
+
+def test_check_tells_a_profile_without_a_sign_in(isolated_home):
+    firefox_profile(isolated_home / ".mozilla" / "firefox", signed_in=False)
+    status = signin.check(Config(signin="browser", signin_browser="firefox"))
+    assert status.ok and not status.signed_in
+    assert (
+        "has no YouTube sign-in" in status.detail and "sign in, then check again" in status.detail
+    )
+
+
+def test_check_reads_a_snap_opera_with_basic_encryption(isolated_home):
+    root = isolated_home / "snap" / "opera" / "current" / ".config" / "opera"
+    chromium_profile(root)
+    status = signin.check(Config(signin="browser", signin_browser=f"opera:{root}"))
+    assert status.ok and status.signed_in, status.detail
+    # Chromium's expiry is microseconds since 1601: read as the 400 days it is
+    assert status.detail in {
+        "signed in to YouTube with Opera (snap), good for 399 days",
+        "signed in to YouTube with Opera (snap), good for 400 days",
+    }, status.detail
+
+
+def test_check_names_what_is_wrong(isolated_home, tmp_path):
+    assert signin.check(Config()).detail.startswith("off:")
+    missing = signin.check(Config(signin="browser", signin_browser="firefox"))
+    assert not missing.ok and "could not find firefox cookies database" in missing.detail
+    gone = signin.check(Config(signin="file", signin_file=str(tmp_path / "none.txt")))
+    assert not gone.ok and "missing" in gone.detail
+    bad = tmp_path / "bad.txt"
+    bad.write_text("not a cookie file\n")
+    broken = signin.check(Config(signin="file", signin_file=str(bad)))
+    assert not broken.ok and "no Netscape cookies file" in broken.detail
+
+
+def test_check_reads_a_cookies_file(tmp_path):
+    jar = netscape_file(tmp_path / "cookies.txt")
+    status = signin.check(Config(signin="file", signin_file=str(jar)))
+    assert status.signed_in and status.detail.startswith("signed in to YouTube with cookies file")
+    out = netscape_file(tmp_path / "out.txt", signed_in=False)
+    status = signin.check(Config(signin="file", signin_file=str(out)))
+    assert status.ok and not status.signed_in and "export the cookies again" in status.detail
+
+
+def test_yt_dlp_args_hand_a_browser_on_and_copy_a_file(paths, tmp_path):
+    with signin.yt_dlp_args(Config(), paths) as args:
+        assert args == []
+    with signin.yt_dlp_args(Config(signin="browser", signin_browser="Firefox"), paths) as args:
+        assert args == ["--cookies-from-browser", "firefox"]
+    master = netscape_file(tmp_path / "cookies.txt")
+    before = master.read_text()
+    with signin.yt_dlp_args(Config(signin="file", signin_file=str(master)), paths) as args:
+        copy = Path(args[1])
+        assert (
+            args[0] == "--cookies" and copy != master and copy.parent == paths.temp_dir / "signin"
+        )
+        assert stat.S_IMODE(copy.stat().st_mode) == 0o600 and copy.read_text() == before
+        copy.write_text("rotated by yt-dlp\n")
+    assert not copy.exists() and master.read_text() == before
+    gone = Config(signin="file", signin_file=str(tmp_path / "x"))
+    with pytest.raises(SigninError, match="missing"), signin.yt_dlp_args(gone, paths):
+        pass
+
+
+def test_cookie_file_for_spotdl_keeps_google_and_youtube_only(isolated_home, paths):
+    firefox_profile(isolated_home / ".mozilla" / "firefox")
+    with signin.cookie_file(Config(), paths) as none:
+        assert none is None
+    with signin.cookie_file(Config(signin="browser", signin_browser="firefox"), paths) as path:
+        assert path is not None and stat.S_IMODE(path.stat().st_mode) == 0o600
+        text = path.read_text()
+        assert "LOGIN_INFO" in text and ".google.com" in text and "example.com" not in text
+    assert not path.exists()
+
+
+def test_keep_file_makes_a_private_copy(paths, tmp_path):
+    source = netscape_file(tmp_path / "exported.txt")
+    kept = signin.keep_file(source, paths)
+    assert kept == paths.state_dir / "cookies.txt" and kept.read_text() == source.read_text()
+    assert stat.S_IMODE(kept.stat().st_mode) == 0o600
+    source.unlink()
+    assert signin.keep_file(kept, paths) == kept  # its own copy again: still there
+    with pytest.raises(SigninError):
+        signin.keep_file(tmp_path / "none", paths)
+
+
+def test_asks_for_signin_and_expired():
+    assert signin.asks_for_signin(
+        "ERROR: [youtube] x: Sign in to confirm your age. Use --cookies-from-browser or --cookies"
+    )
+    assert signin.asks_for_signin("Private video. Sign in if you've been granted access")
+    assert signin.asks_for_signin("Join this channel to get access to members-only content")
+    assert not signin.asks_for_signin("HTTP Error 403: Forbidden")
+    assert not signin.asks_for_signin("Unsupported URL: https://x")
+    assert signin.signin_expired("The provided YouTube account cookies are no longer valid.")
+    assert not signin.signin_expired("Sign in to confirm your age")
+
+
+def test_config_keeps_the_sign_in_consistent(paths, caplog):
+    config = Config()
+    with pytest.raises(ValueError, match="needs signin_browser"):
+        config.set("signin", "browser")
+    with pytest.raises(ValueError, match="needs signin_file"):
+        config.set("signin", "file")
+    with pytest.raises(ValueError, match="no browser yt-dlp reads"):
+        config.set("signin_browser", "netscape")
+    config.set("signin_browser", "opera:~/snap/opera/current/.config/opera")
+    config.set("signin", "browser")
+    config.set("signin_use", "always")
+    assert signin.always(config) and signin_problem(config) == ""
+    config.save(paths.config_file)
+    assert (
+        Config.load(paths.config_file).signin_browser == "opera:~/snap/opera/current/.config/opera"
+    )
+    paths.config_file.write_text('signin = "browser"\nsignin_use = "sometimes"\n')
+    loaded = Config.load(paths.config_file)
+    assert loaded.signin == "off" and loaded.signin_use == "when-asked"
+    assert "signin is off" in caplog.text
+
+
+def test_default_browser_names_what_xdg_settings_says(monkeypatch):
+    class Proc:
+        stdout = "opera_opera.desktop\n"
+
+    monkeypatch.setattr(signin.shutil, "which", lambda name: "/usr/bin/xdg-settings")
+    monkeypatch.setattr(signin.subprocess, "run", lambda *a, **k: Proc())
+    monkeypatch.setattr(signin.sys, "platform", "linux")
+    assert signin.default_browser() == "opera"
+    Proc.stdout = "org.mozilla.firefox.desktop\n"
+    assert signin.default_browser() == "firefox"
+    Proc.stdout = "something.desktop\n"
+    assert signin.default_browser() is None
+
+
+def test_private_files_are_this_users_only(paths):
+    first = signin._private(paths, ".txt")
+    second = signin._private(paths, ".txt")
+    assert first != second and first.parent == paths.temp_dir / "signin"
+    assert stat.S_IMODE(first.stat().st_mode) == 0o600
+    assert stat.S_IMODE(first.parent.stat().st_mode) == 0o700
+    assert os.getpid() == int(first.name.split("-")[0])
+    json.dumps([str(first), str(second)])  # names are plain

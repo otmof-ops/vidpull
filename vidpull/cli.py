@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from vidpull import APP_NAME, AUTHOR, CREDIT, REPO_URL, __version__, history
-from vidpull.config import DUPLICATES, PRESETS, Config
+from vidpull.config import DUPLICATES, PRESETS, Config, signin_problem
 from vidpull.doctor import format_report, run_checks, worst
 from vidpull.duplicates import Duplicate, Finder, describe
 from vidpull.engine import ProbeError, YtDlpEngine
@@ -33,6 +33,8 @@ from vidpull.models import SKIPPED, GroupEvent, GroupStatus, JobEvent, JobStatus
 from vidpull.paths import Paths
 from vidpull.procs import redact_url
 from vidpull.semver import Version
+from vidpull.signin import SigninError, asks_for_signin, parse_spec
+from vidpull.signin import available as signin_available
 from vidpull.spotdl import (
     InstallError,
     ResolveError,
@@ -61,7 +63,6 @@ EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_USAGE = 2
 
-COOKIE_SPEC = re.compile(r"^[A-Za-z0-9_.:+-]{1,80}$")
 AUDIO_CODECS = ("mp3", "m4a", "opus", "flac", "wav", "best")
 COMMANDS = frozenset(
     {
@@ -73,6 +74,8 @@ COMMANDS = frozenset(
         "version",
         "queue",
         "config",
+        "signin",
+        "signout",
         "_finalize-install",
     }
 )
@@ -146,9 +149,47 @@ def build_parser() -> argparse.ArgumentParser:
     get.add_argument(
         "--cookies-from-browser",
         metavar="BROWSER",
-        help="pass browser cookies to yt-dlp for this run only",
+        help="sign in with this browser's session for this run (BROWSER[+KEYRING][:PROFILE]); "
+        "`vidpull signin` keeps one",
+    )
+    get.add_argument(
+        "--cookies", metavar="FILE", help="sign in with this Netscape cookies.txt for this run"
+    )
+    get.add_argument(
+        "--no-signin", action="store_true", help="download signed out, whatever is set up"
     )
     get.set_defaults(func=cmd_get)
+
+    signin_cmd = sub.add_parser(
+        "signin",
+        help="sign in to YouTube with a browser's session or a cookies file, for the "
+        "age-restricted, private and members-only videos that need one",
+    )
+    way = signin_cmd.add_mutually_exclusive_group()
+    way.add_argument(
+        "--browser",
+        metavar="BROWSER",
+        help="a browser you are signed in to YouTube with: firefox, chrome, chromium, brave, "
+        "edge, opera, vivaldi, or BROWSER[+KEYRING][:PROFILE]; 'auto' takes the default one",
+    )
+    way.add_argument(
+        "--file",
+        metavar="PATH",
+        help="a cookies.txt exported from a browser (vidpull keeps its own private copy)",
+    )
+    when = signin_cmd.add_mutually_exclusive_group()
+    when.add_argument(
+        "--always", action="store_true", help="sign in for every download, not only when asked"
+    )
+    when.add_argument(
+        "--when-asked",
+        action="store_true",
+        help="sign in only when a site asks for a sign-in (the default)",
+    )
+    signin_cmd.set_defaults(func=cmd_signin)
+
+    signout = sub.add_parser("signout", help="forget the sign-in: downloads are made signed out")
+    signout.set_defaults(func=cmd_signout)
 
     update = sub.add_parser("update", help="update vidpull and yt-dlp to the latest release")
     update.add_argument(
@@ -311,16 +352,25 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
     console = Console()
     ctx.paths.ensure_runtime_dirs()
     setup_logging(ctx.paths)
-    extra: list[str] = []
+    # for this run only; the file keeps its settings
+    if args.no_signin:
+        ctx.config.signin = "off"
     if args.cookies_from_browser:
-        if not COOKIE_SPEC.match(args.cookies_from_browser):
-            print(
-                "error: --cookies-from-browser accepts BROWSER[+KEYRING][:PROFILE] only",
-                file=sys.stderr,
-            )
+        try:
+            spec = parse_spec(args.cookies_from_browser)
+        except SigninError as exc:
+            print(f"error: --cookies-from-browser: {exc}", file=sys.stderr)
             return EXIT_USAGE
-        extra = ["--cookies-from-browser", args.cookies_from_browser]
-    engine = YtDlpEngine(ctx.config, ctx.paths, extra_args=extra)
+        ctx.config.signin, ctx.config.signin_browser = "browser", spec.text
+        ctx.config.signin_use = "always"
+    if args.cookies:
+        cookies = Path(args.cookies).expanduser()
+        if not cookies.is_file():
+            print(f"error: --cookies: no such file: {cookies}", file=sys.stderr)
+            return EXIT_USAGE
+        ctx.config.signin, ctx.config.signin_file = "file", str(cookies)
+        ctx.config.signin_use = "always"
+    engine = YtDlpEngine(ctx.config, ctx.paths)
     download_dir = Path(args.output_dir).expanduser() if args.output_dir else None
     if args.duplicates:
         ctx.config.duplicates = args.duplicates  # for this run; the file keeps its setting
@@ -531,6 +581,13 @@ def cmd_get(args: argparse.Namespace, ctx: Context) -> int:
         else:
             failures += 1
             console.print(f"[red]{job.status}[/] {redact_url(job.url)}: {job.error}")
+            if asks_for_signin(job.error or "") and not signin_available(ctx.config):
+                console.print(
+                    "[yellow]note[/] this needs a YouTube sign-in: `vidpull signin --browser auto` "
+                    "uses the session of your browser, then `vidpull get` it again",
+                    markup=True,
+                    highlight=False,
+                )
     for group_id in runs:  # last, where it is still in sight after a long list
         group = store.get_group(group_id)
         if group is None:
@@ -1108,6 +1165,110 @@ def cmd_queue_log(args: argparse.Namespace, ctx: Context) -> int:
     store.close()
     print("\n".join(lines), file=sys.stdout if found is not None else sys.stderr)
     return EXIT_OK if found is not None else EXIT_FAILURE
+
+
+def cmd_signin(args: argparse.Namespace, ctx: Context) -> int:
+    """Set up the sign-in, or report on it: `vidpull signin` alone says whether the cookies
+    hold a YouTube sign-in and lists the browsers found on this machine."""
+    from vidpull import signin
+
+    config = ctx.config
+    changing = bool(args.browser or args.file or args.always or args.when_asked)
+    if args.browser:
+        spec = _browser_spec(args.browser)
+        if spec is None:
+            return EXIT_FAILURE
+        config.signin, config.signin_browser = "browser", spec
+    elif args.file:
+        try:
+            kept = signin.keep_file(Path(args.file).expanduser(), ctx.paths)
+        except (SigninError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_FAILURE
+        config.signin, config.signin_file = "file", str(kept)
+    if args.always:
+        config.signin_use = "always"
+    elif args.when_asked:
+        config.signin_use = "when-asked"
+    if changing:
+        problem = signin_problem(config)
+        if problem:
+            print(f"error: {problem}", file=sys.stderr)
+            return EXIT_USAGE
+        config.save(ctx.paths.config_file)
+    status = signin.check(config)
+    print(f"sign-in: {status.detail}")
+    if config.signin != "off":
+        when = "for every download" if config.signin_use == "always" else "when a site asks for one"
+        print(f"used: {when}")
+    if not changing:
+        found = signin.found_browsers()
+        if found:
+            print("browsers on this machine:")
+            for browser in found:
+                mark = "  (default)" if browser.default else ""
+                print(
+                    f"  {browser.label:<18} {browser.age:<18} "
+                    f"vidpull signin --browser {browser.spec}{mark}"
+                )
+        else:
+            print(
+                "no browser with a cookie database was found; export a cookies.txt from your "
+                "browser and run `vidpull signin --file PATH`"
+            )
+    return EXIT_OK if config.signin == "off" or status.signed_in else EXIT_FAILURE
+
+
+def _browser_spec(given: str) -> str | None:
+    """The spec for `--browser`: 'auto' is the first browser found here that is signed in
+    to YouTube (the default browser when none is); a bare name takes the install of that
+    browser found here (a snap's folder spelled out); anything else is handed on as it
+    is, once yt-dlp would accept it."""
+    from vidpull import signin
+
+    found = signin.found_browsers()
+    if given.strip().lower() == "auto":
+        if not found:
+            print(
+                "error: no browser with a cookie database was found; name one, or use --file",
+                file=sys.stderr,
+            )
+            return None
+        # the first browser that holds a YouTube sign-in; the default browser otherwise
+        for browser in found:
+            trial = Config(signin="browser", signin_browser=browser.spec)
+            if signin.check(trial).signed_in:
+                return browser.spec
+        return found[0].spec
+    try:
+        spec = parse_spec(given)
+    except SigninError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return None
+    if spec.profile or spec.keyring or spec.container:
+        return spec.text
+    for browser in found:
+        if browser.name == spec.name:
+            return browser.spec
+    print(
+        f"note: no {spec.label} profile was found where yt-dlp looks; it is set anyway",
+        file=sys.stderr,
+    )
+    return spec.text
+
+
+def cmd_signout(args: argparse.Namespace, ctx: Context) -> int:
+    from vidpull.signin import COOKIES_NAME
+
+    config = ctx.config
+    own = ctx.paths.state_dir / COOKIES_NAME
+    if config.signin_file and Path(config.signin_file).expanduser() == own:
+        own.unlink(missing_ok=True)  # vidpull's copy of the cookies: a credential
+        config.signin_file = ""
+    config.signin = "off"
+    config.save(ctx.paths.config_file)
+    print("signed out: downloads are made signed out")
+    return EXIT_OK
 
 
 def cmd_config_list(args: argparse.Namespace, ctx: Context) -> int:

@@ -186,6 +186,32 @@ vidpull get URL --list          # every format with its id, then: vidpull get UR
 vidpull get URL --playlist      # the whole playlist the link belongs to
 ```
 
+### Signing in to YouTube
+
+Age-restricted videos, private ones and members-only ones need a signed-in account, and a
+song from a Spotify link that YouTube Music only has as an age-restricted upload fails with
+"age-restricted: needs a YouTube sign-in" on the Failed tab. Press **Sign in** above the list
+(or `y`) and pick a browser you are signed in to YouTube with: vidpull reads that browser's
+own cookies, the way yt-dlp does, on this machine and nowhere else. **Check** tells whether
+the browser holds a YouTube sign-in before anything is saved; **Open YouTube** opens
+youtube.com in your browser to sign in there first. A browser installed as a snap or a
+flatpak is found too. Then **Retry all** on the Failed tab tries what needed the sign-in.
+
+In a terminal: `vidpull signin` lists the browsers found and says whether the sign-in works,
+`vidpull signin --browser auto` takes the default browser (`--browser firefox`, `opera`,
+`chrome`, `chromium`, `brave`, `edge`, `vivaldi`, or yt-dlp's `BROWSER[+KEYRING][:PROFILE]`),
+`vidpull signin --file ~/Downloads/cookies.txt` takes a cookies file exported from a browser
+(vidpull keeps a private copy of it), and `vidpull signout` forgets it. `vidpull doctor` has a
+`sign-in` row.
+
+The sign-in is used only when a site asks for it: a download is made signed out first, and
+again signed in when the answer is "sign in to confirm your age" (or a private or members-only
+video). Signed out, YouTube offers more formats and sees nothing of your account, and yt-dlp's
+own guidance is that heavy use on an account can get it limited. `vidpull signin --always`
+(or `signin_use = always` in the settings) signs in for every download instead, which private
+playlists need. For one run, `vidpull get URL --cookies-from-browser firefox`,
+`--cookies FILE` and `--no-signin` do the same without touching the settings.
+
 ### Spotify links
 
 Paste a Spotify track, album or playlist link (or a `spotify:` URI) and vidpull queues one job per
@@ -289,8 +315,8 @@ also delete the files vidpull downloaded (only those; nothing else in the folder
   `~/.local/state/vidpull/jobs.db`, the log next to it, the app under `~/.local/share/vidpull`.
 - **Clipboard watcher** (`w`): copied media links queue up as pending and wait for your
   format choice. Off by default; nothing downloads on its own.
-- **A site wants you signed in**: `vidpull get URL --cookies-from-browser firefox` (or
-  chromium, chrome, brave, edge) uses that browser's session for this one run.
+- **A site wants you signed in**: see [Signing in to YouTube](#signing-in-to-youtube);
+  `vidpull get URL --cookies-from-browser firefox` does it for one run.
 - **YouTube shows only a few formats, or conversions fail**: run `vidpull doctor --fix`. It
   lists what is missing (a JavaScript runtime for YouTube, ffmpeg for merging and
   converting), says what it would install, and does it when you say yes. The same check runs

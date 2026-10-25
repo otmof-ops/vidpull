@@ -6,6 +6,36 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Sign in to YouTube.** Age-restricted, private and members-only videos need a signed-in
+  account; a song from a Spotify link whose only upload is age-restricted failed with "Sign in
+  to confirm your age". A **Sign in** button above the list (and `y`) picks a browser you are
+  signed in to YouTube with, or a cookies.txt exported from one; vidpull reads the browser's
+  own cookies the way yt-dlp does, finds browsers installed as snaps and flatpaks (which
+  yt-dlp does not look for), and tells whether they hold a YouTube sign-in before saving
+  anything. `vidpull signin [--browser NAME|auto] [--file PATH] [--always]`, `vidpull signout`,
+  the settings `signin`, `signin_browser`, `signin_file` and `signin_use`, a `sign-in` row in
+  `vidpull doctor`, and `vidpull get --cookies FILE` and `--no-signin` for one run.
+- **Used when a site asks.** A download is made signed out, and again signed in when the
+  answer is a sign-in request (the age gate, a private or a members-only video); a song whose
+  lookup needed the sign-in is downloaded with it. `signin_use = always` signs in for every
+  download. spotDL's own lookup of an upload YouTube refused is made once more signed in.
+- The Failed tab says how many of its entries need a YouTube sign-in and where to get one;
+  "The provided YouTube account cookies are no longer valid" reads "YouTube sign-in expired".
+
+### Changed
+
+- A cookies file is handed to each yt-dlp or spotDL run as a private copy (yt-dlp writes the
+  file back when it is done, and two downloads at once would write the same file); the copy
+  and vidpull's own copy of an exported cookies file are readable by this user only.
+- yt-dlp's subprocess sees the desktop session variables it picks a Linux keyring by
+  (`XDG_CURRENT_DESKTOP`, `DESKTOP_SESSION`, `KDE_SESSION_VERSION`, `KDE_FULL_SESSION`,
+  `GNOME_DESKTOP_SESSION_ID`), so a Chromium-family browser's keyring-locked cookies decrypt
+  the way they do in a terminal; `secretstorage` is installed for GNOME keyrings.
+- `--cookies-from-browser` on `vidpull get` is checked as yt-dlp reads it (`BROWSER[+KEYRING]
+  [:PROFILE][::CONTAINER]`, a profile may be a path) instead of by a character class.
+
 ## [1.6.0] - 2026-09-30
 
 ### Added

@@ -22,6 +22,7 @@ classifiers = [
 ]
 dependencies = [
   "yt-dlp[default]>=2026.8.19",
+  "secretstorage>=3.3; sys_platform == 'linux'",  # a GNOME keyring's Chromium cookies
   "textual>=8,<9",
 ]
 

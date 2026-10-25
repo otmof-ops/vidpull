@@ -34,11 +34,13 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import parse_qs, urlsplit
 
+from vidpull import signin
 from vidpull.config import Config
 from vidpull.formats import parse_formats
 from vidpull.models import Job, MediaInfo
 from vidpull.paths import Paths
 from vidpull.procs import clean_env, last_error, run, which
+from vidpull.signin import SIGNED_IN_KEY, SigninError
 
 log = logging.getLogger(__name__)
 
@@ -375,19 +377,47 @@ class YtDlpEngine:
         return media_info_from_dict(url, self.probe_json(url, playlist=playlist))
 
     def probe_json(self, url: str, *, playlist: bool = False) -> dict[str, Any]:
-        """yt-dlp's ``-J`` document for ``url``: what ``--load-info-json`` reads back."""
-        args = [
-            *self.prefix(),
-            *self.common_args(),
-            "-J",
-            "--flat-playlist",
-            "--no-warnings",
-            "--yes-playlist" if playlist else "--no-playlist",
-            "--",
-            url,
-        ]
+        """yt-dlp's ``-J`` document for ``url``: what ``--load-info-json`` reads back.
+
+        Made signed out, then once more with the sign-in when the site asks for one and a
+        sign-in is set up (signed in from the start when ``signin_use`` is ``always``). A
+        document that took the sign-in says so under ``SIGNED_IN_KEY``, so that its
+        download signs in too.
+        """
+        use = signin.always(self.config)
         try:
-            proc = run(args, timeout=PROBE_TIMEOUT, env=self.env())
+            data = self._probe_once(url, playlist, use)
+        except ProbeError as exc:
+            if use or not signin.available(self.config) or not signin.asks_for_signin(str(exc)):
+                raise
+            use = True
+            data = self._probe_once(url, playlist, True)
+        if use:
+            data[SIGNED_IN_KEY] = True
+        return data
+
+    def _signin_args(self, signed_in: bool) -> contextlib.AbstractContextManager[list[str]]:
+        if not signed_in:
+            return contextlib.nullcontext([])
+        return signin.yt_dlp_args(self.config, self.paths)
+
+    def _probe_once(self, url: str, playlist: bool, signed_in: bool) -> dict[str, Any]:
+        try:
+            with self._signin_args(signed_in) as cookies:
+                args = [
+                    *self.prefix(),
+                    *self.common_args(),
+                    *cookies,
+                    "-J",
+                    "--flat-playlist",
+                    "--no-warnings",
+                    "--yes-playlist" if playlist else "--no-playlist",
+                    "--",
+                    url,
+                ]
+                proc = run(args, timeout=PROBE_TIMEOUT, env=self.env())
+        except SigninError as exc:
+            raise ProbeError(f"cannot sign in: {exc}") from exc
         except subprocess.TimeoutExpired as exc:
             raise ProbeError("yt-dlp did not answer within the probe timeout") from exc
         except OSError as exc:
@@ -415,6 +445,60 @@ class YtDlpEngine:
         *,
         info: dict[str, Any] | None = None,
     ) -> DownloadResult:
+        """One download. A song whose probe took the sign-in is downloaded with it; anything
+        else is downloaded signed out and once more signed in when the site asks for a
+        sign-in (or signed in from the start when ``signin_use`` is ``always``)."""
+        signed = False
+        if info is not None and info.get(SIGNED_IN_KEY):
+            info = {key: value for key, value in info.items() if key != SIGNED_IN_KEY}
+            signed = True
+        use = signed or signin.always(self.config)
+        result = self._download_signed(
+            use, job, download_dir, temp_dir, on_progress, cancel, on_log, info
+        )
+        if use or result.ok or result.cancelled or result.files or cancel.is_set():
+            return result
+        if not signin.available(self.config) or not signin.asks_for_signin(result.error):
+            return result
+        on_log(
+            "info",
+            f"the site asks for a sign-in: trying again signed in with "
+            f"{signin.describe(self.config)}",
+        )
+        return self._download_signed(
+            True, job, download_dir, temp_dir, on_progress, cancel, on_log, info
+        )
+
+    def _download_signed(
+        self,
+        signed_in: bool,
+        job: Job,
+        download_dir: Path,
+        temp_dir: Path,
+        on_progress: Callable[[Progress], None],
+        cancel: threading.Event,
+        on_log: Callable[[str, str], None],
+        info: dict[str, Any] | None,
+    ) -> DownloadResult:
+        try:
+            with self._signin_args(signed_in) as cookies:
+                return self._download_once(
+                    job, download_dir, temp_dir, on_progress, cancel, on_log, info, cookies
+                )
+        except SigninError as exc:
+            return DownloadResult(ok=False, error=f"cannot sign in: {exc}")
+
+    def _download_once(
+        self,
+        job: Job,
+        download_dir: Path,
+        temp_dir: Path,
+        on_progress: Callable[[Progress], None],
+        cancel: threading.Event,
+        on_log: Callable[[str, str], None],
+        info: dict[str, Any] | None,
+        cookies: list[str],
+    ) -> DownloadResult:
         if cancel.is_set():
             return DownloadResult(ok=False, cancelled=True)
         playlist = job.selection.playlist
@@ -436,6 +520,7 @@ class YtDlpEngine:
         argv = [
             *self.prefix(),
             *self.common_args(),
+            *cookies,
             *download_args(
                 job, self.config, staging, temp_dir, playlist=playlist, info_path=info_path
             ),

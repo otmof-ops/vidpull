@@ -31,6 +31,12 @@ SAFE_ENV_KEYS: tuple[str, ...] = (
     "DBUS_SESSION_BUS_ADDRESS",
     "XDG_RUNTIME_DIR",
     "XDG_SESSION_TYPE",
+    # yt-dlp picks the keyring a Chromium-family browser's cookies are locked with from these
+    "XDG_CURRENT_DESKTOP",
+    "DESKTOP_SESSION",
+    "KDE_SESSION_VERSION",
+    "KDE_FULL_SESSION",
+    "GNOME_DESKTOP_SESSION_ID",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
