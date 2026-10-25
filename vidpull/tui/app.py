@@ -1813,6 +1813,9 @@ class VidpullApp(App[PostExit | None]):
                     setattr(updated, key, getattr(self.config, key))
             if any(getattr(updated, key) != getattr(self.config, key) for key in signin_keys):
                 signin.clear_jar_cache()  # the cookies held for spotDL go with the sign-in
+            if updated.signin != "file" and updated.signin_file == str(signin.own_copy(self.paths)):
+                signin.forget_own_copy(self.paths)  # a credential nothing points at any more
+                updated.signin_file = ""
             self.config.__dict__.update(updated.__dict__)
             self.config.save(self.paths.config_file)
             self._config_mtime = _mtime(self.paths.config_file)

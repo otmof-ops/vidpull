@@ -638,9 +638,11 @@ def test_tui_dialog_shows_its_list_and_buttons_at_every_size(
             screen = app.screen
             await pilot.pause(0.1)
             height = size[1]
+            dialog = screen.query_one("#dialog").region
             for widget_id in ("browser-0", "use", "cancel", "signin-result"):
                 region = screen.query_one(f"#{widget_id}").region
                 assert region.height >= 1 and 0 <= region.y < height, (widget_id, region)
+                assert region.bottom <= dialog.bottom - 1, (widget_id, region, dialog)
             assert screen.query_one("#signin-intro", Static).display == (height >= 36)
             await pilot.press("escape")
 
@@ -800,3 +802,25 @@ def test_cli_get_cookies_names_a_folder_and_the_run_flag_in_the_note(
     assert cli.main(["get", URL, "--cookies", str(jar)]) == 1
     out = " ".join(capsys.readouterr().out.split())
     assert "the one given for this run, cookies file, did not lift it" in out
+
+
+def test_tui_settings_off_forgets_the_kept_copy(config, paths, store, tmp_path):
+    from textual.widgets import Select
+
+    from vidpull.tui.screens.settings import SettingsScreen
+
+    kept = signin.keep_file(netscape_file(tmp_path / "c.txt"), paths)
+    config.signin, config.signin_file = "file", str(kept)
+    app = make_app(config, paths, store, FakeEngine())
+
+    async def flow():
+        async with app.run_test(size=(132, 50)) as pilot:
+            await pilot.press("escape")
+            await pilot.press("s")
+            assert await until(pilot, lambda: isinstance(app.screen, SettingsScreen))
+            app.screen.query_one("#f-signin", Select).value = "off"
+            app.screen.query_one("#save", Button).press()
+            assert await until(pilot, lambda: not isinstance(app.screen, SettingsScreen))
+            assert config.signin == "off" and config.signin_file == "" and not kept.exists()
+
+    asyncio.run(flow())

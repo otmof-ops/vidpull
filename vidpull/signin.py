@@ -129,6 +129,8 @@ JAR_CACHE_SECONDS = 120  # a run's export of the browser's jar is reused this lo
 _URL = re.compile(r"https?://\S+")
 _jar_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
 _jar_generation = [0]  # bumped by every clear: a read that began before one stores nothing
+_jar_failure: list[tuple[float, str]] = []  # a read that failed, kept a moment for the waiters
+FAILURE_KEPT_SECONDS = 10
 _jar_lock = threading.Lock()  # the dictionary
 _fill_lock = threading.Lock()  # one reader fills it; a keyring is asked once, not per worker
 _quiet_lock = threading.Lock()  # redirecting stderr and warnings is process-wide
@@ -476,7 +478,7 @@ def check(config: Config) -> Status:
             else "export the cookies again while signed in to youtube.com"
         )
         what = (
-            f"{yt} of its {count} cookies are youtube.com's"
+            f"{yt} of its {_plural(count, 'cookie')} {'is' if yt == 1 else 'are'} youtube.com's"
             if count
             else "no cookies could be read"
         )
@@ -621,8 +623,9 @@ def yt_dlp_args(config: Config, paths: Paths) -> Iterator[list[str]]:
 def _cached_jar(config: Config) -> Any:
     """The sign-in's youtube.com cookies, read again after ``JAR_CACHE_SECONDS``: a run of
     songs signed in from the start would otherwise read the browser's database for every
-    song. Only the current sign-in's are held, those of youtube.com only, and the reading
-    (which may wait on a keyring) happens outside the lock."""
+    song. Only the current sign-in's are held, those of youtube.com only; one reader fills
+    the cache while the others wait, so a keyring is asked once, and a read that failed is
+    not made again by every waiter in turn."""
     key = (config.signin, config.signin_browser, config.signin_file)
 
     def fresh() -> Any | None:
@@ -640,9 +643,16 @@ def _cached_jar(config: Config) -> Any:
         held = fresh()  # the reader before us may have filled it
         if held is not None:
             return held
+        if _jar_failure and time.monotonic() - _jar_failure[0][0] < FAILURE_KEPT_SECONDS:
+            raise SigninError(_jar_failure[0][1])  # the reader before us failed: so would we
         with _jar_lock:
             began = _jar_generation[0]
-        jar, _said = load_jar(config)
+        try:
+            jar, _said = load_jar(config)
+        except SigninError as exc:
+            _jar_failure[:] = [(time.monotonic(), str(exc))]
+            raise
+        _jar_failure.clear()
         kept = _only(jar, SPOTDL_DOMAINS)
         with _jar_lock:
             if _jar_generation[0] == began:  # no sign-out while the browser was being read
@@ -656,6 +666,7 @@ def clear_jar_cache() -> None:
     with _jar_lock:
         _jar_cache.clear()
         _jar_generation[0] += 1
+    _jar_failure.clear()
 
 
 def _only(jar: Any, domains: tuple[str, ...]) -> Any:

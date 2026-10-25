@@ -401,3 +401,33 @@ def test_a_sign_out_during_a_read_leaves_nothing_held(isolated_home, monkeypatch
     go_on.set()
     worker.join(5)
     assert signin._jar_cache == {}
+
+
+def test_a_failed_read_is_not_made_again_by_every_waiter(monkeypatch):
+    import threading
+
+    config = Config(signin="browser", signin_browser="firefox")  # no profile here: it fails
+    signin.clear_jar_cache()
+    reads = []
+
+    def failing(cfg):
+        reads.append(1)
+        time.sleep(0.05)
+        raise signin.SigninError("no browser here")
+
+    monkeypatch.setattr(signin, "load_jar", failing)
+    failures = []
+
+    def work():
+        try:
+            signin._cached_jar(config)
+        except signin.SigninError as exc:
+            failures.append(str(exc))
+
+    threads = [threading.Thread(target=work) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(reads) == 1 and len(failures) == 8
+    signin.clear_jar_cache()
