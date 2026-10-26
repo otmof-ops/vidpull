@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vidpull"
-version = "1.7.1"
+version = "1.7.2"
 description = "Automated URL video downloader with a Textual TUI, tagged releases, and integrated update and uninstall pipelines"
 readme = "README.md"
 license = "BSD-3-Clause"

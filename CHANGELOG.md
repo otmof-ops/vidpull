@@ -6,6 +6,8 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.2] - 2026-10-26
+
 ### Fixed
 
 - `THIRD-PARTY-NOTICES.md` said cryptography's wheel carries OpenSSL's notice (it ships none),
