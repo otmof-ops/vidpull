@@ -6,6 +6,8 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-10-26
+
 ### Changed
 
 - The repository is public: `git clone` and `pipx install git+https://github.com/otmof-ops/vidpull`
