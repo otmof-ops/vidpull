@@ -152,7 +152,7 @@ l      this session's log                    q  quit (running downloads resume n
 Picker: enter selects · a shows every format · p queues the whole playlist (presets)
         ctrl+a uses your choice for every remaining pasted link
 
-vidpull is BSD 3-Clause licensed · by Jay · https://github.com/otmof-ops/vidpull
+vidpull is BSD 3-Clause licensed · by Jay Taylor · https://github.com/otmof-ops/vidpull
 """
 
 

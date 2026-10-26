@@ -33,6 +33,13 @@ IN_PROCESS = {
     "typing_extensions",
     "typing-extensions",
 }
+# yt-dlp's secretstorage extra: unlocking a Chromium-family cookie store kept on a GNOME keyring
+KEYRING = {"secretstorage", "jeepney", "cryptography", "cffi", "pycparser"}
+
+
+def home_relative(path: str) -> str:
+    home = str(Path.home())
+    return "~" + path[len(home) :] if path.startswith(home + "/") else path
 
 
 def licence_of(dist: md.Distribution) -> str:
@@ -83,8 +90,12 @@ def build_rows() -> list[tuple[str, str, str, str, str, str]]:
         kind = "direct" if key in direct else "transitive"
         if key in IN_PROCESS:
             linkage = "imported in-process"
-        elif key in {"yt-dlp", "deno"}:
-            linkage = "run as a subprocess"
+        elif key == "yt-dlp":
+            linkage = "run as a subprocess; imported to recognize links and read browser cookies"
+        elif key == "deno":
+            linkage = "run as a subprocess by yt-dlp"
+        elif key in KEYRING:
+            linkage = "used by yt-dlp to unlock a keyring-locked browser cookie store"
         else:
             linkage = "used by yt-dlp"
         rows.append(
@@ -97,9 +108,9 @@ def render(rows) -> str:
     lines = [
         START,
         "",
-        f"Generated from `{sys.prefix}` with Python {sys.version.split()[0]}.",
+        f"Generated from `{home_relative(sys.prefix)}` with Python {sys.version.split()[0]}.",
         "",
-        "| Package | Version | Licence (as declared by the package) | Role "
+        "| Package | Version | License (as declared by the package) | Role "
         "| How vidpull uses it | Source |",
         "| --- | --- | --- | --- | --- | --- |",
     ]

@@ -1,7 +1,8 @@
 # Contributing
 
 Thanks for looking under the hood. vidpull is a small codebase with a few rules that keep
-it safe to update and safe to remove; please keep them.
+it safe to update and safe to remove; please keep them. A security problem goes through
+`SECURITY.md`, not an issue or a pull request.
 
 ## Set up
 
@@ -41,13 +42,17 @@ files the CHANGELOG section and opens the pull request; after the merge,
 `scripts/release.sh tag X.Y.Z` creates the annotated tag on `main` and the GitHub release.
 Never tag by hand and never tag before the version bump has merged.
 
-## License
+## License and sign-off
 
-Contributions are accepted under the project license, BSD 3-Clause (`LICENSE`). Keep the
-copyright line, which carries the author's name and the repository link, in every copy, and
-keep the credit in `vidpull version` and the help screen intact in forks and derived works.
+Contributions are accepted under the project license, BSD 3-Clause (`LICENSE`). Sign off each
+commit (`git commit -s`): the `Signed-off-by` line is your statement, under the
+[Developer Certificate of Origin](https://developercertificate.org), that the work is yours to
+give under that license. You keep your copyright. Keep the copyright line, which carries the
+author's name and the repository link, in every copy, and keep the credit in `vidpull version`
+and the help screen intact in forks and derived works. The name is a trademark; `TRADEMARKS.md`
+says what a fork may be called.
 
-When a dependency is added, removed or changes its licence, refresh `THIRD-PARTY-NOTICES.md`
+When a dependency is added, removed or changes its license, refresh `THIRD-PARTY-NOTICES.md`
 with `scripts/third-party-inventory.py` (run under the live generation's interpreter) and check
 the compatibility summary still holds.
 

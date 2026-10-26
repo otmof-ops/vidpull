@@ -16,7 +16,7 @@ def test_version_plain_and_json(capsys, paths):
     assert cli.main(["version", "--plain"]) == 0
     assert capsys.readouterr().out.strip() == __version__
     assert cli.main(["version"]) == 0
-    assert "by Jay · https://github.com/otmof-ops/vidpull" in capsys.readouterr().out
+    assert "by Jay Taylor · https://github.com/otmof-ops/vidpull" in capsys.readouterr().out
     assert cli.main(["version", "--json"]) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["vidpull"] == __version__ and data["install"] in {

@@ -334,10 +334,12 @@ also delete the files vidpull downloaded (only those; nothing else in the folder
 
 BSD 3-Clause, the standard permissive license with a non-endorsement clause. In plain words: use,
 copy, change and sell vidpull freely; every copy, source or binary, keeps the copyright line,
-which names **Jay** and links to https://github.com/otmof-ops/vidpull; and Jay's name may not be
-used to endorse or promote whatever you build from it. Full text in [LICENSE](LICENSE).
+which names **Jay Taylor** and links to https://github.com/otmof-ops/vidpull; and that name may
+not be used to endorse or promote whatever you build from it. Full text in [LICENSE](LICENSE).
 What runs alongside it, under whose terms, and the one caveat for anyone who repackages it into
-a single binary: [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+a single binary: [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). The name is a trademark:
+[TRADEMARKS.md](TRADEMARKS.md) says what a fork may be called. A security problem goes through
+[SECURITY.md](SECURITY.md), not the issue tracker.
 
 Built on [yt-dlp](https://github.com/yt-dlp/yt-dlp), [ffmpeg](https://ffmpeg.org) and
 [Textual](https://textual.textualize.io). Contributions welcome: see
