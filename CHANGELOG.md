@@ -6,6 +6,23 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The repository is public: `git clone` and `pipx install git+https://github.com/otmof-ops/vidpull`
+  need no GitHub account, and `vidpull update` fetches releases without one.
+- The copyright line, the package metadata and `vidpull version` name the author in full.
+- `THIRD-PARTY-NOTICES.md` regenerated: it records the packages the sign-in brought in
+  (secretstorage, jeepney, cryptography, cffi, pycparser) and the two places vidpull imports
+  yt-dlp in-process (recognizing links for the clipboard watcher, reading a browser's cookies)
+  beside the subprocess it runs for every download.
+
+### Added
+
+- `TRADEMARKS.md`: what the name may be used for and what a fork should be called.
+- `SECURITY.md`: how to report a vulnerability, what vidpull promises, what the updater trusts.
+- Contributions sign off each commit under the Developer Certificate of Origin
+  (`CONTRIBUTING.md`).
+
 ## [1.7.0] - 2026-10-25
 
 ### Added

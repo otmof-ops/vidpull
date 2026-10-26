@@ -10,7 +10,7 @@ readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE", "THIRD-PARTY-NOTICES.md"]
 requires-python = ">=3.12"
-authors = [{ name = "Jay" }]
+authors = [{ name = "Jay Taylor" }]
 keywords = ["yt-dlp", "tui", "downloader", "textual", "youtube", "mp3", "video"]
 classifiers = [
   "Environment :: Console",

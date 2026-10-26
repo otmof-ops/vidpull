@@ -12,7 +12,7 @@ from pathlib import Path as _Path
 
 APP_NAME = "vidpull"
 REPO_URL = "https://github.com/otmof-ops/vidpull"
-AUTHOR = "Jay"
+AUTHOR = "Jay Taylor"
 CREDIT = f"by {AUTHOR} · {REPO_URL}"
 
 
