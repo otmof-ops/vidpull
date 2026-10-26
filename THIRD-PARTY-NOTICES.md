@@ -22,17 +22,22 @@ vidpull knows what they would be shipping.
 - The sign-in's keyring support (yt-dlp's `secretstorage` extra) pulls in **SecretStorage**,
   **jeepney**, **cryptography**, **cffi** and **pycparser**, under the BSD, MIT and Apache terms
   the table records, all used by yt-dlp to unlock a Chromium-family browser's cookie store kept
-  on a GNOME keyring. vidpull imports none of them itself. cryptography's wheel carries its own
-  copy of OpenSSL (Apache-2.0) with OpenSSL's notice inside the wheel.
+  on a GNOME keyring. vidpull imports none of them itself. cryptography's wheel statically links
+  OpenSSL and a set of Rust crates and ships no notice text for them; those notices are owed by
+  whoever redistributes the wheel, which vidpull does not.
 - **ffmpeg** is a **system package** from your distribution (on Ubuntu, LGPL-2.1-or-later with
   GPL-enabled components), invoked by yt-dlp as a subprocess. vidpull neither ships nor links it.
+  Where no package manager is found, `vidpull doctor --fix` offers the `static-ffmpeg` wheel from
+  PyPI instead, which downloads a static build into vidpull's own environment; it too stays on
+  your machine.
 - The two README screenshots are SVG files rendered by vidpull itself; they reference the Fira Code
   font (OFL-1.1) by URL and do not embed it.
 
 ## Two entries worth knowing about
 
-yt-dlp's `default` extra pulls in **mutagen** (GPL-2.0-or-later, used by yt-dlp to embed metadata
-and cover art) and **certifi** (MPL-2.0, the CA bundle for HTTPS). vidpull calls neither. mutagen
+yt-dlp's `default` extra pulls in **mutagen** (GPL-2.0-or-later, used by yt-dlp to write cover art
+into FLAC, Ogg and Opus files, and by preference into M4A; ffmpeg does the rest of the tagging)
+and **certifi** (MPL-2.0, the CA bundle for HTTPS). vidpull calls neither. mutagen
 is loaded into vidpull's process whenever yt-dlp is imported, because yt-dlp imports it at
 start-up, and vidpull then uses nothing in it. Neither is distributed by vidpull, and neither
 changes vidpull's license: pip installing a GPL package on your own machine, and a program on that
@@ -40,21 +45,27 @@ machine importing it, is use, not distribution.
 
 If you ever **bundle vidpull and its environment into one redistributable artifact** (a PyInstaller
 binary, a container image you publish, a Snap or AppImage), that artifact would carry mutagen's
-GPL-2.0-or-later obligations and certifi's MPL-2.0 file-level terms. Either satisfy them for the
-whole artifact, or leave mutagen out (`yt-dlp` without the `default` extra, at the cost of embedded
-metadata and thumbnails).
+GPL-2.0-or-later obligations, certifi's MPL-2.0 file-level terms, and the notice duties of the
+permissive packages: requests' NOTICE file, the MIT and ISC headers inside yt-dlp-ejs's
+JavaScript, and OpenSSL's and the Rust crates' notices for cryptography's wheel, which ships none
+of them. Either satisfy them for the whole artifact, or leave mutagen out: install the `default`
+extra's other members by name (brotli, certifi, pycryptodomex, requests, urllib3, websockets,
+yt-dlp-ejs) and skip mutagen, at the cost of cover art in FLAC, Ogg and Opus files.
 
 ## The optional spotDL environment
 
 Spotify links are handled by [spotDL](https://github.com/spotDL/spotify-downloader) (MIT), which
 vidpull installs, only after the user says yes, into a **second virtual environment** under the
 data dir (`~/.local/share/vidpull/spotdl-venv`) and runs as a **separate process** (`spotdl save`,
-`spotdl url`) the way it runs yt-dlp. vidpull never imports it and never redistributes it.
+and vidpull's own `spotdl_tracklist.py`, a small script that runs under spotDL's interpreter and
+imports its modules there) the way it runs yt-dlp. vidpull's own process never imports spotDL,
+and vidpull never redistributes it.
 
 That environment is pip-installed from PyPI onto the user's machine and holds about 64 packages,
 each under its own license. Besides MIT, BSD, Apache and PSF entries it contains **mutagen**
-(GPL-2.0-or-later), **pykakasi** (GPL-3.0-or-later), **Unidecode** and **text-unidecode**
-(GPL-2.0-or-later, the latter also Artistic) and **spotapi** (GPL-3.0). The position is the one
+(GPL-2.0-or-later), **pykakasi** (GPL-3.0-or-later), **Unidecode** (GPL-2.0-or-later),
+**text-unidecode** (Artistic-1.0 or GPL-2.0-or-later, at the user's choice) and **spotapi**
+(GPL-3.0 by its license text; it declares none in its metadata). The position is the one
 described for mutagen above: use, not distribution, behind a process boundary. It does not change
 vidpull's license. Anyone who bundles vidpull *together with that environment* into one artifact
 takes on those GPL obligations for the whole artifact; leave the spotDL environment out of any
@@ -81,7 +92,7 @@ Generated from `~/.local/share/vidpull/current` with Python 3.12.3.
 | cffi | 2.1.1 | MIT-0 | transitive | used by yt-dlp to unlock a keyring-locked browser cookie store | https://github.com/python-cffi/cffi |
 | charset-normalizer | 3.5.2 | MIT | transitive | used by yt-dlp | https://github.com/jawah/charset_normalizer/blob/master/CHANGELOG.md |
 | cryptography | 50.0.2 | Apache-2.0 OR BSD-3-Clause | transitive | used by yt-dlp to unlock a keyring-locked browser cookie store | https://github.com/pyca/cryptography |
-| deno | 2.9.8 | MIT | transitive | run as a subprocess by yt-dlp | https://deno.com |
+| deno | 2.9.8 | MIT | installer extra (yt-dlp[deno]) | run as a subprocess by yt-dlp | https://deno.com |
 | idna | 3.20 | BSD-3-Clause | transitive | used by yt-dlp | https://github.com/kjd/idna |
 | jeepney | 0.9.0 | MIT | transitive | used by yt-dlp to unlock a keyring-locked browser cookie store | https://gitlab.com/takluyver/jeepney |
 | linkify-it-py | 2.2.0 | MIT | transitive | imported in-process | https://github.com/tsutsu3/linkify-it-py |

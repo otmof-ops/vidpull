@@ -6,6 +6,24 @@ All notable changes to vidpull are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `THIRD-PARTY-NOTICES.md` said cryptography's wheel carries OpenSSL's notice (it ships none),
+  that vidpull runs `spotdl url` (it runs `spotdl save` and its own `spotdl_tracklist.py` under
+  spotDL's interpreter) and that mutagen embeds metadata (it writes cover art; ffmpeg tags). It
+  now names the `static-ffmpeg` fallback and the notice duties a bundler takes on.
+- `SECURITY.md` lists the Spotify visibility request among vidpull's own network use and names
+  the calls that run with your full environment.
+
+### Changed
+
+- `CONTRIBUTING.md` describes the credit in `vidpull version` and the help screen instead of
+  asking forks to keep it; the license is the only condition.
+
+### Removed
+
+- `scripts/push-ci-workflows.sh`, a one-off helper from before the CI workflows were merged.
+
 ## [1.7.1] - 2026-10-26
 
 ### Changed

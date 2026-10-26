@@ -16,3 +16,4 @@ htmlcov/
 *.part
 *.ytdl
 .env
+cookies*.txt
