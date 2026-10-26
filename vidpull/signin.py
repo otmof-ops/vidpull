@@ -58,7 +58,7 @@ LABELS = {
     "vivaldi": "Vivaldi",
     "whale": "Whale",
 }
-# the way yt-dlp reads BROWSER[+KEYRING][:PROFILE][::CONTAINER] (yt_dlp/options.py)
+# the way yt-dlp reads BROWSER[+KEYRING][:PROFILE][::CONTAINER] (yt_dlp/__init__.py)
 _SPEC = re.compile(
     r"(?P<name>[^+:]+)(?:\s*\+\s*(?P<keyring>[^:]+))?"
     r"(?:\s*:\s*(?!:)(?P<profile>.+?))?(?:\s*::\s*(?P<container>.+))?"

@@ -87,7 +87,12 @@ def build_rows() -> list[tuple[str, str, str, str, str, str]]:
         key = name.lower()
         if key in SKIP:
             continue
-        kind = "direct" if key in direct else "transitive"
+        if key in direct:
+            kind = "direct"
+        elif key == "deno":
+            kind = "installer extra (yt-dlp[deno])"
+        else:
+            kind = "transitive"
         if key in IN_PROCESS:
             linkage = "imported in-process"
         elif key == "yt-dlp":

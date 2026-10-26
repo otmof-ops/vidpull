@@ -47,10 +47,10 @@ Never tag by hand and never tag before the version bump has merged.
 Contributions are accepted under the project license, BSD 3-Clause (`LICENSE`). Sign off each
 commit (`git commit -s`): the `Signed-off-by` line is your statement, under the
 [Developer Certificate of Origin](https://developercertificate.org), that the work is yours to
-give under that license. You keep your copyright. Keep the copyright line, which carries the
-author's name and the repository link, in every copy, and keep the credit in `vidpull version`
-and the help screen intact in forks and derived works. The name is a trademark; `TRADEMARKS.md`
-says what a fork may be called.
+give under that license. You keep your copyright. Every copy keeps the copyright line, which
+carries the author's name and the repository link, as the license requires; in a running copy,
+the credit in `vidpull version` and the help screen is where that name and link appear. The name
+is a trademark; `TRADEMARKS.md` says what a fork may be called.
 
 When a dependency is added, removed or changes its license, refresh `THIRD-PARTY-NOTICES.md`
 with `scripts/third-party-inventory.py` (run under the live generation's interpreter) and check

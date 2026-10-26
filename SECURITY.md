@@ -23,13 +23,17 @@ vidpull is a local downloader. Everything it fetches comes through
 each run as a separate process. vidpull's own network use is the check for a
 newer release (a read of this repository's tags over HTTPS when the app
 starts, at most once every `update_check_hours`), `vidpull update`,
-`vidpull doctor --online`, and the installs that `vidpull doctor --fix` and
-the spotDL offer make after you say yes.
+`vidpull doctor --online`, one request to Spotify's public oEmbed endpoint to
+learn whether a Spotify link is visible without a login, and the installs
+that `vidpull doctor --fix` and the spotDL offer make after you say yes.
 
 - **A link is data.** It reaches yt-dlp as one element of an argument list.
   Nothing in vidpull goes through a shell, so there is nothing to inject
-  into. Every subprocess runs with a timeout and a reduced environment
-  (`vidpull/procs.py` lists the variables that pass through).
+  into. The yt-dlp and spotDL runs are cancellable and every other call has
+  a timeout; they all get a reduced environment (`vidpull/procs.py` lists
+  the variables that pass through), except the desktop helpers
+  (`xdg-settings`, `xdg-open`) and your editor for `vidpull config edit`,
+  which get yours.
 - **It is not a sandbox.** yt-dlp fetches whatever the link points to and
   ffmpeg processes what it fetched; a hostile site exercises their parsers,
   not vidpull's. Files land under your downloads folder under the names the
@@ -60,5 +64,7 @@ the spotDL offer make after you say yes.
   trustworthy as this GitHub account and the packages on PyPI.
 - `install.sh`, and the app when `vidpull doctor --fix` or the start-up check
   offers a fix, install a missing system package (ffmpeg, Python) with your
-  distribution's package manager and the JavaScript runtime with pip, after
-  printing what they would run and only after you say yes.
+  distribution's package manager, and the JavaScript runtime (or, where
+  there is no package manager, a static ffmpeg build) with pip into
+  vidpull's own environment, after printing what they would run and only
+  after you say yes.
